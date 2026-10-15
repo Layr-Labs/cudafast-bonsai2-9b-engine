@@ -582,9 +582,9 @@ where they exist.
 
 | Artifact | Identity |
 |---|---|
-| Weight file | one GGUF from `prism-ml/Ternary-Bonsai-2-9B-gguf` (`Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf` @ revision `9e08fac9b821bb7a8e2db23c291a885e762f4dd7`, sha256 `9cc8d0469ff8c51f8787a7b67ffbe9e4627e1618c50bc0cd7f72ee49ed1b8881`, 2675410560 bytes) |
+| Weight file | one GGUF from `prism-ml/Ternary-Bonsai-2-9B-gguf` (`Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf` @ revision `5b2abb02362efbed46bbe204014b02837778b2c2`, sha256 `c79fcdfaf6b7bf47089b50dadcfd11f9ce7d3e96adf3bbefde7912e5ef69e22b`, 2675410720 bytes) |
 | MTP head | in-file `mtp` / `nextn` tensors in the weight file (`mtp_head` in the fixture) |
-| DFlash2 drafter | `Ternary-Bonsai-2-9B-DFlash2-Q8_0.gguf` @ revision `58cef9d5ec8cf69b1b866ab7188b569c2743b19c` (its own `revision` in `target.files`), sha256 `95149abdd584f7a69ea5ead38790d5481454428d2c1616527ff0d45422a762b4`, 1574233856 bytes (`dflash_drafter` and `target.files` in the fixture) |
+| DFlash2 drafter | `Ternary-Bonsai-2-9B-DFlash2-Q8_0.gguf` @ revision `5b2abb02362efbed46bbe204014b02837778b2c2` (its own `revision` in `target.files`), sha256 `95149abdd584f7a69ea5ead38790d5481454428d2c1616527ff0d45422a762b4`, 1574233856 bytes (`dflash_drafter` and `target.files` in the fixture) |
 | Engine source | PrismML `llama.cpp` @ `4fbda1292562cc1f23904d5867fb79603737547a` (`llama.cpp/PRISM_PIN.md`) |
 | Engine image | `bonsai9b-engine:v1` built from `nvidia/cuda@sha256:7d2f6a8c2071d911524f95061a0db363e24d27aa51ec831fcccf9e76eb72bc92` (`docs/design.md` §3); image id per ranked box under `/srv/bonsai9b/engine-image.id`; on a participant machine `./setup.sh` builds the image and writes `.build/engine-image.id` |
 | Resident binary | `llama-resident` from `harness/llama_resident/` (organizer-staged reference hash in box calibration) |
