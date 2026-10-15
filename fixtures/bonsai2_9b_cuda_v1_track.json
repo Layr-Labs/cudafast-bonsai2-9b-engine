@@ -47,7 +47,7 @@
   "golden_model_type": "qwen3_5",
   "decode_steps": 128,
   "token_tolerance_budget": 0.1,
-  "baseline_reference_commit": "0000000000000000000000000000000000000000",
+  "baseline_reference_commit": "e214fe85d4844be621e55f14d820c23011689e6f",
   "_noop_decode_speedup_note": "benchd e7cd2e9 requires noop_decode_speedup on each timed_prompt_pool entry for measure-job only. This track's scored driver is tools/bonsai2-9b-measure-and-score.sh (iterate --mode official), which does not call measure-job; pool entries omit noop_decode_speedup until a measure-job path is added.",
   "live_goldens": [
     "pool-9",
