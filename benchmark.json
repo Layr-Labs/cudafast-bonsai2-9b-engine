@@ -1,0 +1,63 @@
+{
+  "schemaVersion": 1,
+  "name": "cudafast-bonsai2-9b",
+  "trackId": "bonsai2-9b-cuda-v1",
+  "description": "Bonsai 2 9B CUDA text inference speedup track on DGX Spark (GB10, sm_121). Target: prism-ml/Ternary-Bonsai-2-9B-gguf @ 9e08fac9 file Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf, Bonsai 2 9B (built from Qwen/Qwen3.5-9B; 32 layers, hybrid linear/full attention): a PQ2_0 ternary trunk with prism.hadamard v1 transforms and one in-file MTP layer in Q8_0, run by the PrismML llama.cpp fork vendored at llama.cpp/ through harness/llama_resident (llamacpp-resident) in the pinned bonsai9b-engine:v1 CUDA devel image. The scored binary is the Engine Protocol v1 adapter (harness/protocol-adapter) attached to one llama-resident per leg. Two speculative arms, selected by mtp-head.manifest.json spec.mode: native MTP via llama.cpp draft-mtp at participant-selected depth 1 to 6, or the pinned Prism DFlash2 block drafter Ternary-Bonsai-2-9B-DFlash2-Q8_0.gguf (same repository and revision) via llama.cpp draft-dflash at depth 1 to 15. No submission carries drafter weights. Scoring is single-stream and paired: official_pairs = 3 on one box (serial control then candidate per pair), one pair per prompt of the fixture's live_goldens (three chat-template coding prompts of 512 tokens, one unmeasured prefill warm-up pass, 128-step decode); official_pair_combine mean gates every pair against its own control leg then seals the mean of the per-pair composites (prefill_gain^0.25 * decode_gain^0.75), with 0.95 speedup floors and no official decode speedup ceiling. Ranked timed windows use benchd near-tie replay: timed_token_tolerance_per_thousand 40 and timed_token_near_tie_relative_gap 0.01; local modes stay exact-match. fixtures/bonsai2_9b_cuda_v1_track.json is the authority; editablePaths is the authority for what a submission may change.",
+  "category": "cuda",
+  "direction": "+",
+  "editablePaths": [
+    "llama.cpp",
+    "harness",
+    "mtp-head.manifest.json"
+  ],
+  "optionalEditablePaths": [
+    "mtp-head.manifest.json"
+  ],
+  "editableSurfaceByteBudget": {
+    "exemptPathMaxBytes": 512000000,
+    "exemptPathMaxFileBytes": 100000000,
+    "maxTotalBytes": 34321817,
+    "maxFileBytes": 4108168,
+    "maxGrowthBytes": 34321817
+  },
+  "contractPath": "fixtures/bonsai2_9b_cuda_v1_track.json",
+  "setupCommand": [
+    "bash",
+    "-c",
+    "./tools/fetch-benchd.sh && ./setup.sh"
+  ],
+  "preSubmitCommand": [
+    "bash",
+    "-c",
+    "./tools/bonsai2-9b-measure-and-score.sh --preflight-only"
+  ],
+  "benchmarkCommand": [
+    "bash",
+    "-c",
+    "MLXFAST_SCORE_PATH=score.json ./tools/bonsai2-9b-yukon-run.sh"
+  ],
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml"
+  },
+  "scoreArtifact": "benchmark-results-<run_id>/score.json",
+  "scorePath": "score.json",
+  "scoring": {
+    "mode": "bonsai2-native-mtp-paired-composite",
+    "formula": "composite = prefill_gain^0.25 * decode_gain^0.75",
+    "scoredExponents": {
+      "prefillGainExponent": 0.25,
+      "decodeGainExponent": 0.75
+    },
+    "scoredBatchSize": 1,
+    "kvBackend": "contiguous",
+    "pairsPerCohort": 3,
+    "minPairsPerCohort": 3,
+    "decodeSpeedupFloor": 0.95,
+    "prefillSpeedupFloor": 0.95
+  },
+  "leaderboard": {
+    "namespace": "bonsai2-9b-cuda-v1"
+  },
+  "staticReviewTrackId": "bonsai2-9b-cuda-v1"
+}

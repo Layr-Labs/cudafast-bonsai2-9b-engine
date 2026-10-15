@@ -1,0 +1,683 @@
+{
+  "schema_version": 1,
+  "track_id": "bonsai2-9b-cuda-v1",
+  "track_name": "bonsai2-9b-cuda-v1 -- composite paired speedup",
+  "official_scoring_enabled": true,
+  "golden_pins_provisional": false,
+  "official_pairs": 3,
+  "official_pair_combine": "mean",
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml",
+    "maxConcurrentWorkflows": 1
+  },
+  "allowed_modes": [
+    "serial",
+    "mtp",
+    "dflash"
+  ],
+  "benchmark_name": "cudafast-bonsai2-9b",
+  "kv_backend": "contiguous",
+  "scored_batch_size": 1,
+  "prefill_gain_exponent": 0.25,
+  "decode_gain_exponent": 0.75,
+  "decode_speedup_floor": 0.95,
+  "prefill_speedup_floor": 0.95,
+  "scores_against_live_control_leg": true,
+  "paired_flow_retired": true,
+  "prefill_band_up_tolerance": 0.05,
+  "prefill_band_down_tolerance": 0.05,
+  "decode_band_up_tolerance": 0.03,
+  "decode_band_down_tolerance": 0.05,
+  "decode_band_down_enabled": false,
+  "calibration_max_cv_percent": 3.0,
+  "prefill_band_down_enabled": false,
+  "score_decode_weight": 0.75,
+  "score_prefill_weight": 0.25,
+  "correctness_steps": 64,
+  "benchmark_decode_steps": 128,
+  "local_submit_benchmark_decode_steps": 1023,
+  "official_prefill_warmup_runs": 1,
+  "official_prefill_timed_runs": 5,
+  "timed_token_tolerance_per_thousand": 40,
+  "timed_token_near_tie_relative_gap": 0.01,
+  "vocab_size": 248320,
+  "num_hidden_layers": 32,
+  "seed_tokens": 512,
+  "golden_model_type": "qwen3_5",
+  "decode_steps": 128,
+  "token_tolerance_budget": 0.1,
+  "baseline_reference_commit": "0000000000000000000000000000000000000000",
+  "_noop_decode_speedup_note": "benchd e7cd2e9 requires noop_decode_speedup on each timed_prompt_pool entry for measure-job only. This track's scored driver is tools/bonsai2-9b-measure-and-score.sh (iterate --mode official), which does not call measure-job; pool entries omit noop_decode_speedup until a measure-job path is added.",
+  "live_goldens": [
+    "pool-9",
+    "pool-10",
+    "pool-11"
+  ],
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-9.golden.json",
+      "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+      "bytes": 28032
+    },
+    {
+      "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-10.golden.json",
+      "sha256": "88c9d66a7aeaf676931688c070190ac6396df574fc3ea79ca795311e070cc073",
+      "bytes": 26247
+    },
+    {
+      "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-11.golden.json",
+      "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+      "bytes": 24454
+    }
+  ],
+  "hidden_correctness_golden": {
+    "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+    "bytes": 28032
+  },
+  "speculative_oracles": {
+    "pool-9": {
+      "mtp1": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-9.mtp1.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "mtp2": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-9.mtp2.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "mtp3": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-9.mtp3.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "mtp4": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-9.mtp4.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "mtp5": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-9.mtp5.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "mtp6": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-9.mtp6.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash1": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash1.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash2": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash2.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash3": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash3.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash4": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash4.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash5": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash5.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash6": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash6.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash7": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash7.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash8": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash8.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash9": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash9.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash10": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash10.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash11": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash11.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash12": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash12.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash13": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash13.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash14": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash14.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      },
+      "dflash15": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-9.dflash15.golden.json",
+        "sha256": "1318838ef502bf266d7fb02489586cab5e67d363c8fa5e0a902ca047c2687900",
+        "bytes": 28032
+      }
+    },
+    "pool-10": {
+      "mtp1": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-10.mtp1.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "mtp2": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-10.mtp2.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "mtp3": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-10.mtp3.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "mtp4": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-10.mtp4.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "mtp5": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-10.mtp5.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "mtp6": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-10.mtp6.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "dflash1": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash1.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "dflash2": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash2.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "dflash3": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash3.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "dflash4": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash4.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "dflash5": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash5.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "dflash6": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash6.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "dflash7": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash7.golden.json",
+        "sha256": "1e858c583e06ef880655c2881cc33a817dc6c0ffc3d5c54b290ec415fa9f0a5c",
+        "bytes": 26242
+      },
+      "dflash8": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash8.golden.json",
+        "sha256": "88c9d66a7aeaf676931688c070190ac6396df574fc3ea79ca795311e070cc073",
+        "bytes": 26247
+      },
+      "dflash9": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash9.golden.json",
+        "sha256": "88c9d66a7aeaf676931688c070190ac6396df574fc3ea79ca795311e070cc073",
+        "bytes": 26247
+      },
+      "dflash10": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash10.golden.json",
+        "sha256": "88c9d66a7aeaf676931688c070190ac6396df574fc3ea79ca795311e070cc073",
+        "bytes": 26247
+      },
+      "dflash11": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash11.golden.json",
+        "sha256": "88c9d66a7aeaf676931688c070190ac6396df574fc3ea79ca795311e070cc073",
+        "bytes": 26247
+      },
+      "dflash12": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash12.golden.json",
+        "sha256": "88c9d66a7aeaf676931688c070190ac6396df574fc3ea79ca795311e070cc073",
+        "bytes": 26247
+      },
+      "dflash13": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash13.golden.json",
+        "sha256": "88c9d66a7aeaf676931688c070190ac6396df574fc3ea79ca795311e070cc073",
+        "bytes": 26247
+      },
+      "dflash14": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash14.golden.json",
+        "sha256": "88c9d66a7aeaf676931688c070190ac6396df574fc3ea79ca795311e070cc073",
+        "bytes": 26247
+      },
+      "dflash15": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-10.dflash15.golden.json",
+        "sha256": "88c9d66a7aeaf676931688c070190ac6396df574fc3ea79ca795311e070cc073",
+        "bytes": 26247
+      }
+    },
+    "pool-11": {
+      "mtp1": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-11.mtp1.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "mtp2": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-11.mtp2.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "mtp3": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-11.mtp3.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "mtp4": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-11.mtp4.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "mtp5": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-11.mtp5.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "mtp6": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9/pool-11.mtp6.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash1": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash1.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash2": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash2.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash3": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash3.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash4": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash4.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash5": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash5.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash6": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash6.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash7": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash7.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash8": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash8.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash9": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash9.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash10": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash10.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash11": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash11.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash12": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash12.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash13": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash13.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash14": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash14.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      },
+      "dflash15": {
+        "r2_path": "correctness_prompts/bonsai2-9b-cuda-v1/ternary-9e08fac9-dflash2/pool-11.dflash15.golden.json",
+        "sha256": "e6fe3f320d3f024cdd292e500ea04a179bd3289af19ce0b36497541837b50ca5",
+        "bytes": 24454
+      }
+    }
+  },
+  "serve_configuration": {
+    "engine": "llama.cpp",
+    "engine_pin": "4fbda1292562cc1f23904d5867fb79603737547a",
+    "engine_tag": "prism-4fbda12",
+    "container_image": "bonsai9b-engine:v1",
+    "base_image_digest": "sha256:7d2f6a8c2071d911524f95061a0db363e24d27aa51ec831fcccf9e76eb72bc92",
+    "resident_binary": ".build/release/llama-resident",
+    "toolchain": {
+      "platform": "linux/arm64",
+      "driver_min": "580.159.03",
+      "cuda_arch": "sm_121"
+    },
+    "weight_owner": "llamacpp-resident",
+    "engine_env": {
+      "RESIDENT_CTX_SIZE": "8192",
+      "RESIDENT_N_BATCH": "2048",
+      "RESIDENT_N_UBATCH": "512",
+      "RESIDENT_KV_CACHE_TYPE": "f16",
+      "RESIDENT_KV_CACHE_MEMORY_BYTES": "4294967296",
+      "RESIDENT_FLASH_ATTN": "1",
+      "RESIDENT_GPU_MEMORY_UTILIZATION": "0.45",
+      "HF_HUB_OFFLINE": "1",
+      "TRANSFORMERS_OFFLINE": "1"
+    },
+    "engine_args": {
+      "ctx_size": 8192,
+      "type_k": "f16",
+      "type_v": "f16",
+      "flash_attn": true,
+      "n_batch": 2048,
+      "n_ubatch": 512,
+      "n_gpu_layers": -1,
+      "seed": 0
+    },
+    "depths": {
+      "serial": {
+        "num_speculative_tokens": 0,
+        "resident_spec_depth": 0,
+        "timed_oracle": "timed_prompt_pool[<live prompt>]"
+      },
+      "mtp1": {
+        "num_speculative_tokens": 1,
+        "resident_spec_depth": 1,
+        "speculative_method": "draft-mtp",
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp1"
+      },
+      "mtp2": {
+        "num_speculative_tokens": 2,
+        "resident_spec_depth": 2,
+        "speculative_method": "draft-mtp",
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp2"
+      },
+      "mtp3": {
+        "num_speculative_tokens": 3,
+        "resident_spec_depth": 3,
+        "speculative_method": "draft-mtp",
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp3"
+      },
+      "mtp4": {
+        "num_speculative_tokens": 4,
+        "resident_spec_depth": 4,
+        "speculative_method": "draft-mtp",
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp4"
+      },
+      "mtp5": {
+        "num_speculative_tokens": 5,
+        "resident_spec_depth": 5,
+        "speculative_method": "draft-mtp",
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp5"
+      },
+      "mtp6": {
+        "num_speculative_tokens": 6,
+        "resident_spec_depth": 6,
+        "speculative_method": "draft-mtp",
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp6"
+      },
+      "dflash1": {
+        "num_speculative_tokens": 1,
+        "resident_spec_depth": 1,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash1"
+      },
+      "dflash2": {
+        "num_speculative_tokens": 2,
+        "resident_spec_depth": 2,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash2"
+      },
+      "dflash3": {
+        "num_speculative_tokens": 3,
+        "resident_spec_depth": 3,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash3"
+      },
+      "dflash4": {
+        "num_speculative_tokens": 4,
+        "resident_spec_depth": 4,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash4"
+      },
+      "dflash5": {
+        "num_speculative_tokens": 5,
+        "resident_spec_depth": 5,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash5"
+      },
+      "dflash6": {
+        "num_speculative_tokens": 6,
+        "resident_spec_depth": 6,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash6"
+      },
+      "dflash7": {
+        "num_speculative_tokens": 7,
+        "resident_spec_depth": 7,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash7"
+      },
+      "dflash8": {
+        "num_speculative_tokens": 8,
+        "resident_spec_depth": 8,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash8"
+      },
+      "dflash9": {
+        "num_speculative_tokens": 9,
+        "resident_spec_depth": 9,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash9"
+      },
+      "dflash10": {
+        "num_speculative_tokens": 10,
+        "resident_spec_depth": 10,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash10"
+      },
+      "dflash11": {
+        "num_speculative_tokens": 11,
+        "resident_spec_depth": 11,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash11"
+      },
+      "dflash12": {
+        "num_speculative_tokens": 12,
+        "resident_spec_depth": 12,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash12"
+      },
+      "dflash13": {
+        "num_speculative_tokens": 13,
+        "resident_spec_depth": 13,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash13"
+      },
+      "dflash14": {
+        "num_speculative_tokens": 14,
+        "resident_spec_depth": 14,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash14"
+      },
+      "dflash15": {
+        "num_speculative_tokens": 15,
+        "resident_spec_depth": 15,
+        "speculative_method": "draft-dflash",
+        "timed_oracle": "speculative_oracles[<live prompt>].dflash15"
+      }
+    }
+  },
+  "target": {
+    "stand_in": false,
+    "upstream_model_id": "prism-ml/Ternary-Bonsai-2-9B-gguf",
+    "upstream_revision": "9e08fac9b821bb7a8e2db23c291a885e762f4dd7",
+    "format": "gguf",
+    "engine": "llama.cpp",
+    "files": [
+      {
+        "path": "Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf",
+        "bytes": 2675410560,
+        "sha256": "9cc8d0469ff8c51f8787a7b67ffbe9e4627e1618c50bc0cd7f72ee49ed1b8881"
+      },
+      {
+        "path": "Ternary-Bonsai-2-9B-DFlash2-Q8_0.gguf",
+        "bytes": 1574233856,
+        "sha256": "95149abdd584f7a69ea5ead38790d5481454428d2c1616527ff0d45422a762b4",
+        "revision": "58cef9d5ec8cf69b1b866ab7188b569c2743b19c"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 19989343,
+        "sha256": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4",
+        "source": "EigenLabs/Qwen3.5-9B-MLX-4bit-mtp@556dcba57d1ae8101be4c7a04199ec3bde7b5dfb"
+      },
+      {
+        "path": "chat_template.jinja",
+        "bytes": 7756,
+        "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+        "source": "EigenLabs/Qwen3.5-9B-MLX-4bit-mtp@556dcba57d1ae8101be4c7a04199ec3bde7b5dfb"
+      }
+    ],
+    "geometry_source": {
+      "upstream_model_id": "Qwen/Qwen3.5-9B",
+      "upstream_revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a"
+    },
+    "architecture": "qwen35",
+    "model_type": "qwen3_5",
+    "block_count": 33,
+    "num_hidden_layers": 32,
+    "num_mtp_layers": 1,
+    "nextn_predict_layers": 1,
+    "n_embd": 4096,
+    "vocab_size": 248320,
+    "eos_token_ids": [
+      248046,
+      248044
+    ],
+    "quantization": {
+      "file_type": "PQ2_0",
+      "trunk": "PQ2_0, norms F32",
+      "output": "PQ2_0",
+      "token_embd": "PQ2_0",
+      "mtp": "Q8_0, norms F32",
+      "prism_hadamard": {
+        "version": 1,
+        "block_size": 4096,
+        "sign_mode": "explicit"
+      }
+    }
+  },
+  "mtp_head": {
+    "role": "spec_decode_mtp_head",
+    "source": "pinned",
+    "packaging": "embedded_in_target",
+    "file": "Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf",
+    "tensor_prefix": "blk.32.",
+    "dtype": "Q8_0",
+    "declaration_max_bytes": 3221225472,
+    "requantization_permitted": false,
+    "engine_option": "draft-mtp",
+    "num_nextn_predict_layers": 1,
+    "permitted_draft_depths": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "bytes": 258557952
+  },
+  "dflash_drafter": {
+    "role": "spec_decode_block_drafter",
+    "source": "pinned",
+    "packaging": "separate_file",
+    "file": "Ternary-Bonsai-2-9B-DFlash2-Q8_0.gguf",
+    "architecture": "dflash",
+    "dtype": "Q8_0",
+    "block_size": 16,
+    "requantization_permitted": false,
+    "engine_option": "draft-dflash",
+    "permitted_draft_depths": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ]
+  },
+  "scoring_semantics": {
+    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = control / candidate per-token time (serial-anchored -- a faster candidate scores > 1). Decode per-token time is the decode window: decode-run time / N, with no seed prefill in it. The run is PAIRED on the box: official_pairs pairs, each one serial-control leg on the organizer-staged reference tree and one candidate leg at the declared draft depth, single-stream. Pair k measures live_goldens[(k - 1) mod N], so each live golden gets the same number of pairs. The score is the mean of the per-pair composites (official_pair_combine: mean). The floors apply to every pair; there is no decode speedup ceiling."
+  },
+  "golden_reference_engine": "llama.cpp",
+  "_byte_budget_derivation": "2026-10-08: du editable paths llama.cpp+harness+mtp-head.manifest.json total=33273241 max_file=4108168; benchmark.json maxTotalBytes=maxGrowthBytes=34321817 maxFileBytes=4108168 (+1 MiB headroom on total, same rule as Nemotron track)."
+}

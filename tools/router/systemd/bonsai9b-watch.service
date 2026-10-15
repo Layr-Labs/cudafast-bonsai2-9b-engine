@@ -1,0 +1,16 @@
+[Unit]
+Description=Bonsai 2 9B CUDA router fleet watcher
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+Environment="PATH=@PATH@"
+EnvironmentFile=%h/.config/bonsai9b/watch.env
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --who=bonsai9b-watch "--why=Fleet monitoring" /usr/bin/bash "@EXEC_REPO@/tools/router/watch.sh"
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
