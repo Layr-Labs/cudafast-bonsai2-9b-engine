@@ -451,8 +451,8 @@ EOF
   cal_case "calibration passes" '.prompts[0].passes = 1' "a band needs at least two"
   cal_case "calibration mean" '.prompts[0].decode_seconds_per_token_mean = 0' \
     "is not a plausible per-token time"
-  cal_case "calibration cv" '.prompts[0].decode_cv = 0.05' "above the 2 % stability gate"
-  cal_case "calibration cv just over 2 %" '.prompts[0].prefill_cv = 0.021' "above the 2 % stability gate"
+  cal_case "calibration cv" '.prompts[0].decode_cv = 0.05' "above the 3.0 % stability gate"
+  cal_case "calibration cv just over 3 %" '.prompts[0].prefill_cv = 0.031' "above the 3.0 % stability gate"
   cal_case "calibration band does not bracket 1" '.prompts[0].decode_band_high = 0.99' \
     "is not a usable band"
   cal_case "calibration band admits a half-speed box" '.prompts[0].prefill_band_high = 2.5' \
