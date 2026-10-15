@@ -575,14 +575,15 @@
     "files": [
       {
         "path": "Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf",
-        "bytes": 2675410560,
-        "sha256": "9cc8d0469ff8c51f8787a7b67ffbe9e4627e1618c50bc0cd7f72ee49ed1b8881"
+        "bytes": 2675410720,
+        "sha256": "c79fcdfaf6b7bf47089b50dadcfd11f9ce7d3e96adf3bbefde7912e5ef69e22b",
+        "revision": "5b2abb02362efbed46bbe204014b02837778b2c2"
       },
       {
         "path": "Ternary-Bonsai-2-9B-DFlash2-Q8_0.gguf",
         "bytes": 1574233856,
         "sha256": "95149abdd584f7a69ea5ead38790d5481454428d2c1616527ff0d45422a762b4",
-        "revision": "58cef9d5ec8cf69b1b866ab7188b569c2743b19c"
+        "revision": "5b2abb02362efbed46bbe204014b02837778b2c2"
       },
       {
         "path": "tokenizer.json",
