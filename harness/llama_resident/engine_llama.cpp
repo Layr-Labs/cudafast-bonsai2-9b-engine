@@ -76,7 +76,12 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
     }
 
     void verify_decode(SpeculativeRoundState &st) override {
-        llama_batch batch_tgt = llama_batch_init(llama_n_batch(eng_->ctx_tgt_), 0, 1);
+        // Only the anchor and actual drafts need host storage. llama_batch_init
+        // allocates a sequence-id array for every capacity row, so using the
+        // context's full prompt-batch capacity wastes thousands of allocations
+        // per verify round. The configured decode batch/ubatch stays unchanged.
+        const int32_t n_verify = static_cast<int32_t>(st.draft->size() + 1);
+        llama_batch batch_tgt = llama_batch_init(n_verify, 0, 1);
         common_batch_clear(batch_tgt);
         common_batch_add(batch_tgt, *st.id_last, (*st.n_past)++, {eng_->seq_id_}, true);
         for (size_t i = 0; i < st.draft->size(); ++i) {
@@ -86,7 +91,10 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
             llama_batch_free(batch_tgt);
             throw std::runtime_error("speculative verify decode failed");
         }
-        if (!common_speculative_process(eng_->spec_.get(), batch_tgt)) {
+        // DFlash only uses process() to encode target features and inject its
+        // draft KV. Wait until acceptance is known so rejected rows do not take
+        // an encoder/injection pass. MTP needs its original eager bookkeeping.
+        if (eng_->spec_mode_ != "dflash" && !common_speculative_process(eng_->spec_.get(), batch_tgt)) {
             llama_batch_free(batch_tgt);
             throw std::runtime_error("speculative process failed");
         }
@@ -136,6 +144,27 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
 
     void accept_spec_prefix(size_t n_draft_accepted) override {
         common_speculative_accept(eng_->spec_.get(), eng_->seq_id_, n_draft_accepted);
+    }
+
+    void finish_verify_before_emits(SpeculativeRoundState &st, size_t n_committed_ids) override {
+        if (eng_->spec_mode_ != "dflash") {
+            return;
+        }
+        // n_past already includes the anchor and accepted draft rows. The
+        // target's extracted features still belong to the last verify decode;
+        // process() reads its first n_committed_ids rows, before any new decode.
+        const int32_t n_rows = static_cast<int32_t>(n_committed_ids);
+        const int32_t pos = *st.n_past - n_rows;
+        llama_batch batch = llama_batch_init(n_rows, 0, 1);
+        common_batch_add(batch, *st.id_last, pos, {eng_->seq_id_}, true);
+        for (int32_t i = 1; i < n_rows; ++i) {
+            common_batch_add(batch, (*st.draft)[i - 1], pos + i, {eng_->seq_id_}, true);
+        }
+        const bool ok = common_speculative_process(eng_->spec_.get(), batch);
+        llama_batch_free(batch);
+        if (!ok) {
+            throw std::runtime_error("committed DFlash process failed");
+        }
     }
 
     Emit emit_logits_at_verify_index(int idx) override { return verify_emits_.at(static_cast<size_t>(idx)); }
