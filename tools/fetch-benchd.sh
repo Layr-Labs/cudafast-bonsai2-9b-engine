@@ -176,12 +176,12 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="${BENCHD_BRANCH:-main}"
-# THE PIN. Layr-Labs/benchd main @ 937fd4d (public) publishes dist/
+# THE PIN. Layr-Labs/benchd main @ f434f8c (public) publishes dist/
 # (aarch64-apple-darwin), dist/linux-aarch64 and dist/linux-x86_64, built from
-# source_commit 95b8b3d. Its manifests name a063f67, the public snapshot of
-# that source: the snapshot tree is the 0fd6c0c tree without dist/. The
-# organizer's development channel (dist commit f64b9cd, bench pull request 413)
-# publishes the same six files byte for byte, and its manifests name 95b8b3d.
+# source_commit 41fcdf7. Its manifests name ab336dc, the public snapshot of
+# that source: the snapshot tree is the 41fcdf7 tree without dist/. The
+# organizer's development channel (dist commit d69a680, bench pull request 415)
+# publishes the same six files byte for byte, and its manifests name 41fcdf7.
 # A ranked box stages that pair. So both names are accepted.
 # That source includes:
 #   * ecd66fe: decode is the decode window (decode-run time / N, with no seed
@@ -210,13 +210,20 @@ BRANCH="${BENCHD_BRANCH:-main}"
 #     GB10 cool gate stays 60 C. The calibration file stays version 3;
 #   * bench pull request 410: a dflash candidate leg boots
 #     `--spec dflash --draft-len <dflash.depth>`, and
-#     record-correctness-golden --benchmark-spec takes dflash:<D>.
+#     record-correctness-golden --benchmark-spec takes dflash:<D>;
+#   * bench pull request 412: the calibration CV maximum is a per-track contract
+#     field, calibration_max_cv_percent, defaulting to the benchd 2% constant
+#     when a fixture does not declare it. This CUDA track sets 3.0;
+#   * bench pull request 414: that ceiling has ONE resolver,
+#     max_cv_percent_of_contract, read by the capture, the ranked load and the
+#     box preflight (the new `benchd validate-calibration --contract` subcommand);
+#     no path keeps its own copy. CUDA stays 3%, MLX stays 2%; no value changes.
 # This benchd replays a timed divergence through the reference engine when the
 # fixture declares timed_token_tolerance_per_thousand and
 # timed_token_near_tie_relative_gap; local modes stay an exact match.
-PINNED_COMMIT="937fd4dd87b177379d94cdb101810d22763dd412"
-PINNED_SOURCE_COMMIT="95b8b3d0bb8b983c1fd867cb85fdfc00390f0673"
-PINNED_PUBLIC_SOURCE_COMMIT="a063f6753a8b1b85ca99d6a44a4958e2de836289"
+PINNED_COMMIT="f434f8c160b478d5b70c5f94a6a68cc3130a8860"
+PINNED_SOURCE_COMMIT="41fcdf74cc70d92b218607420a9854bd3f5d26e4"
+PINNED_PUBLIC_SOURCE_COMMIT="ab336dc02e03a2a20e419dde0ff9d059d7f1e3a9"
 COMMIT="${BENCHD_COMMIT:-${PINNED_COMMIT}}"
 SOURCE_COMMIT_PIN="${BENCHD_SOURCE_COMMIT:-${PINNED_SOURCE_COMMIT}}"
 DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"
