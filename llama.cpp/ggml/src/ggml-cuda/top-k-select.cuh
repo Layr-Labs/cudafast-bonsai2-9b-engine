@@ -31,7 +31,8 @@ static __device__ __forceinline__ uint64_t topk_select_pack(const float v, const
 }
 
 // Block-wide maximum. `red` needs TOPK_SELECT_NT/32 + 1 entries; every thread
-// returns the same value and `red` is reusable after return.
+// returns the same value. Repeated uniform calls may immediately reuse `red`:
+// the next call's first barrier protects this call's final result read.
 static __device__ __forceinline__ uint64_t topk_select_block_max(uint64_t v, uint64_t * red) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -56,9 +57,10 @@ static __device__ __forceinline__ uint64_t topk_select_block_max(uint64_t v, uin
         }
     }
     __syncthreads();
-    v = red[TOPK_SELECT_NT / 32];
-    __syncthreads();
-    return v;
+    // Next invocation writes only the disjoint per-warp slots before its
+    // first barrier. That barrier waits for every thread to read this result
+    // before warp 0 can overwrite the result slot in the next invocation.
+    return red[TOPK_SELECT_NT / 32];
 }
 
 // grid (nchunks, nrows); part holds nrows * nchunks * k packed values.
@@ -79,20 +81,29 @@ topk_select_partial(const float * __restrict__ src, uint64_t * __restrict__ part
         v[j] = col < ncols ? topk_select_pack(x[col], col) : 0;
     }
 
-    uint64_t * out  = part + ((int64_t) row * gridDim.x + blockIdx.x) * k;
-    uint64_t   prev = 0;
-    for (int r = 0; r < k; ++r) {
-        uint64_t best = 0;
+    uint64_t * out = part + ((int64_t) row * gridDim.x + blockIdx.x) * k;
+    uint64_t best = 0;
 #pragma unroll
-        for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
-            const uint64_t c = v[j];
-            if ((r == 0 || c < prev) && c > best) {
-                best = c;
-            }
-        }
-        prev = topk_select_block_max(best, red);
+    for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
+        best = v[j] > best ? v[j] : best;
+    }
+    for (int r = 0; r < k; ++r) {
+        const uint64_t winner = topk_select_block_max(best, red);
         if (threadIdx.x == 0) {
-            out[r] = prev;
+            out[r] = winner;
+        }
+        // Every non-padding key contains a unique column ID. Only the owner
+        // of the winner needs a new local maximum. Other maxima remain valid.
+        // Multiple owners of zero padding all correctly remain zero.
+        if (r + 1 < k && best == winner) {
+            best = 0;
+#pragma unroll
+            for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
+                const uint64_t c = v[j];
+                if (c < winner && c > best) {
+                    best = c;
+                }
+            }
         }
     }
 }
