@@ -951,7 +951,40 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    // PQ2_0: the first use of each 16-bit packed X load dominates the stall profile. Hint the X
+    // rows of later K iterations into L2 (prefetch has no architectural effect; the loaded tile and
+    // every vec_dot are unchanged). The loop hints PQ2_X_HINT_DIST iterations ahead; this prologue
+    // covers the iterations in between.
+    constexpr bool pq2_x_hint = type == GGML_TYPE_PQ2_0;
+    constexpr bool q8_x_hint  = type == GGML_TYPE_Q8_0;
+#else
+    constexpr bool pq2_x_hint = false;
+    constexpr bool q8_x_hint  = false;
+#endif
+    constexpr int PQ2_X_HINT_DIST = 2;
+    if constexpr (pq2_x_hint) {
+        for (int d = 1; d < PQ2_X_HINT_DIST; ++d) {
+            ggml_cuda_mmq_hint_x_pq2_0<type, J, fallback>(x, offset_x, kb0_start + d*blocks_per_iter, kb0_stop,
+                                                          tile_x_max_i, stride_row_x);
+        }
+    }
+    if constexpr (q8_x_hint) {
+        for (int d = 1; d < PQ2_X_HINT_DIST; ++d) {
+            ggml_cuda_mmq_hint_x_q8_0<type, J, fallback>(x, offset_x, kb0_start + d*blocks_per_iter, kb0_stop,
+                                                         tile_x_max_i, stride_row_x);
+        }
+    }
+
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        if constexpr (pq2_x_hint) {
+            ggml_cuda_mmq_hint_x_pq2_0<type, J, fallback>(x, offset_x, kb0 + PQ2_X_HINT_DIST*blocks_per_iter, kb0_stop,
+                                                          tile_x_max_i, stride_row_x);
+        }
+        if constexpr (q8_x_hint) {
+            ggml_cuda_mmq_hint_x_q8_0<type, J, fallback>(x, offset_x, kb0 + PQ2_X_HINT_DIST*blocks_per_iter, kb0_stop,
+                                                         tile_x_max_i, stride_row_x);
+        }
         if constexpr (async_buffer_y) {
             const char * by0 = reinterpret_cast<const char *>(
                 y + ncols_y * (kb0 * qk / ne_block) * sz);
