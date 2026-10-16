@@ -203,6 +203,48 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int kbx  = txi / QI_PQ2_0;
     const int kqsx = txi % QI_PQ2_0;
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK && defined(TURING_MMA_AVAILABLE)
+    // GB10: the 8 qs bytes of (row, kbx, kqsx) sit at a 2-byte aligned address. Read them as three
+    // aligned 32-bit words and funnel-shift, giving the same four sign-extended 16-bit values as the
+    // generic per-int16 loads. The block scale is stored by the same thread: thread (kbx, kqsx) of
+    // a row writes scale entry kbx*scale_entries_per_block + kqsx, the entry ksx of the generic loop.
+    static_assert(QI_PQ2_0 == scale_entries_per_block, "one scale entry per thread of a row");
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_pq2_0 * bxi = (const block_pq2_0 *) x + kbx0 + i*stride + kbx;
+        const uint8_t     * qsi = bxi->qs + kqsx*8;
+        const int           mis = reinterpret_cast<uintptr_t>(qsi) & 3; // 0 or 2
+        const uint32_t    * qwi = reinterpret_cast<const uint32_t *>(qsi - mis);
+        const uint32_t      w0  = qwi[0];
+        const uint32_t      w1  = qwi[1];
+        const uint32_t      w2  = qwi[1 + mis/2]; // w1 again when aligned: no read past the 8 bytes
+        const uint32_t      qw[2] = {__funnelshift_r(w0, w1, 8*mis), __funnelshift_r(w1, w2, 8*mis)};
+
+        const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;
+
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int q = j % 2 == 0 ? int(int16_t(qw[j/2] & 0xFFFFu)) : int(qw[j/2]) >> 16;
+
+            const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+            const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+            const int qx = __byte_perm(qe, qo, 0x5140);
+            const int qy = __byte_perm(qe, qo, 0x7362);
+
+            x_qs[i*sram_stride + dst_offset + j*2+0] = qx;
+            x_qs[i*sram_stride + dst_offset + j*2+1] = qy;
+        }
+
+        x_df[i*sram_stride + kbx*scale_entries_per_block + kqsx] = bxi->d;
+    }
+    GGML_UNUSED(scale_entries_per_row);
+#else
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
@@ -259,6 +301,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = bxi->d;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
+#endif // defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK && defined(TURING_MMA_AVAILABLE)
 }
 
 // L2 prefetch hints for the PQ2_0 X tile of K iteration kb0_hint (the rows and blocks that
@@ -726,6 +769,35 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int kbx  = txi / QI8_0;
     const int kqsx = txi % QI8_0;
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK && defined(TURING_MMA_AVAILABLE)
+    // GB10: thread txi of a row takes the int pair 2*(txi % 4), 2*(txi % 4) + 1 of block txi / 4 (8 qs bytes
+    // at a 2-byte aligned address), read as three aligned 32-bit words and funnel-shifted; the values
+    // equal get_int_b2 and land in the x_qs slots of the generic loop (block b, int k -> b*QI8_0 + k).
+    static_assert(2*threads_per_row == 2*MMQ_TILE_NE_K, "one int pair of the x_qs row per thread");
+    const int kbp = txi / (QI8_0/2);
+    const int kqp = txi % (QI8_0/2);
+    GGML_UNUSED_VARS(kbx, kqsx);
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbp;
+        const int8_t      * qsi = bxi->qs + 8*kqp;
+        const int           mis = reinterpret_cast<uintptr_t>(qsi) & 3; // 0 or 2
+        const uint32_t    * qwi = reinterpret_cast<const uint32_t *>(qsi - mis);
+        const uint32_t      w0  = qwi[0];
+        const uint32_t      w1  = qwi[1];
+        const uint32_t      w2  = qwi[1 + mis/2]; // w1 again when aligned: no read past the 8 bytes
+
+        x_qs[i*sram_stride + kbp*QI8_0 + 2*kqp + 0] = __funnelshift_r(w0, w1, 8*mis);
+        x_qs[i*sram_stride + kbp*QI8_0 + 2*kqp + 1] = __funnelshift_r(w1, w2, 8*mis);
+    }
+#else
 #pragma unroll
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
@@ -744,6 +816,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
+#endif // defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK && defined(TURING_MMA_AVAILABLE)
 
     constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
     constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;

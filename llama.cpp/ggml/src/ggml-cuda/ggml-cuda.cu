@@ -2782,6 +2782,23 @@ static int ggml_cuda_try_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cg
     int consumed = 0;
     int i_mm     = -1;
 
+    // A SWIGLU read only by the signed transform is not materialized: the transform kernel forms
+    // each input element from the GLU operands with the GLU kernel's own expression.
+    // GGML_CUDA_FWHT_SWIGLU_FUSION=0 disables it.
+    static const bool swiglu_disabled = getenv("GGML_CUDA_FWHT_SWIGLU_FUSION") != nullptr &&
+                                        atoi(getenv("GGML_CUDA_FWHT_SWIGLU_FUSION")) == 0;
+    const ggml_tensor * glu = nullptr;
+    if (cgraph->nodes[node_idx]->op == GGML_OP_GLU) {
+        glu = cgraph->nodes[node_idx];
+        if (swiglu_disabled || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+                !ggml_can_fuse_subgraph(cgraph, node_idx,
+                    { GGML_OP_GLU, GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { node_idx + 3 }) ||
+                cgraph->nodes[node_idx + 1]->src[0] != glu) {
+            return 0;
+        }
+        node_idx++;
+    }
+
     if (ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { node_idx + 2 })) {
         const ggml_tensor * mul     = cgraph->nodes[node_idx];
         const ggml_tensor * reshape = cgraph->nodes[node_idx + 1];
@@ -2800,6 +2817,9 @@ static int ggml_cuda_try_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cg
         consumed = 3;
         i_mm     = node_idx + 2;
     } else {
+        if (glu) {
+            return 0;
+        }
         mm = cgraph->nodes[node_idx];
         if (mm->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
             return 0;
@@ -2880,12 +2900,43 @@ static int ggml_cuda_try_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cg
     if (K % n != 0 || (signs && signs->ne[0] != K)) return 0;
     ne0_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
     if (ne0_padded % n != 0) return 0;
+
+    // GLU operands addressed as ggml_cuda_op_unary_gated does; each GLU row must be one transform row.
+    const void * glu_x  = nullptr;
+    const void * glu_g  = nullptr;
+    int64_t      glu_o0 = 0;
+    int64_t      glu_o1 = 0;
+    if (glu) {
+        const ggml_tensor * src0 = glu->src[0];
+        const ggml_tensor * src1 = glu->src[1];
+        const size_t  ts = ggml_element_size(glu);
+        const int64_t nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+        if (src0->type != glu->type || (src1 && src1->type != glu->type) ||
+                !ggml_is_contiguous_1(src0) || src0->nb[0] != ts ||
+                (src1 && (!ggml_is_contiguous_1(src1) || src1->nb[0] != ts || src1->ne[0] != nc)) ||
+                glu->ne[0] != nc || nc != K || ggml_nrows(glu) != ncols || ggml_nrows(src0) != ncols ||
+                (src1 && ggml_nrows(src1) != ncols)) {
+            return 0;
+        }
+        const int32_t swapped = ggml_get_op_params_i32(glu, 1);
+        const char * p0 = (const char *) src0->data;
+        const char * p1 = src1 ? (const char *) src1->data : p0;
+        if (!src1) {
+            p0 += swapped ? nc * ts : 0;
+            p1 += swapped ? 0 : nc * ts;
+        }
+        glu_x  = p0;
+        glu_g  = p1;
+        glu_o0 = src0->nb[1] / ts;
+        glu_o1 = (src1 ? src1->nb[1] : src0->nb[1]) / ts;
+    }
+
     // Separate held storage avoids allocator aliasing and includes MMQ lookahead padding.
     auto blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
     void * out = blk->get();
     ctx.fwht_q8().held.push_back(std::move(blk));
-    fwht_quantize_mmq_d4_cuda(x->data, x->type, signs ? (const float *) signs->data : nullptr,
-                               out, K, ne0_padded, ncols, ctx.stream());
+    fwht_quantize_mmq_d4_cuda(glu ? glu_x : x->data, x->type, signs ? (const float *) signs->data : nullptr,
+                               out, K, ne0_padded, ncols, ctx.stream(), glu_g, glu_o0, glu_o1);
 
     ggml_cuda_fwht_q8 e;
     e.mmq_d4 = true;
@@ -2895,7 +2946,7 @@ static int ggml_cuda_try_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cg
     for (int a = 0; a < n_aliases; ++a) {
         ctx.fwht_q8().set(aliases[a], e);
     }
-    return consumed;
+    return consumed + (glu ? 1 : 0);
 }
 
 static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
@@ -4724,7 +4775,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 // Hadamard rotation that quantizes its own output; its PTQ1_0 mat-vecs skip quantize
-                if ((node->op == GGML_OP_MUL || node->op == GGML_OP_MUL_MAT) && !is_concurrent_event_active) {
+                if ((node->op == GGML_OP_MUL || node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_GLU) &&
+                        !is_concurrent_event_active) {
                     const int mmq_consumed = ggml_cuda_try_fwht_mmq(*cuda_ctx, cgraph, i);
                     const int consumed = mmq_consumed ? mmq_consumed : ggml_cuda_try_fwht_q8(*cuda_ctx, cgraph, i);
                     if (consumed > 0) {

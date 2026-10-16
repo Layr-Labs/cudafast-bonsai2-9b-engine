@@ -47,6 +47,10 @@ struct llama_cparams {
     uint32_t                              n_capture_layers   = 0;
     std::array<int32_t, LLAMA_MAX_LAYERS> capture_layer_idx  = {};
 
+    // > 0: select the logits_topk largest logits of every output row on the device
+    // and copy only those (the raw rows stay on the device until they are read)
+    uint32_t logits_topk = 0;
+
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
