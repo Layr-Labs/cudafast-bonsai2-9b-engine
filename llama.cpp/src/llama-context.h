@@ -141,6 +141,15 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // device embeddings hand-off, see llama_set_embd_import_layer_inp
+    void set_embeddings_layer_inp_dev(bool value);
+    bool set_encoder_inp_slabs(uint32_t n);
+    bool set_embd_import_layer_inp(const llama_context & src, const int32_t * lids, uint32_t n_lids, int32_t row0);
+    bool set_embd_import_nextn();
+
+    // keep up to n built graphs, see llama_set_graph_slots
+    void set_graph_slots(uint32_t n);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -287,6 +296,10 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    // make a parked graph that can be reused for this ubatch the active one, or else park the
+    // active graph and activate the least recently used slot (true when the active graph can be reused)
+    bool graph_slot_select(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, bool embd_import);
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -331,6 +344,32 @@ private:
     // read: the logits tensor and its first output row (valid until the next graph is allocated)
     ggml_tensor * logits_dev     = nullptr;
     int64_t       logits_dev_row = 0;
+
+    // device rows the embeddings input of the next encode/decode is copied from
+    // (llama_set_embd_import_*): per source, in the order of the input's slabs, the tensor, its
+    // backend and first row; and this context's backend on their device
+    struct embd_import_src {
+        ggml_tensor *  tensor  = nullptr;
+        ggml_backend_t backend = nullptr;
+        int64_t        row0    = 0;
+    };
+    struct embd_import_info {
+        std::vector<embd_import_src> srcs;
+        ggml_backend_t               backend_dst = nullptr;
+    };
+    embd_import_info embd_import;     // staged for the next encode/decode
+    embd_import_info embd_import_cur; // taken by the running encode/decode
+
+    // stage an embeddings import from these sources (llama_set_embd_import_*)
+    bool embd_import_stage(std::vector<embd_import_src> srcs);
+
+    // batch token index of the last ubatch's first token (rows of its layer inputs)
+    int64_t layer_inp_tok0 = 0;
+
+    // device copy of the last encode's nextn embeddings, the source of llama_set_embd_import_nextn
+    ggml_context_ptr        ctx_nextn_dev;
+    ggml_backend_buffer_ptr buf_nextn_dev;
+    ggml_tensor *           nextn_dev = nullptr;
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
@@ -388,6 +427,15 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // built graphs parked with their own scheduler and compute buffers while another graph of the
+    // context is active (gf_res_prev and sched), least recently used first (llama_set_graph_slots)
+    struct graph_slot {
+        llm_graph_result_ptr   res;
+        ggml_backend_sched_ptr sched;
+    };
+    std::vector<graph_slot> graph_slots;
+    uint32_t                n_graph_slots = 1;
 
     bool sched_need_reserve = true;
 

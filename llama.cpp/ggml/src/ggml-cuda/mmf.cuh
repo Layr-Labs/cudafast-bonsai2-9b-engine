@@ -303,7 +303,7 @@ static constexpr int mmf_ksplit_cols   = 16;
 static constexpr int mmf_ksplit_nwarps = 8;
 
 static __global__ void mul_mat_f_ksplit_partial(
-        const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ part,
+        const float * x, const float * y, float * part,
         const int ncols, const int stride_row, const int stride_col_y) {
 #if defined(AMPERE_MMA_AVAILABLE) && !defined(VOLTA_MMA_AVAILABLE)
     typedef tile<16, 8, float> tile_A;
@@ -325,6 +325,18 @@ static __global__ void mul_mat_f_ksplit_partial(
 
     x += (int64_t(rb)*rows_per_block + itA*tile_A::I)*stride_row;
     y += int64_t(itB)*tile_B::I*stride_col_y;
+
+    // Launched with programmatic stream serialization (ggml_cuda_mul_mat_f_ksplit): x is weight data, so hint
+    // this block's x segments into L2 (no architectural effect) before waiting for the kernel that wrote y.
+    // The pointer arguments are not __restrict__, so no load moves above the wait.
+    for (int c = w*warp_size + (threadIdx.x / tile_A::I)*nwarps*warp_size; c < ncols;
+            c += (warp_size / tile_A::I)*nwarps*warp_size) {
+        const float * p = x + (threadIdx.x % tile_A::I)*stride_row + c;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(p)));
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(p + min(warp_size, ncols - c) - 1)));
+    }
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
 
     extern __shared__ char data_mmf_ksplit[];
     float * tile_xy = (float *) data_mmf_ksplit;
@@ -387,7 +399,10 @@ static __global__ void mul_mat_f_ksplit_partial(
 #endif // defined(AMPERE_MMA_AVAILABLE) && !defined(VOLTA_MMA_AVAILABLE)
 }
 
-static __global__ void mul_mat_f_ksplit_reduce(const float * __restrict__ part, float * __restrict__ dst, const int stride_col_dst) {
+static __global__ void mul_mat_f_ksplit_reduce(const float * part, float * dst, const int stride_col_dst) {
+    // programmatic stream serialization: part is written by mul_mat_f_ksplit_partial
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
     constexpr int rows_per_block = MMF_ROWS_PER_BLOCK;
     constexpr int nwarps         = mmf_ksplit_nwarps;
     constexpr int ldj            = GGML_PAD(mmf_ksplit_cols, 8);

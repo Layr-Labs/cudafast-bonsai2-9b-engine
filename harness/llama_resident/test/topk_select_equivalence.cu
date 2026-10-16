@@ -1,11 +1,13 @@
 // Byte-exact check of the streaming top-k selection (top-k-select.cuh) against
 // the argsort fallback it replaces: the first k entries of the stable
 // descending cub radix sort (DeviceSegmentedRadixSort, the CUDA graph capture
-// route, and DeviceRadixSort for a single row), and a host stable sort.
+// route, and DeviceRadixSort for a single row), a host stable sort, and the
+// previous (C8) streaming selector (topk_select_c8_reference.cuh).
 //
 // nvcc -O2 -std=c++17 -arch=sm_121 -I llama.cpp/ggml/src/ggml-cuda \
 //      harness/llama_resident/test/topk_select_equivalence.cu -o topk-select-equivalence
 #include "top-k-select.cuh"
+#include "topk_select_c8_reference.cuh"
 
 #include <cub/cub.cuh>
 
@@ -104,19 +106,44 @@ static std::vector<int> cub_reference(const float * d_x, int ncols, int nrows, i
     return out;
 }
 
+static float bits_to_float(uint32_t u) {
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+static constexpr int kPatterns = 16;
+
 static std::vector<float> make_data(int pattern, int ncols, int nrows, uint32_t seed) {
     std::mt19937 rng(seed);
     std::normal_distribution<float> normal(0.0f, 5.0f);
     std::uniform_int_distribution<int> level(-2, 1);
     std::uniform_int_distribution<int> pos(0, ncols - 1);
     std::vector<float> x((size_t) ncols * nrows);
+    const float inf = std::numeric_limits<float>::infinity();
+    // integer levels 0..M-1: about CHUNK/M keys share the top value, so the threshold path's survivor count
+    // sweeps across its 256-entry buffer
+    const int levels[] = { 16, 24, 32, 40, 48 };
     for (size_t i = 0; i < x.size(); ++i) {
+        const int col = (int) (i % ncols);
         switch (pattern) {
             case 0: x[i] = normal(rng); break;                                  // logits-like
             case 1: x[i] = (float) level(rng); break;                           // heavy ties
             case 2: x[i] = (rng() & 1) ? 0.0f : -0.0f; break;                   // signed zeros only
             case 3: x[i] = -std::fabs(normal(rng)) - 1.0f; break;               // negative, zeros injected below
-            default: x[i] = normal(rng); break;                                 // specials injected below
+            case 4: x[i] = normal(rng); break;                                  // specials injected below
+            case 5: {                                                           // NaN rows, several payloads
+                const uint32_t nans[] = { 0x7fc00000u, 0xffc00000u, 0x7fffffffu, 0xffffffffu, 0x7f800001u, 0xff800001u };
+                x[i] = bits_to_float(nans[rng() % 6]);
+            } break;
+            case 6: x[i] = 1.0f; break;                                         // constant rows
+            case 7: x[i] = (rng() & 1) ? inf : -inf; break;                     // infinities only
+            case 8: x[i] = (float) col; break;                                  // ascending
+            case 9: x[i] = -(float) col; break;                                 // descending
+            case 10: case 11: case 12: case 13: case 14:
+                x[i] = (float) (rng() % levels[pattern - 10]); break;
+            default:                                                            // winners in one thread's columns
+                x[i] = (col % TOPK_SELECT_NT == 7) ? 100.0f + normal(rng) : normal(rng); break;
         }
     }
     for (int r = 0; r < nrows; ++r) {
@@ -159,10 +186,13 @@ int main() {
     const Case cases[] = {
         { 248320, 16, 16 }, { 248320, 1, 16 }, { 248320, 15, 16 }, { 1025, 3, 16 }, { 8192, 4, 32 },
         { 8193, 2, 32 },    { 24577, 5, 1 },   { 100003, 7, 5 },   { 49153, 2, 17 }, { 32, 3, 32 },
+        // verify top-8 rows, 32 / 33 / 37 chunks (warp merge limit), threshold path k edges
+        { 248320, 16, 8 },  { 248320, 1, 8 },  { 248320, 4, 1 },   { 262144, 2, 16 }, { 262145, 2, 16 },
+        { 300000, 3, 8 },   { 300000, 2, 32 }, { 65536, 3, 15 },   { 16384, 2, 16 },  { 16, 2, 16 },
     };
     int failures = 0, checks = 0;
     for (const Case & cs : cases) {
-        for (int pattern = 0; pattern < 5; ++pattern) {
+        for (int pattern = 0; pattern < kPatterns; ++pattern) {
             const std::vector<float> x = make_data(pattern, cs.ncols, cs.nrows, 1234u + pattern * 77u + cs.ncols);
             float * d_x;
             int * d_dst;
@@ -177,12 +207,25 @@ int main() {
             std::vector<int> got((size_t) cs.nrows * cs.k);
             CHECK(cudaMemcpy(got.data(), d_dst, got.size() * sizeof(int), cudaMemcpyDeviceToHost));
 
+            std::vector<int> c8((size_t) cs.nrows * cs.k);
+            {
+                uint64_t * d_scratch_c8;
+                CHECK(cudaMalloc(&d_scratch_c8, topk_c8_scratch_elems(cs.ncols, cs.nrows, cs.k) * sizeof(uint64_t)));
+                CHECK(cudaMemset(d_dst, 0xff, c8.size() * sizeof(int)));
+                topk_c8_launch(d_x, d_dst, d_scratch_c8, cs.ncols, cs.nrows, cs.k, 0);
+                CHECK(cudaGetLastError());
+                CHECK(cudaDeviceSynchronize());
+                CHECK(cudaMemcpy(c8.data(), d_dst, c8.size() * sizeof(int), cudaMemcpyDeviceToHost));
+                cudaFree(d_scratch_c8);
+            }
+
             char what[160];
             snprintf(what, sizeof(what), "ncols=%d nrows=%d k=%d pattern=%d", cs.ncols, cs.nrows, cs.k, pattern);
             int bad = 0;
+            bad |= compare("c8-selector", got, c8);
             bad |= compare("host", got, host_reference(x, cs.ncols, cs.nrows, cs.k));
             bad |= compare("cub-segmented-radix", got, cub_reference(d_x, cs.ncols, cs.nrows, cs.k, true));
-            checks += 2;
+            checks += 3;
             if (cs.nrows == 1) {
                 bad |= compare("cub-radix", got, cub_reference(d_x, cs.ncols, cs.nrows, cs.k, false));
                 checks += 1;
@@ -225,7 +268,15 @@ int main() {
             checks += 1;
         }
 
-        // informative timing only: streaming selection versus segmented radix sort + copy
+        // informative timing only: this selector, the C8 selector, and segmented radix sort + copy
+        uint64_t * d_scratch_c8;
+        CHECK(cudaMalloc(&d_scratch_c8, topk_c8_scratch_elems(ncols, nrows, k) * sizeof(uint64_t)));
+        cudaGraph_t graph_c8;
+        cudaGraphExec_t exec_c8;
+        CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+        topk_c8_launch(d_x, d_dst, d_scratch_c8, ncols, nrows, k, stream);
+        CHECK(cudaStreamEndCapture(stream, &graph_c8));
+        CHECK(cudaGraphInstantiate(&exec_c8, graph_c8, 0));
         cudaEvent_t e0, e1;
         CHECK(cudaEventCreate(&e0));
         CHECK(cudaEventCreate(&e1));
@@ -238,6 +289,19 @@ int main() {
         CHECK(cudaEventSynchronize(e1));
         float ms_select = 0.0f;
         CHECK(cudaEventElapsedTime(&ms_select, e0, e1));
+        CHECK(cudaEventRecord(e0, stream));
+        for (int i = 0; i < iters; ++i) {
+            CHECK(cudaGraphLaunch(exec_c8, stream));
+        }
+        CHECK(cudaEventRecord(e1, stream));
+        CHECK(cudaEventSynchronize(e1));
+        float ms_c8 = 0.0f;
+        CHECK(cudaEventElapsedTime(&ms_c8, e0, e1));
+        printf("info: 16x248320 k=16 select %.1f us/call, C8 select %.1f us/call (graph)\n",
+               1000.0f * ms_select / iters, 1000.0f * ms_c8 / iters);
+        cudaGraphExecDestroy(exec_c8);
+        cudaGraphDestroy(graph_c8);
+        cudaFree(d_scratch_c8);
         CHECK(cudaEventRecord(e0, 0));
         for (int i = 0; i < 5; ++i) {
             (void) cub_reference(d_x, ncols, nrows, k, true);

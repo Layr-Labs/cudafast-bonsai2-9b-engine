@@ -1343,6 +1343,8 @@ int64_t llm_graph_result::get_max_nodes() const {
 void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
+
+    embd_import = false;
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;

@@ -70,6 +70,12 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
         target_include_directories(logits-topk-equivalence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(logits-topk-equivalence PRIVATE ggml)
         add_test(NAME logits-topk-equivalence COMMAND logits-topk-equivalence)
+
+        add_executable(token-embd-equivalence test/token_embd_equivalence.cpp)
+        target_compile_features(token-embd-equivalence PRIVATE cxx_std_17)
+        target_link_libraries(token-embd-equivalence PRIVATE ggml)
+        add_test(NAME token-embd-equivalence COMMAND token-embd-equivalence
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../reference_weights/Ternary-Bonsai-2-9B-gguf/Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf)
         add_executable(swiglu-fwht-equivalence test/swiglu_fwht_equivalence.cu)
         target_include_directories(swiglu-fwht-equivalence PRIVATE
             ${LLAMA_CPP_DIR}/ggml/src

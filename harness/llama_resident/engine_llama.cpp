@@ -169,6 +169,13 @@ static common_params make_engine_params(const std::string &model_path, const std
     params.n_ubatch = draft_depth > 0 ? n_batch : n_ubatch;
     params.n_parallel = 1;
     params.n_gpu_layers = -1;
+    // llama.cpp keeps the token embedding table in host memory, which puts a CPU split (the row
+    // lookup) and a synchronous upload in front of every graph; on the GPU the lookup runs inside
+    // the graph and dequantizes the same way (test/token_embd_equivalence.cpp)
+    if (ggml_backend_dev_t gpu = ggml_backend_dev_by_name("CUDA0")) {
+        params.tensor_buft_overrides.push_back({"^token_embd\\.weight$", ggml_backend_dev_buffer_type(gpu)});
+        params.tensor_buft_overrides.push_back({nullptr, nullptr});
+    }
     constexpr int n_threads = 4;
     params.cpuparams.n_threads = n_threads;
     params.cpuparams_batch.n_threads = n_threads;
