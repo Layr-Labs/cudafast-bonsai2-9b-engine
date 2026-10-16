@@ -79,20 +79,29 @@ topk_select_partial(const float * __restrict__ src, uint64_t * __restrict__ part
         v[j] = col < ncols ? topk_select_pack(x[col], col) : 0;
     }
 
-    uint64_t * out  = part + ((int64_t) row * gridDim.x + blockIdx.x) * k;
-    uint64_t   prev = 0;
-    for (int r = 0; r < k; ++r) {
-        uint64_t best = 0;
+    uint64_t * out = part + ((int64_t) row * gridDim.x + blockIdx.x) * k;
+    uint64_t best = 0;
 #pragma unroll
-        for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
-            const uint64_t c = v[j];
-            if ((r == 0 || c < prev) && c > best) {
-                best = c;
-            }
-        }
-        prev = topk_select_block_max(best, red);
+    for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
+        best = v[j] > best ? v[j] : best;
+    }
+    for (int r = 0; r < k; ++r) {
+        const uint64_t winner = topk_select_block_max(best, red);
         if (threadIdx.x == 0) {
-            out[r] = prev;
+            out[r] = winner;
+        }
+        // Every non-padding key contains a unique column ID. Only the owner
+        // of the winner needs a new local maximum. Other maxima remain valid.
+        // Multiple owners of zero padding all correctly remain zero.
+        if (r + 1 < k && best == winner) {
+            best = 0;
+#pragma unroll
+            for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
+                const uint64_t c = v[j];
+                if (c < winner && c > best) {
+                    best = c;
+                }
+            }
         }
     }
 }
