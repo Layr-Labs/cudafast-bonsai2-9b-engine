@@ -23,6 +23,10 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // > 0: the graph selects the top logits_topk entries of every output row on
+    // the backend and only those (ids and values) are copied to the host.
+    int32_t  logits_topk = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 

@@ -1349,6 +1349,9 @@ void llm_graph_result::reset() {
     t_h_nextn     = nullptr;
     t_h_capture   = nullptr;
 
+    t_logits_topk_ids  = nullptr;
+    t_logits_topk_vals = nullptr;
+
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
@@ -3877,6 +3880,33 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+void llm_graph_context::build_logits_topk() const {
+    const int32_t k = cparams.logits_topk;
+    ggml_tensor * logits = res->t_logits;
+    if (k <= 0 || !logits || logits->ne[1] <= 0 || logits->ne[0] < k || !ggml_is_contiguous(logits) ||
+        logits->type != GGML_TYPE_F32 || logits->ne[2] != 1 || logits->ne[3] != 1) {
+        return;
+    }
+
+    // One selection over every output row; the values are gathered from the same logits,
+    // so the host sees the exact floats the full copy would have held.
+    ggml_tensor * ids = ggml_top_k(ctx0, logits, k);
+    ggml_set_name(ids, "logits_topk_ids");
+
+    ggml_tensor * logits_3d = ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], logits->ne[1]);
+    ggml_tensor * vals      = ggml_get_rows(ctx0, logits_3d, ids);
+    ggml_set_name(vals, "logits_topk_vals");
+
+    ggml_set_output(ids);
+    ggml_set_output(vals);
+
+    res->t_logits_topk_ids  = ids;
+    res->t_logits_topk_vals = vals;
+
+    ggml_build_forward_expand(gf, ids);
+    ggml_build_forward_expand(gf, vals);
 }
 
 void llm_graph_context::build_sampling() const {

@@ -111,6 +111,16 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
+// k > 0: every decode selects the top k logits of each output row on the backend (descending,
+// ties to the lower id) and copies only those ids and values; the full logits are not copied.
+// k = 0 restores the full logits copy.
+LLAMA_API void llama_set_logits_topk(struct llama_context * ctx, int32_t k);
+
+// Points ids and vals at the top-k of output row i of the last decode. Returns k, or 0 when the
+// last decode copied full logits instead (read llama_get_logits_ith then).
+LLAMA_API int32_t llama_get_logits_topk_ith(struct llama_context * ctx, int32_t i, const int32_t ** ids,
+                                            const float ** vals);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
