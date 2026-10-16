@@ -47,10 +47,6 @@ struct llama_cparams {
     uint32_t                              n_capture_layers   = 0;
     std::array<int32_t, LLAMA_MAX_LAYERS> capture_layer_idx  = {};
 
-    // > 0: select the logits_topk largest logits of every output row on the device
-    // and copy only those (the raw rows stay on the device until they are read)
-    uint32_t logits_topk = 0;
-
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
@@ -71,13 +67,6 @@ struct llama_cparams {
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
-
-    // the extracted layer inputs stay on the device for llama_set_embd_import_layer_inp (no host copy)
-    bool embeddings_layer_inp_dev = false;
-
-    // > 0: the encoder takes its embeddings input as this many slabs of [n_embd_inp_enc / n, n_tokens]
-    // and puts them side by side in one row per token
-    uint32_t encoder_inp_slabs = 0;
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

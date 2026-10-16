@@ -4,16 +4,14 @@
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
-        const void * src0, const int32_t * src1, dst_t * dst,
+        const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
         const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
         /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
         /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
         /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/) {
 
-    // get_rows_cuda_q uses programmatic stream serialization on GB10; the arguments are not __restrict__
     ggml_cuda_pdl_sync();
-    ggml_cuda_pdl_lc();
     for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
         for (int64_t i00 = 2*(blockIdx.y*blockDim.x + threadIdx.x); i00 < ne00; i00 += gridDim.y*blockDim.x) {
             // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
@@ -186,8 +184,7 @@ static void get_rows_cuda_q(
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    ggml_cuda_kernel_launch_gb10(cc, k_get_rows<qk, qr, dq, dst_t>, ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream),
+    k_get_rows<qk, qr, dq><<<block_nums, block_dims, 0, stream>>>(
         src0_d, src1_d, dst_d,
         ne00, /*ne01, ne02, ne03,*/
         /*ne10,*/ ne11, ne12_fdv, /*ne13,*/

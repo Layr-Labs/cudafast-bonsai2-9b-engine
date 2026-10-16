@@ -3,13 +3,9 @@
 #include "session.hpp"
 #include "wire.hpp"
 
-#include <sched.h>
-
-#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -25,47 +21,7 @@ static std::string getenv_str(const char *name) {
     return v ? std::string(v) : std::string();
 }
 
-// Keep the resident on the fastest cores of a heterogeneous CPU (GB10: ten
-// Cortex-X925 next to ten Cortex-A725). The host side of every decode round
-// (sampling, the draft walk, graph launches) is serial, and threads created
-// later (CUDA, ggml) inherit the mask. Uniform or unreadable CPUs: no change.
-static void pin_to_fastest_cores() {
-    cpu_set_t allowed;
-    CPU_ZERO(&allowed);
-    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
-        return;
-    }
-    long best = 0;
-    long slowest = 0;
-    long freq[CPU_SETSIZE] = {};
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-        if (!CPU_ISSET(cpu, &allowed)) {
-            continue;
-        }
-        std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cpufreq/cpuinfo_max_freq");
-        if (!(f >> freq[cpu]) || freq[cpu] <= 0) {
-            return;
-        }
-        best = std::max(best, freq[cpu]);
-        slowest = slowest == 0 ? freq[cpu] : std::min(slowest, freq[cpu]);
-    }
-    if (best == 0 || slowest == best) {
-        return;
-    }
-    cpu_set_t fast;
-    CPU_ZERO(&fast);
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-        if (CPU_ISSET(cpu, &allowed) && freq[cpu] == best) {
-            CPU_SET(cpu, &fast);
-        }
-    }
-    if (sched_setaffinity(0, sizeof(fast), &fast) == 0) {
-        std::cerr << "resident: pinned to the " << CPU_COUNT(&fast) << " fastest of " << CPU_COUNT(&allowed) << " cores\n";
-    }
-}
-
 int main(int argc, char **argv) {
-    pin_to_fastest_cores();
     bool fake = false;
     std::string model;
     std::string draft_model;

@@ -1,5 +1,4 @@
 #include "concat.cuh"
-#include "cpy.cuh"
 
 #include <stdint.h>
 
@@ -151,9 +150,6 @@ static __global__ void concat_dim0_transpose_u32(
     const int input_x = (int) blockIdx.x*32 + threadIdx.x; // output row / input column
     const int input_y0 = (int) blockIdx.y*32 + threadIdx.y; // output column / input row
 
-    // launched with programmatic stream serialization (GB10-only path in concat_cuda)
-    ggml_cuda_pdl_sync();
-    ggml_cuda_pdl_lc();
 #pragma unroll
     for (int j = 0; j < 32; j += 8) {
         const int input_y = input_y0 + j;
@@ -197,12 +193,8 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         const size_t size0 = ggml_nbytes(src0);
         const size_t size1 = ggml_nbytes(src1);
 
-        if (!ggml_cuda_memcpy_d2d_gb10((char *) dst->data, src0->data, size0, stream)) {
-            CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
-        }
-        if (!ggml_cuda_memcpy_d2d_gb10((char *) dst->data + size0, src1->data, size1, stream)) {
-            CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
-        }
+        CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
@@ -218,9 +210,9 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
                 src0->ne[0] + src1->ne[0] == dst->ne[0];
             if (transpose_dim0) {
                 const dim3 grid((dst->ne[1] + 31)/32, (src1->ne[0] + 31)/32, 1);
-                ggml_cuda_kernel_launch(concat_dim0_transpose_u32, ggml_cuda_kernel_launch_params(grid, dim3(32, 8, 1), 0, stream),
+                concat_dim0_transpose_u32<<<grid, dim3(32, 8, 1), 0, stream>>>(
                     (const uint32_t *) src0->data, (const char *) src1->data, (uint32_t *) dst->data,
-                    (int) src0->ne[0], (int) dst->ne[1], (int) src1->ne[0], (uint64_t) src1->nb[0], (int) (dst->nb[1]/sizeof(uint32_t)));
+                    src0->ne[0], dst->ne[1], src1->ne[0], src1->nb[0], dst->nb[1]/sizeof(uint32_t));
                 return;
             }
         }
