@@ -31,6 +31,7 @@
   "decode_band_down_tolerance": 0.05,
   "decode_band_down_enabled": false,
   "calibration_max_cv_percent": 3.0,
+  "control_band_mode": "mean_of_legs",
   "prefill_band_down_enabled": false,
   "score_decode_weight": 0.75,
   "score_prefill_weight": 0.25,
