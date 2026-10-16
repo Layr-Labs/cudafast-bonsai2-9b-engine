@@ -535,10 +535,15 @@ const ggml_cuda_dl_entry * ggml_cuda_dl_find(const void * src) {
 
 // Copy of a contiguous [nrows][ncols] PQ2_0 / Q8_0 weight in the decode layout (TM), on the current
 // device. Returns the bytes allocated (0: not eligible, disabled, or out of memory: the weight then keeps
-// the regular kernels). GGML_CUDA_DECODE_LAYOUT=0 disables it.
+// the regular kernels). GGML_CUDA_DECODE_LAYOUT=0 disables it. A PQ2_0 weight gets PTQ1_0 groups (C51,
+// value-exact re-encoding) when every block is a trit block; GGML_CUDA_DECODE_PTQ1=0 keeps PQ2_0 groups.
 size_t ggml_cuda_dl_register(const void * src, const int64_t nrows, const int64_t ncols, const ggml_type type) {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_DECODE_LAYOUT");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    static const bool ptq1_enabled = [] {
+        const char * env = getenv("GGML_CUDA_DECODE_PTQ1");
         return env == nullptr || atoi(env) != 0;
     }();
     if (!enabled || src == nullptr || (type != GGML_TYPE_PQ2_0 && type != GGML_TYPE_Q8_0)) {
@@ -560,15 +565,44 @@ size_t ggml_cuda_dl_register(const void * src, const int64_t nrows, const int64_
     if (m.count(src)) {
         return 0;
     }
-    char * dl = nullptr;
-    if (cudaMalloc(&dl, bytes) != cudaSuccess) {
-        (void) cudaGetLastError();
-        return 0;
-    }
     // The weight upload (possibly asynchronous, other streams) must be complete.
     CUDA_CHECK(cudaDeviceSynchronize());
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    if (type == GGML_TYPE_PQ2_0 && ptq1_enabled) {
+        static_assert(sizeof(block_ptq1_0) == 28, "28-byte PTQ1_0 groups");
+        const size_t bytes_p = (size_t) (nrows*nkb)*sizeof(block_ptq1_0);
+        char * dl = nullptr;
+        unsigned int * fail_d = nullptr;
+        if (cudaMalloc(&dl, bytes_p) == cudaSuccess && cudaMalloc(&fail_d, sizeof(unsigned int)) == cudaSuccess) {
+            CUDA_CHECK(cudaMemsetAsync(fail_d, 0, sizeof(unsigned int), stream));
+            ggml_cuda_dl_repack_ptq1((const char *) src, dl, (int) nrows, (int) nkb, GGML_CUDA_DL_TM, fail_d, stream);
+            CUDA_CHECK(cudaGetLastError());
+            unsigned int fail = 0;
+            CUDA_CHECK(cudaMemcpyAsync(&fail, fail_d, sizeof(unsigned int), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaFree(fail_d));
+            if (fail == 0) {
+                CUDA_CHECK(cudaStreamDestroy(stream));
+                m.emplace(src, ggml_cuda_dl_entry{ (const char *) src, dl, nrows, ncols, type, GGML_TYPE_PTQ1_0 });
+                return bytes_p;
+            }
+            // a block with a code 3 (+2d) or one that does not round-trip: keep the PQ2_0 groups
+            GGML_LOG_WARN("%s: PQ2_0 weight %p has a block PTQ1_0 cannot hold; it keeps PQ2_0 decode groups\n", __func__, src);
+            CUDA_CHECK(cudaFree(dl));
+        } else {
+            (void) cudaGetLastError();
+            if (dl != nullptr) {
+                CUDA_CHECK(cudaFree(dl));
+            }
+        }
+    }
+    char * dl = nullptr;
+    if (cudaMalloc(&dl, bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        return 0;
+    }
     if (type == GGML_TYPE_PQ2_0) {
         ggml_cuda_dl_repack<1, 34>((const char *) src, dl, (int) nrows, (int) nkb, GGML_CUDA_DL_TM, stream);
     } else {
@@ -577,7 +611,7 @@ size_t ggml_cuda_dl_register(const void * src, const int64_t nrows, const int64_
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaStreamDestroy(stream));
-    m.emplace(src, ggml_cuda_dl_entry{ (const char *) src, dl, nrows, ncols, type });
+    m.emplace(src, ggml_cuda_dl_entry{ (const char *) src, dl, nrows, ncols, type, type });
     return bytes;
 }
 

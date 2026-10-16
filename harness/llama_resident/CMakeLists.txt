@@ -84,6 +84,15 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
             $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
         target_link_libraries(swiglu-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
         add_test(NAME swiglu-fwht-equivalence COMMAND swiglu-fwht-equivalence)
+        add_executable(ptq1-repack-equivalence test/ptq1_repack_equivalence.cu)
+        target_include_directories(ptq1-repack-equivalence PRIVATE
+            ${LLAMA_CPP_DIR}/ggml/src
+            ${LLAMA_CPP_DIR}/ggml/src/ggml-cuda)
+        target_compile_definitions(ptq1-repack-equivalence PRIVATE
+            $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
+        target_link_libraries(ptq1-repack-equivalence PRIVATE ggml ggml-cuda ggml-base CUDA::cudart)
+        add_test(NAME ptq1-repack-equivalence COMMAND ptq1-repack-equivalence
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../reference_weights/Ternary-Bonsai-2-9B-gguf/Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf)
     endif()
     add_executable(llama-resident-tests
         test/test_session.cpp

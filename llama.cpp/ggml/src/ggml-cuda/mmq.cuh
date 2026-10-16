@@ -1618,6 +1618,7 @@ static void mmq_launch_kernel(const int cc, Kernel kernel, const dim3 & block_nu
 
 #include "mmq-pq2-j16.cuh"
 #include "mmq-j16-dl.cuh"
+#include "mmq-pq2-j128.cuh"
 
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -1652,6 +1653,19 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                 tmp_fixup.alloc((size_t) grid*16*128);
             }
             ggml_cuda_mmq_pq2_j16_run<type>(args, grid, tmp_fixup.ptr, stream);
+            return;
+        }
+    }
+
+    // GB10 J=128 PQ2_0 (prefill): bit-exact kernel at 16 warps per SM (mmq-pq2-j128.cuh).
+    if constexpr (type == GGML_TYPE_PQ2_0 && J == 128 && !fallback) {
+        if (cc == GGML_CUDA_CC_DGX_SPARK && ggml_cuda_mmq_pq2_j128_use(args, nsm)) {
+            const int grid = ggml_cuda_mmq_pq2_j128_grid(args, nsm);
+            ggml_cuda_pool_alloc<float> tmp_fixup(ctx.pool(id));
+            if (ggml_cuda_mmq_pq2_j128_needs_fixup(args, grid)) {
+                tmp_fixup.alloc((size_t) grid*128*128);
+            }
+            ggml_cuda_mmq_pq2_j128_run<type>(args, grid, tmp_fixup.ptr, stream);
             return;
         }
     }
