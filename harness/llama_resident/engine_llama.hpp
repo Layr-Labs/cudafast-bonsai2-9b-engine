@@ -67,6 +67,7 @@ class LlamaEngine : public IEngine {
     common_speculative_init_result_ptr draft_init_;
     common_speculative_ptr spec_;
     common_sampler *smpl_ = nullptr;
+    std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> target_topk_{nullptr, llama_sampler_free};
 
     common_params base_params_{};
     common_params_speculative spec_params_{};
