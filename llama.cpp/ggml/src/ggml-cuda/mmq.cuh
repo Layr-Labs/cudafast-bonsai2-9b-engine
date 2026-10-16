@@ -1080,14 +1080,68 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 }
 
 
+// L2 hints for the X rows of the first MMQ_PDL_X_HINT_ITERS K iterations of the first output tile of
+// this CUDA block in the stream-k partition below (same index math). Reads no memory: it only uses
+// kernel arguments, so it can run before the grid dependency wait.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void mul_mat_q_hint_x_first_tile(
+        const char * __restrict__ x, const uint3 blocks_per_ne00, const int nrows_x, const int stride_row_x,
+        const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x,
+        const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const uint3 ntx) {
+    constexpr int qk              = ggml_cuda_type_traits<type>::qk;
+    constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int blocks_per_iter = ggml_cuda_mmq_get_K_vram(type, J, fallback) / qk;
+    constexpr int MMQ_PDL_X_HINT_ITERS = 2;
+
+    const uint32_t nty = (nrows_x + I - 1) / I;
+
+    int kbc      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+    int kbc_stop = int64_t(blockIdx.x + 1)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+
+    kbc      -= fastmodulo(kbc,      blocks_per_ne00) % blocks_per_iter;
+    kbc_stop -= fastmodulo(kbc_stop, blocks_per_ne00) % blocks_per_iter;
+
+    if (kbc >= kbc_stop) {
+        return;
+    }
+
+    const int kb0_start = fastmodulo(kbc, blocks_per_ne00);
+    const int kb0_stop  = min(blocks_per_ne00.z, uint32_t(kb0_start + kbc_stop - kbc));
+
+    int tmp = fastdiv(kbc, blocks_per_ne00);
+    uint2 tmp2 = fast_div_modulo(tmp, ntx);
+    tmp = tmp2.x;
+    tmp2 = fast_div_modulo(tmp, nchannels_y);
+    const int zt = tmp2.y;
+    tmp = tmp2.x;
+    tmp2 = fast_div_modulo(tmp, nsamples_y);
+    const int wt = tmp2.y;
+    const int it = tmp2.x;
+
+    const int tile_x_max_i = nrows_x - it*I - 1;
+    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+
+#pragma unroll
+    for (int d = 0; d < MMQ_PDL_X_HINT_ITERS; ++d) {
+        if constexpr (type == GGML_TYPE_PQ2_0) {
+            ggml_cuda_mmq_hint_x_pq2_0<type, J, fallback>(x, offset_x, kb0_start + d*blocks_per_iter, kb0_stop,
+                                                          tile_x_max_i, stride_row_x);
+        } else {
+            static_assert(type == GGML_TYPE_Q8_0, "X hints are implemented for PQ2_0 and Q8_0");
+            ggml_cuda_mmq_hint_x_q8_0<type, J, fallback>(x, offset_x, kb0_start + d*blocks_per_iter, kb0_stop,
+                                                         tile_x_max_i, stride_row_x);
+        }
+    }
+}
+
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
 template <ggml_type type, int J, bool fallback>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
 static __global__ void mul_mat_q(
-        const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
-        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
-        const float * __restrict__ y_scale,
+        const char * __restrict__ x, const int * y, const int32_t * ids_dst,
+        const int32_t * expert_bounds, float * dst, float * tmp_fixup,
+        const float * y_scale,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
@@ -1098,6 +1152,21 @@ static __global__ void mul_mat_q(
         NO_DEVICE_CODE;
         return;
     }
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    // launch_mul_mat_q uses programmatic stream serialization on GB10, so this block can start while the
+    // previous kernel still runs. X is weight data: hint its first K iterations into L2 (no architectural
+    // effect), then wait for the previous kernel before reading y/ids_dst/expert_bounds/y_scale or writing
+    // dst/tmp_fixup. Those kernel arguments are not __restrict__, so no access moves above the wait.
+    // The next kernel may then be scheduled; it waits for this grid to complete before using dst.
+    if constexpr (ggml_cuda_mmq_get_stream_k(type, J, fallback) &&
+                  (type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_Q8_0)) {
+        mul_mat_q_hint_x_first_tile<type, J, fallback>(x, blocks_per_ne00, nrows_x, stride_row_x,
+            channel_ratio, nchannels_y, stride_channel_x, sample_ratio, nsamples_y, stride_sample_x, ntx);
+    }
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+#endif
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
@@ -1372,10 +1441,16 @@ static __global__ void mul_mat_q(
 template <ggml_type type, int J, bool fallback>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
-        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
-        float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
+        const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
+        float * tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
         const int stride_sample_dst, const uint3 ntx) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    // Programmatic stream serialization on GB10 (launch_mul_mat_q): the partial sums in tmp_last_tile and
+    // dst are written by the mul_mat_q kernel this launch follows.
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+#endif
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -1527,6 +1602,20 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + y_buffers*nbs_y_padded;
 }
 
+// GB10: launch through ggml_cuda_kernel_launch (programmatic stream serialization) so that the MMQ kernels
+// can start while the previous kernel finishes. mul_mat_q and mul_mat_q_stream_k_fixup wait for it
+// (ggml_cuda_pdl_sync) before they read its output or write their own.
+template <typename Kernel, typename... Args>
+static void mmq_launch_kernel(const int cc, Kernel kernel, const dim3 & block_nums, const dim3 & block_dims,
+                              const size_t nbytes_shared, cudaStream_t stream, Args &&... args) {
+    if (cc == GGML_CUDA_CC_DGX_SPARK) {
+        ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream),
+                                std::forward<Args>(args)...);
+        return;
+    }
+    kernel<<<block_nums, block_dims, nbytes_shared, stream>>>(std::forward<Args>(args)...);
+}
+
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -1562,8 +1651,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
-        mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
+        mmq_launch_kernel(cc, mul_mat_q<type, J, fallback>, block_nums_xy_tiling, block_dims, nbytes_shared, stream,
+             args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1591,8 +1680,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
-    mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-        (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
+    mmq_launch_kernel(cc, mul_mat_q<type, J, fallback>, block_nums_stream_k, block_dims, nbytes_shared, stream,
+         args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1603,8 +1692,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     }
 
     CUDA_CHECK(cudaGetLastError());
-    mul_mat_q_stream_k_fixup<type, J, fallback><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
-        (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+    mmq_launch_kernel(cc, mul_mat_q_stream_k_fixup<type, J, fallback>, block_nums_fixup, block_dims_fixup, 0, stream,
+         args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
          ntx_fd);
 }
