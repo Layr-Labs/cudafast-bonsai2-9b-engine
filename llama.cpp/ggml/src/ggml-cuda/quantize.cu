@@ -677,12 +677,16 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
 template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool swiglu = false, bool rms_scale = false>
 static __global__ void quantize_mmq_q8_1(
-        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+        const float * x, const int32_t * ids, void * vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int ne1, const int ne2, const int n_expert_used,
-        const float * __restrict__ gate = nullptr,
-        const float * __restrict__ norm_weight = nullptr,
-        const float * __restrict__ norm_scale = nullptr) {
+        const float * gate = nullptr,
+        const float * norm_weight = nullptr,
+        const float * norm_scale = nullptr) {
+    // quantize_mmq_q8_1_cuda launches this kernel with programmatic stream serialization on GB10; nothing
+    // is read before ggml_cuda_pdl_sync() below, and the pointer arguments are not __restrict__ so no
+    // access moves above it.
+    ggml_cuda_pdl_lc();
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -894,18 +898,19 @@ void quantize_mmq_q8_1_cuda(
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            mmq_launch_kernel(cc, quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>, num_blocks, block_size, 0, stream,
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0, nullptr, nullptr, nullptr);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            mmq_launch_kernel(cc, quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false>, num_blocks, block_size, 0, stream,
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0, nullptr, nullptr, nullptr);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            mmq_launch_kernel(cc, quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false>, num_blocks, block_size, 0, stream,
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0, nullptr, nullptr, nullptr);
             break;
         default:
             GGML_ABORT("fatal error");

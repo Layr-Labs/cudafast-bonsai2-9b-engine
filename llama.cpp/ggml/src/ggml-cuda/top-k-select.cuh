@@ -61,16 +61,28 @@ static __device__ __forceinline__ uint64_t topk_select_block_max(uint64_t v, uin
     return v;
 }
 
+// Wait for the kernel this one follows, then let the next one launch (no-ops without programmatic launch).
+static __device__ __forceinline__ void topk_select_grid_dependency() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 // grid (nchunks, nrows); part holds nrows * nchunks * k packed values.
 // A chunk with fewer than k columns pads its tail with 0, which ranks below
 // every packed column because the low word ~col is at least 2^31.
 static __global__ void __launch_bounds__(TOPK_SELECT_NT)
-topk_select_partial(const float * __restrict__ src, uint64_t * __restrict__ part, const int ncols, const int k) {
+topk_select_partial(const float * src, uint64_t * part, const int ncols, const int k) {
     __shared__ uint64_t red[TOPK_SELECT_NT / 32 + 1];
 
     const int     row = blockIdx.y;
     const int     beg = blockIdx.x * TOPK_SELECT_CHUNK;
     const float * x   = src + (int64_t) row * ncols;
+
+    // top-k.cu launches both passes with programmatic stream serialization on GB10; the arguments are not
+    // __restrict__, so no load moves above the wait
+    topk_select_grid_dependency();
 
     uint64_t v[TOPK_SELECT_PER_THREAD];
 #pragma unroll
@@ -99,8 +111,10 @@ topk_select_partial(const float * __restrict__ src, uint64_t * __restrict__ part
 
 // grid (nrows); writes k column indices per row in descending key order.
 static __global__ void __launch_bounds__(TOPK_SELECT_NT)
-topk_select_merge(const uint64_t * __restrict__ part, int * __restrict__ dst, const int nchunks, const int k) {
+topk_select_merge(const uint64_t * part, int * dst, const int nchunks, const int k) {
     __shared__ uint64_t red[TOPK_SELECT_NT / 32 + 1];
+
+    topk_select_grid_dependency(); // part is written by topk_select_partial
 
     const int        row = blockIdx.x;
     const int        n   = nchunks * k;
