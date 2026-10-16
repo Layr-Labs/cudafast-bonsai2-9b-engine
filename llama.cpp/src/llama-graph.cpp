@@ -3938,6 +3938,35 @@ void llm_graph_context::build_sampling() const {
             continue;
         }
 
+        // A sole top-k sampler is stateless selection, with no accept/RNG
+        // dependencies between rows. Batch only consecutive active rows;
+        // all other chains retain the existing per-row path below.
+        if (active && rows.size() > 1 && res->t_logits->ne[1] >= n_rows &&
+            ggml_is_contiguous(res->t_logits) &&
+            llama_sampler_chain_n(sampler) == 1 &&
+            std::strcmp(llama_sampler_name(llama_sampler_chain_get(sampler, 0)), "+top-k") == 0 &&
+            rows.back() - rows.front() + 1 == rows.size()) {
+            ggml_tensor * logits_seq = ggml_view_2d(ctx0, res->t_logits, res->t_logits->ne[0],
+                    rows.size(), res->t_logits->nb[1], rows.front() * res->t_logits->nb[1]);
+            struct llama_sampler_data data = {
+                /*.logits       =*/ logits_seq,
+                /*.probs        =*/ nullptr,
+                /*.sampled      =*/ nullptr,
+                /*.candidates   =*/ nullptr,
+            };
+            sampler->iface->backend_apply(sampler, ctx0, gf, &data);
+            GGML_ASSERT(data.logits && data.candidates && !data.probs && !data.sampled);
+            for (uint32_t i = 0; i < rows.size(); ++i) {
+                res->t_sampled_logits[rows[i]] = ggml_view_1d(ctx0, data.logits,
+                        data.logits->ne[0], i * data.logits->nb[1]);
+                res->t_candidates[rows[i]] = ggml_view_1d(ctx0, data.candidates,
+                        data.candidates->ne[0], i * data.candidates->nb[1]);
+                ggml_build_forward_expand(gf, res->t_sampled_logits[rows[i]]);
+                ggml_build_forward_expand(gf, res->t_candidates[rows[i]]);
+            }
+            continue;
+        }
+
         for (uint32_t i = 0; i < rows.size(); ++i) {
             ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], rows[i] * logits_t->nb[1]);
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);
