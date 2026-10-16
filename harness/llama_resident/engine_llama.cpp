@@ -255,6 +255,11 @@ LlamaEngine::LlamaEngine(const std::string &model_path, const std::string &spec_
             throw std::runtime_error("failed to initialize speculative decoding");
         }
         dflash_layer_inp_on_ = !dflash_target_layers_.empty();
+        if (spec_mode_ == "dflash") {
+            // The target graph selects the top-k of every output row, so a verify copies
+            // 16 x k ids and values instead of 16 full vocabulary rows, and nothing scans them.
+            llama_set_logits_topk(ctx_tgt_, kTopK);
+        }
         seq_rm_tgt_ = common_context_can_seq_rm(ctx_tgt_);
         seq_rm_dft_ = common_context_can_seq_rm(ctx_dft_);
         use_ckpt_tgt_ = seq_rm_tgt_ == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -333,6 +338,25 @@ void LlamaEngine::prefill_prompt(const llama_tokens &inp) {
 
 Emit LlamaEngine::emit_logits(int idx) const {
     llama_synchronize(ctx_tgt_);
+    const int32_t *top_ids = nullptr;
+    const float *top_vals = nullptr;
+    const int32_t n_top = llama_get_logits_topk_ith(ctx_tgt_, idx, &top_ids, &top_vals);
+    if (n_top > 0) {
+        if (n_top < kTopK) {
+            throw std::runtime_error("backend top-k shorter than the emitted top");
+        }
+        Emit e;
+        e.top.reserve(kTopK);
+        for (int i = 0; i < kTopK; ++i) {
+            e.top.push_back({top_ids[i], top_vals[i]});
+        }
+        // Same order as top_from_logits: descending logit, ties to the lower id.
+        std::sort(e.top.begin(), e.top.end(), [](const auto &a, const auto &b) {
+            return logit_id_before(a.second, a.first, b.second, b.first);
+        });
+        e.token = e.top.front().first;
+        return e;
+    }
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_));
     const float *logits = llama_get_logits_ith(ctx_tgt_, idx);
     if (!logits) {
