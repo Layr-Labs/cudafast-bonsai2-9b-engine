@@ -88,3 +88,7 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
+
+// Exact signed/unsigned FWHT4096 followed by PQ2 MMQ D4 activation quantization.
+void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * signs, void * y,
+    int64_t k, int64_t kp, int64_t rows, cudaStream_t stream);
