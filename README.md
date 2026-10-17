@@ -54,12 +54,14 @@ the pinned weight file                      ← trusted, verified by bytes + sha
 
 The toolchain needed:
 
-- cargo
+- cargo, with Rust 1.98.1 (`rustup toolchain install 1.98.1`)
 - docker with the NVIDIA container runtime
 - jq, python3, curl, sha256sum
 
 A DGX Spark has all of them after the standard DGX OS setup plus rustup. The
-engine image carries cmake and ninja-build for the resident build.
+host needs no nvcc. The engine image carries the CUDA build toolchain: CUDA
+13.0 (nvcc 13.0.88), gcc 13.3, cmake 3.28.3 and ninja 1.11.1.
+[The ranked box toolchain](#the-ranked-box-toolchain) gives the exact versions.
 
 ```bash
 ./tools/fetch-benchd.sh
@@ -185,6 +187,40 @@ two jobs:
 Participant code runs as `bonsaisub` with no network, reading the checkout
 read-only. The adapter's stderr is not returned, and nothing persists between
 jobs or legs.
+
+### The ranked box toolchain
+
+| | |
+|---|---|
+| **Hardware** | NVIDIA DGX Spark (GB10, aarch64) |
+| **OS** | Ubuntu 24.04.4 LTS, kernel 6.17.0-1026-nvidia |
+| **Driver** | NVIDIA 580.159.03 (the fixture's `driver_min`), CUDA driver API 13.0; Docker 29.2.1, NVIDIA Container Toolkit 1.19.1 |
+| **Engine image base** | `nvidia/cuda@sha256:7d2f6a8c2071d911524f95061a0db363e24d27aa51ec831fcccf9e76eb72bc92` (Ubuntu 24.04.3 LTS) |
+| **CUDA toolkit in the image** | CUDA 13.0: nvcc V13.0.88, `cuda-nvcc-13-0` and `cuda-cudart-dev-13-0` 13.0.88-1 |
+| **Compilers in the image** | gcc/g++ 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04), cmake 3.28.3, ninja 1.11.1; no Rust, Python or PyTorch |
+| **CUDA arch** | `sm_121` (the fixture's `serve_configuration.toolchain.cuda_arch`); `tools/engine/build.sh` passes `-DCMAKE_CUDA_ARCHITECTURES=121` |
+| **Rust on the host** | 1.98.1 (`1.98.1-aarch64-unknown-linux-gnu`), offline `cargo build --release --locked` on vendored crates.io dependencies |
+
+The host has no nvcc. Every CUDA compile runs inside `bonsai9b-engine:v1`.
+That covers `llama-resident` and, when present, `harness/kernels/`. The
+adapter (`harness/protocol-adapter`) builds on the host.
+
+The hosted CI does not compile CUDA. Its `llama-resident-cmake` job builds
+`llama_resident` for the CPU only and runs ctest on `ubuntu-24.04-arm`. Its
+adapter job runs cargo test, clippy and fmt on `ubuntu-latest`. A green hosted
+CI does not prove that your CUDA code compiles for `sm_121` with nvcc 13.0.
+
+The ranked job builds your candidate in its step "Setup (engine + pinned
+checkpoint)". A compile failure there fails the submission before any scoring.
+
+Build-check inside the same image before you submit:
+
+1. Build the image with `tools/engine/build-image.sh`. It uses the pinned base
+   digest.
+2. Run `./setup.sh`. It runs `tools/engine/build.sh`, which compiles
+   `llama-resident` and the kernels inside the image with the same nvcc, gcc,
+   cmake and ninja as the ranked box.
+3. Build the adapter with Rust 1.98.1.
 
 ## Organizer runbook
 
