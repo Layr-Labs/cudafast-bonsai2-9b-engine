@@ -835,7 +835,11 @@ static __global__ void mul_mat_q_j16_dl_ring(
                 }
             }
         }
-        __syncthreads(); // every warp is done with stage s
+        // Only reused stages need all warps to finish before the next bulk copy.
+        // This condition is uniform across the CTA; no stage is read after its last use.
+        if (k + S < nstages) {
+            __syncthreads();
+        }
         if (tid == 0 && k + S < nstages) {
             const int kk = k + S;
             const int nn = min(SPS, total - kk*SPS);
