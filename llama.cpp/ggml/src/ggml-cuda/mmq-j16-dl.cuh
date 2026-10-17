@@ -776,12 +776,20 @@ static __global__ void mul_mat_q_j16_dl_ring(
     __syncthreads();
     // Weights of the first S stages before the grid dependency wait (they do not depend on the previous kernel).
     // Weights are read once: evict-first in L2; the activations keep the default policy (every CTA reads them).
+    // Small Q8 matrices can be reused from L2 across drafter calls. Preserve the
+    // default allocation policy for those; stream the larger weights evict-first.
+    const bool keep_weights = FMT == GGML_CUDA_DL_FMT_Q8 &&
+            (int64_t) nrows_x*nst*GB <= (int64_t(24) << 20);
     const uint64_t wpol = ggml_cuda_dl_policy_evict_first();
     if (tid == 0) {
         for (int k = 0; k < S && k < nstages; ++k) {
             const int n = min(SPS, total - k*SPS);
             ggml_cuda_dl_mbar_expect_tx(&full[k], (uint32_t) n*(XB + yb_bytes));
-            ggml_cuda_dl_bulk_g2s_hint(smem + k*SB, x + (int64_t) (gs0 + k*SPS)*XB, (uint32_t) n*XB, &full[k], wpol);
+            if (keep_weights) {
+                ggml_cuda_dl_bulk_g2s(smem + k*SB, x + (int64_t) (gs0 + k*SPS)*XB, (uint32_t) n*XB, &full[k]);
+            } else {
+                ggml_cuda_dl_bulk_g2s_hint(smem + k*SB, x + (int64_t) (gs0 + k*SPS)*XB, (uint32_t) n*XB, &full[k], wpol);
+            }
         }
     }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
@@ -845,7 +853,11 @@ static __global__ void mul_mat_q_j16_dl_ring(
             const int nn = min(SPS, total - kk*SPS);
             const int gsk = gs0 + kk*SPS;
             ggml_cuda_dl_mbar_expect_tx(&full[s], (uint32_t) nn*(XB + yb_bytes));
-            ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + (int64_t) gsk*XB, (uint32_t) nn*XB, &full[s], wpol);
+            if (keep_weights) {
+                ggml_cuda_dl_bulk_g2s(smem + s*SB, x + (int64_t) gsk*XB, (uint32_t) nn*XB, &full[s]);
+            } else {
+                ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + (int64_t) gsk*XB, (uint32_t) nn*XB, &full[s], wpol);
+            }
             for (int j = 0; j < nn; ++j) {
                 ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB, (const char *) y + (int64_t) ((gsk + j) % nst)*yb_bytes, yb_bytes, &full[s]);
             }
