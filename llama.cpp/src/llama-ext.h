@@ -117,6 +117,18 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// Select the k largest logits of every output row on the device (k <= 32, 0 turns it off) and
+// copy only those and the row's first k logits to the host. llama_get_logits_ith still returns
+// the full row, copied from the device when it is first read. Returns false when the output
+// layer is not on a CUDA device or its rows are too narrow for the streaming selection.
+LLAMA_API bool llama_set_logits_topk(struct llama_context * ctx, int32_t k);
+
+// The selection for output i: the ids and logits of the k largest logits in descending order
+// (equal logits, -0.0 and +0.0 among them, in ascending id order; +NaN ranks above +inf and
+// -NaN below -inf) and the first k logits of the row. Returns false without a selection.
+LLAMA_API bool llama_get_logits_topk_ith(struct llama_context * ctx, int32_t i, const int32_t ** ids,
+                                         const float ** logits, const float ** head);
+
 //
 // model/context data extraction
 //

@@ -1,7 +1,7 @@
 #include "engine_llama.hpp"
 
 #include "common.h"
-// Staging API: llama_set_embeddings_nextn (common/speculative.cpp includes it the same way).
+// Staging API: llama_set_embeddings_nextn, llama_set_logits_topk (common/speculative.cpp includes it the same way).
 #include "../src/llama-ext.h"
 #include "logits_rank.hpp"
 #include "speculative_round.hpp"
@@ -217,6 +217,7 @@ LlamaEngine::LlamaEngine(const std::string &model_path, const std::string &spec_
     model_ = main_init_->model();
     ctx_tgt_ = main_init_->context();
     llama_set_sampler(ctx_tgt_, seq_id_, nullptr);
+    logits_topk_ = llama_set_logits_topk(ctx_tgt_, kTopK);
 
     const llama_vocab *vocab = llama_model_get_vocab(model_);
     vocab_size_ = llama_vocab_n_tokens(vocab);
@@ -333,6 +334,15 @@ void LlamaEngine::prefill_prompt(const llama_tokens &inp) {
 
 Emit LlamaEngine::emit_logits(int idx) const {
     llama_synchronize(ctx_tgt_);
+    if (logits_topk_) {
+        const int32_t *ids = nullptr;
+        const float *top = nullptr;
+        const float *head = nullptr;
+        Emit e;
+        if (llama_get_logits_topk_ith(ctx_tgt_, idx, &ids, &top, &head) && top_from_selection(ids, top, head, e)) {
+            return e;
+        }
+    }
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_));
     const float *logits = llama_get_logits_ith(ctx_tgt_, idx);
     if (!logits) {

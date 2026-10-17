@@ -81,6 +81,10 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    // device logits top-k, see llama_set_logits_topk
+    bool set_logits_topk(int32_t k);
+    bool get_logits_topk_ith(int32_t i, const int32_t ** ids, const float ** logits, const float ** head);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -245,6 +249,9 @@ private:
 
     void output_reorder();
 
+    // copy the raw logits the logits top-k left on the device (logits_dev) into `logits`
+    void logits_materialize();
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -312,6 +319,18 @@ private:
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
+
+    // logits top-k output (2-dimensional arrays: [n_outputs][cparams.logits_topk]): the ids and
+    // logits of the k largest logits, and the first k logits of the row
+    buffer_view<int32_t> logits_topk_ids  = {nullptr, 0};
+    buffer_view<float>   logits_topk_vals = {nullptr, 0};
+    buffer_view<float>   logits_topk_head = {nullptr, 0};
+    bool                 logits_topk_ready = false;
+
+    // with the logits top-k, the raw logits of the last ubatch stay on the device until they are
+    // read: the logits tensor and its first output row (valid until the next graph is allocated)
+    ggml_tensor * logits_dev     = nullptr;
+    int64_t       logits_dev_row = 0;
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
