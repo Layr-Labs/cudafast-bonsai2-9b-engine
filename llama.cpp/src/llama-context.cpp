@@ -1013,6 +1013,24 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+int32_t llama_context::get_logits_topk_ith(int32_t i, const int32_t ** ids, const float ** vals) {
+    output_reorder();
+
+    const int32_t k = logits_topk_n;
+    if (k <= 0 || !logits_topk_ids.has_data() || !logits_topk_vals.has_data()) {
+        return 0;
+    }
+    try {
+        const int64_t j = output_resolve_row(i);
+        *ids  = logits_topk_ids.data  + j*k;
+        *vals = logits_topk_vals.data + j*k;
+        return k;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
+        return 0;
+    }
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -1327,6 +1345,16 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
+    sched_need_reserve = true;
+}
+
+void llama_context::set_logits_topk(int32_t k) {
+    k = std::max<int32_t>(0, k);
+    if (cparams.logits_topk == k) {
+        return;
+    }
+    cparams.logits_topk = k;
+    logits_topk_n = 0;
     sched_need_reserve = true;
 }
 
@@ -1962,6 +1990,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+    logits_topk_n = 0;
 
     sched_reserve();
 
@@ -2115,8 +2144,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                           (size_t) n_outputs * row * sizeof(float));
         }
 
+        // extract the backend top-k of the logits instead of the full rows
+        const bool topk_out = cparams.logits_topk > 0 && res->t_logits_topk_ids && res->t_logits_topk_vals &&
+                              logits_topk_ids.has_data() && logits_topk_vals.has_data() && n_outputs > 0 &&
+                              sampling.samplers.empty();
+        if (topk_out) {
+            const int64_t k = cparams.logits_topk;
+            GGML_ASSERT(res->t_logits_topk_ids->ne[0] == k && res->t_logits_topk_ids->ne[1] == n_outputs);
+            GGML_ASSERT((n_outputs_prev + n_outputs)*k <= (int64_t) logits_topk_ids.size);
+            ggml_backend_t backend_ids  = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_logits_topk_ids);
+            ggml_backend_t backend_vals = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_logits_topk_vals);
+            GGML_ASSERT(backend_ids != nullptr && backend_vals != nullptr);
+            ggml_backend_tensor_get_async(backend_ids, res->t_logits_topk_ids, logits_topk_ids.data + n_outputs_prev*k,
+                                          0, n_outputs*k*sizeof(int32_t));
+            ggml_backend_tensor_get_async(backend_vals, res->t_logits_topk_vals, logits_topk_vals.data + n_outputs_prev*k,
+                                          0, n_outputs*k*sizeof(float));
+            logits_topk_n = (int32_t) k;
+        }
+
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (!topk_out && logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -2341,10 +2388,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     embd_capture.size      = has_embd_capture ? (size_t) cparams.n_capture_layers * hparams.n_embd * n_outputs_max : 0;
+    const size_t topk_count = cparams.logits_topk > 0 ? (size_t) cparams.logits_topk * n_outputs_max : 0;
     const size_t new_size  = (logits.size + embd.size + embd_nextn.size + embd_capture.size +
-                              embd_layer_inp_float_count + backend_float_count) *
+                              embd_layer_inp_float_count + backend_float_count + topk_count) *
                                  sizeof(float) +
-                             (backend_token_count) * sizeof(llama_token);
+                             (backend_token_count + topk_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2408,6 +2456,16 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd_capture = has_embd_capture ? buffer_view<float>{ (float *) (base + offset), embd_capture.size } :
                                       buffer_view<float>{ nullptr, 0 };
     offset += embd_capture.size * sizeof(float);
+
+    if (topk_count > 0) {
+        logits_topk_vals = buffer_view<float>{ (float *) (base + offset), topk_count };
+        offset += topk_count * sizeof(float);
+        logits_topk_ids = buffer_view<int32_t>{ (int32_t *) (base + offset), topk_count };
+        offset += topk_count * sizeof(int32_t);
+    } else {
+        logits_topk_vals = buffer_view<float>{ nullptr, 0 };
+        logits_topk_ids  = buffer_view<int32_t>{ nullptr, 0 };
+    }
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -2501,6 +2559,14 @@ void llama_context::output_reorder() {
         if (embd.size > 0) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd.data[i0*n_embd_out + k], embd.data[i1*n_embd_out + k]);
+            }
+        }
+
+        if (logits_topk_n > 0 && logits_topk_ids.has_data() && logits_topk_vals.has_data()) {
+            const uint64_t kt = logits_topk_n;
+            for (uint64_t k = 0; k < kt; k++) {
+                std::swap(logits_topk_ids.data[i0*kt + k],  logits_topk_ids.data[i1*kt + k]);
+                std::swap(logits_topk_vals.data[i0*kt + k], logits_topk_vals.data[i1*kt + k]);
             }
         }
 
@@ -4071,6 +4137,16 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+void llama_set_logits_topk(llama_context * ctx, int32_t k) {
+    ctx->set_logits_topk(k);
+}
+
+int32_t llama_get_logits_topk_ith(llama_context * ctx, int32_t i, const int32_t ** ids, const float ** vals) {
+    ctx->synchronize();
+
+    return ctx->get_logits_topk_ith(i, ids, vals);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

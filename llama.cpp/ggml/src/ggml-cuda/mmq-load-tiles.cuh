@@ -261,6 +261,70 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// L2 prefetch hints for the PQ2_0 X tile of K iteration kb0_hint (the rows and blocks that
+// ggml_cuda_mmq_load_tiles_pq2_0 reads). Each row segment of blocks_per_iter blocks is 68 bytes at
+// 2-byte alignment, so four 32-byte sector hints cover it. No-op past kb0_stop.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_hint_x_pq2_0(
+        const char * __restrict__ x, const int offset_x, const int kb0_hint, const int kb0_stop, const int i_max,
+        const int stride) {
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (kb0_hint >= kb0_stop) {
+        return;
+    }
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int blocks_per_iter = MMQ_ITER_K / QK_PQ2_0;
+    constexpr int seg_bytes       = blocks_per_iter * (int) sizeof(block_pq2_0);
+    constexpr int hints_per_row   = 4;
+    static_assert(seg_bytes <= 3*32 + 32 && seg_bytes > 64, "four sector hints per row segment");
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+#pragma unroll
+    for (int linear = tid; linear < I*hints_per_row; linear += nwarps*warp_size) {
+        const int row  = min(linear / hints_per_row, i_max);
+        const int hint = linear % hints_per_row;
+        const char * seg = reinterpret_cast<const char *>(
+            reinterpret_cast<const block_pq2_0 *>(x) + offset_x + row*stride + kb0_hint);
+        const char * p = seg + min(hint*32, seg_bytes - 1);
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(p)));
+    }
+#else
+    GGML_UNUSED_VARS(x, offset_x, kb0_hint, kb0_stop, i_max, stride);
+#endif
+}
+
+// Same L2 look-ahead hint for the Q8_0 X tile (34-byte blocks, MMQ_ITER_K / QK8_0 blocks per row
+// segment): ten 32-byte sector hints cover a 272-byte segment at any 2-byte alignment.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_hint_x_q8_0(
+        const char * __restrict__ x, const int offset_x, const int kb0_hint, const int kb0_stop, const int i_max,
+        const int stride) {
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (kb0_hint >= kb0_stop) {
+        return;
+    }
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int blocks_per_iter = MMQ_ITER_K / QK8_0;
+    constexpr int seg_bytes       = blocks_per_iter * (int) sizeof(block_q8_0);
+    constexpr int hints_per_row   = (seg_bytes + 31 + 31) / 32;
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+#pragma unroll
+    for (int linear = tid; linear < I*hints_per_row; linear += nwarps*warp_size) {
+        const int row  = min(linear / hints_per_row, i_max);
+        const int hint = linear % hints_per_row;
+        const char * seg = reinterpret_cast<const char *>(
+            reinterpret_cast<const block_q8_0 *>(x) + offset_x + row*stride + kb0_hint);
+        const char * p = seg + min(hint*32, seg_bytes - 1);
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(p)));
+    }
+#else
+    GGML_UNUSED_VARS(x, offset_x, kb0_hint, kb0_stop, i_max, stride);
+#endif
+}
+
 #if !defined(GGML_USE_HIP)
 template <ggml_type type, int J, bool fallback>
 static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const char * __restrict__ x,
