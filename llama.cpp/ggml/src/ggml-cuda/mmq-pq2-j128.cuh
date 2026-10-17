@@ -809,7 +809,8 @@ static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid,
         ggml_cuda_kernel_launch(mul_mat_q_stream_k_fixup<type, 128, false>,
             ggml_cuda_kernel_launch_params(dim3(grid, 128/32, 1), dim3(32, 4, 1), 0, stream),
             nullptr, nullptr, args.dst, tmp_fixup, blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst,
-            (int) args.nrows_dst, one_fd, (int) args.stride_channel_dst, one_fd, (int) args.stride_sample_dst, ntx_fd);
+            (int) args.nrows_dst, one_fd, (int) args.stride_channel_dst, one_fd, (int) args.stride_sample_dst, ntx_fd,
+            ggml_cuda_mmq_partition_init((uint64_t) ((args.nrows_x+127)/128)*nkb*ntx, grid));
     }
 }
 
