@@ -1,6 +1,9 @@
 #include "models.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
@@ -120,6 +123,53 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     }
 
     type = LLM_TYPE_UNKNOWN;
+}
+
+// DFlash2 proposes only tokens from the selector's top-k over the drafter logits, and the target
+// verifies every proposal, so the drafter may score a leading contiguous id range of the shared LM
+// head instead of the whole vocabulary: an id outside the range is never proposed, never emitted
+// by mistake. The range comes from the vocabulary alone. Byte-level BPE ids follow merge order, so
+// the frequent Latin-script and code tokens come first; the range ends after the last pure-ASCII
+// token of that leading block (the first run of 1024 ids without one), rounded up to whole waves
+// of the head's MMQ tiles on GB10 (128 rows x 48 SMs). GB10 only.
+// LLAMA_DFLASH_HEAD_ROWS=0 keeps the full head; N > 0 scores ids [0, N) (rounded up to 128).
+static int64_t dflash2_head_rows(const llama_model & model, int64_t n_vocab) {
+    bool gb10 = false;
+    for (const auto & d : model.devices) {
+        const char * desc = d.dev ? ggml_backend_dev_description(d.dev) : nullptr;
+        gb10 = gb10 || (desc && strstr(desc, "GB10") != nullptr);
+    }
+    if (!gb10) {
+        return 0;
+    }
+
+    int64_t rows = 0;
+    if (const char * env = getenv("LLAMA_DFLASH_HEAD_ROWS")) {
+        rows = GGML_PAD(std::max<int64_t>(0, atoll(env)), 128);
+    } else {
+        const int64_t gap  = 1024;
+        const int64_t wave = 128 * 48;
+        int64_t last = -1;
+        for (int64_t id = 0; id < n_vocab && id - last < gap; ++id) {
+            if (!(model.vocab.token_get_attr((llama_token) id) & LLAMA_TOKEN_ATTR_NORMAL)) {
+                continue;
+            }
+            const std::string & piece = model.vocab.token_to_piece((llama_token) id);
+            bool ascii = !piece.empty();
+            for (const char c : piece) {
+                ascii = ascii && (unsigned char) c < 0x80;
+            }
+            if (ascii) {
+                last = id;
+            }
+        }
+        rows = (last + 1 + wave - 1) / wave * wave; // wave is not a power of two: no GGML_PAD
+        LLAMA_LOG_INFO("%s: leading pure-ASCII token block ends at id %lld\n", __func__, (long long) last);
+        if (rows > n_vocab * 3 / 4) {
+            rows = 0; // no leading block worth restricting to
+        }
+    }
+    return rows > 0 && rows < n_vocab ? rows : 0;
 }
 
 void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
@@ -264,6 +314,15 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab_draft }, TENSOR_NOT_REQUIRED);
 
+    // DFlash2 sharing the target's full-vocabulary head: optionally score a leading id range only
+    if (selector_meta && output == nullptr && d2t == nullptr) {
+        dflash_head_rows = dflash2_head_rows(*this, n_vocab);
+        if (dflash_head_rows > 0) {
+            LLAMA_LOG_INFO("%s: DFlash2 drafter head scores token ids [0, %lld) of %lld (LLAMA_DFLASH_HEAD_ROWS=0: full)\n",
+                    __func__, (long long) dflash_head_rows, (long long) n_vocab);
+        }
+    }
+
     if (hparams.dsv4_hc_mult > 0) {
         const int64_t q_lora_rank     = hparams.n_lora_q;
         const int64_t n_ff_exp        = hparams.n_ff_exp;
@@ -363,11 +422,21 @@ template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
     auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
 
-    inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);
+    // one row per token, or one slab per target layer that the graph puts side by side per token
+    const int64_t n_slabs = cparams.encoder_inp_slabs;
+    inp_target->embd = n_slabs > 0
+        ? ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc() / n_slabs, n_tokens, n_slabs)
+        : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);
     ggml_set_input(inp_target->embd);
 
     ggml_tensor * cur = inp_target->embd;
     cb(cur, "inp_embd", -1);
+    res->t_inp_embd = cur;
+
+    if (n_slabs > 0) {
+        cur = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3)), hparams.n_embd_inp_enc(), n_tokens);
+        cb(cur, "inp_embd_rows", -1);
+    }
 
     res->add_input(std::move(inp_target));
 
@@ -884,6 +953,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         ggml_tensor * inp_g = inp->embd;
         cb(inp_g, "inp_g_embeddings", -1);
+        res->t_inp_embd = inp_g;
 
         res->add_input(std::move(inp));
 
@@ -1117,7 +1187,47 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         output_s = model_other->output_s;
     }
 
-    cur = build_lora_mm(output, cur, output_s);
+    // only in graphs whose logits nobody extracts (no output rows: the DFlash2 noise block); a
+    // batch that asks for logits (e.g. the init warm-up) gets the full head
+    const int64_t head_rows = model.dflash_selector_hidden && !model.d2t && loras->empty() && n_outputs == 0
+        ? model.dflash_head_rows : 0;
+    if (head_rows > 0 && head_rows < output->ne[1] && output->ne[1] == (int64_t) model.vocab.n_tokens()) {
+        // build_lora_mm with the leading head_rows rows of the head: the activation gets the
+        // transform of the full tensor, then multiplies a view of its first rows in place, so
+        // every logit in the range equals the full head's; selector ids are token ids as before
+        ggml_tensor * cur_mm = cur;
+        if (hadamard_rotations) {
+            const auto it = hadamard_rotations->find(output);
+            if (it != hadamard_rotations->end()) {
+                const auto & t = it->second;
+                const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
+                const auto memo_it  = hadamard_memo.find(memo_key);
+                if (memo_it != hadamard_memo.end()) {
+                    cur_mm = memo_it->second;
+                } else {
+                    if (t.perm_rep > 1) {
+                        ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
+                        const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+                        x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+                        x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+                        cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+                    }
+                    if (t.signs) {
+                        cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
+                    }
+                    cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+                    hadamard_memo[memo_key] = cur_mm;
+                }
+            }
+        }
+        ggml_tensor * head = ggml_view_2d(ctx0, output, output->ne[0], head_rows, output->nb[1], 0);
+        cur = ggml_mul_mat(ctx0, head, cur_mm);
+        if (output_s) {
+            cur = ggml_mul(ctx0, cur, output_s);
+        }
+    } else {
+        cur = build_lora_mm(output, cur, output_s);
+    }
 
     // DFlash2 feeds these logits to the selector, so they need the target's output
     // transforms; DFlash1 and DSpark read them through the sampler instead
@@ -1192,6 +1302,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
         ggml_tensor * inp_g = inp->embd;
         cb(inp_g, "inp_g_embeddings", -1);
+        res->t_inp_embd = inp_g;
 
         res->add_input(std::move(inp));
 

@@ -64,3 +64,22 @@ inline Emit top_from_logits(const float *logits, int n_vocab) {
     }
     return e;
 }
+
+// The device selection of a row (llama_get_logits_topk_ith: the kTopK largest logits and the
+// first kTopK logits of the row) gives the scan's result unless a NaN reaches the scan. A +NaN
+// would top the selection, a NaN among the first kTopK logits would seed the scan. Without
+// either, the row's NaNs are -NaN, which the device ranks below every other logit and the scan
+// never inserts, so both keep the kTopK largest of the other logits in logit_id_before order.
+// Returns false when the row needs the scan.
+inline bool top_from_selection(const int32_t *ids, const float *logits, const float *head, Emit &e) {
+    for (int i = 0; i < kTopK; ++i) {
+        if (std::isnan(logits[i]) || std::isnan(head[i])) {
+            return false;
+        }
+    }
+    e.token = ids[0];
+    for (int i = 0; i < kTopK; ++i) {
+        e.top.push_back({ids[i], logits[i]});
+    }
+    return true;
+}

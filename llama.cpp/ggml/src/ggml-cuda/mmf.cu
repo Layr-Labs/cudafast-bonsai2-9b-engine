@@ -10,6 +10,42 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     }
 }
 
+// Same warp count as mul_mat_f_cuda picks, so that each warp of the split covers the same K columns.
+static int mmf_nwarps_best(const int64_t ncols_x, const int warp_size, const int cc) {
+    int64_t nwarps_best    = 1;
+    int64_t niter_best     = (ncols_x + warp_size*2 - 1) / (warp_size*2);
+    const int64_t max_block_size = mmf_get_max_block_size(cc);
+    for (int64_t nwarps = 2; nwarps <= max_block_size/warp_size; nwarps++) {
+        const int64_t niter = (ncols_x + nwarps*warp_size*2 - 1) / (nwarps*warp_size*2);
+        if (niter < niter_best) {
+            niter_best  = niter;
+            nwarps_best = nwarps;
+        }
+    }
+    return (int) nwarps_best;
+}
+
+static bool ggml_cuda_mul_mat_f_ksplit(ggml_backend_cuda_context & ctx, const float * x, const float * y, float * dst,
+        const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_dst,
+        const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst, const int cc, const int warp_size) {
+    if (cc != GGML_CUDA_CC_DGX_SPARK || warp_size != 32 || ncols_dst != mmf_ksplit_cols || nrows_x % MMF_ROWS_PER_BLOCK != 0 ||
+            nrows_x > 4*MMF_ROWS_PER_BLOCK || mmf_nwarps_best(ncols_x, warp_size, cc) != mmf_ksplit_nwarps) {
+        return false;
+    }
+    const int64_t nrb = nrows_x / MMF_ROWS_PER_BLOCK;
+    ggml_cuda_pool_alloc<float> part(ctx.pool(), nrb*GGML_PAD(mmf_ksplit_cols, 8)*mmf_ksplit_nwarps*MMF_ROWS_PER_BLOCK);
+    const int nbytes_shared = 16 * (warp_size + mmf_get_padding(cc)) * (int) sizeof(float);
+    // GB10 only (checked above): both kernels wait for their predecessor (ggml_cuda_pdl_sync)
+    ggml_cuda_kernel_launch(mul_mat_f_ksplit_partial,
+        ggml_cuda_kernel_launch_params(dim3(nrb*mmf_ksplit_nwarps*(MMF_ROWS_PER_BLOCK/16)*(mmf_ksplit_cols/8)),
+                                       dim3(warp_size, 1, 1), nbytes_shared, ctx.stream()),
+        x, y, part.get(), (int) ncols_x, (int) stride_row, (int) stride_col_y);
+    ggml_cuda_kernel_launch(mul_mat_f_ksplit_reduce,
+        ggml_cuda_kernel_launch_params(dim3(nrb), dim3(MMF_ROWS_PER_BLOCK, mmf_ksplit_cols, 1), 0, ctx.stream()),
+        part.get(), dst, (int) stride_col_dst);
+    return true;
+}
+
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
@@ -99,6 +135,12 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int device    = ggml_cuda_get_device();
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int rows_per_block = mmf_get_rows_per_block(cc);
+
+    if (!ids && src0->type == GGML_TYPE_F32 && ne02 == 1 && ne03 == 1 && nchannels_dst == 1 && ne3 == 1 &&
+            ggml_cuda_mul_mat_f_ksplit(ctx, (const float *) src0->data, src1_d, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y,
+                stride_col_dst, cc, ggml_cuda_info().devices[device].warp_size)) {
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32: {

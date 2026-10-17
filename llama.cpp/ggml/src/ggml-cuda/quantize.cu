@@ -677,12 +677,16 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
 template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool swiglu = false, bool rms_scale = false>
 static __global__ void quantize_mmq_q8_1(
-        const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+        const float * x, const int32_t * ids, void * vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int ne1, const int ne2, const int n_expert_used,
-        const float * __restrict__ gate = nullptr,
-        const float * __restrict__ norm_weight = nullptr,
-        const float * __restrict__ norm_scale = nullptr) {
+        const float * gate = nullptr,
+        const float * norm_weight = nullptr,
+        const float * norm_scale = nullptr) {
+    // quantize_mmq_q8_1_cuda launches this kernel with programmatic stream serialization on GB10; nothing
+    // is read before ggml_cuda_pdl_sync() below, and the pointer arguments are not __restrict__ so no
+    // access moves above it.
+    ggml_cuda_pdl_lc();
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -894,18 +898,19 @@ void quantize_mmq_q8_1_cuda(
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            mmq_launch_kernel(cc, quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false>, num_blocks, block_size, 0, stream,
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0, nullptr, nullptr, nullptr);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            mmq_launch_kernel(cc, quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false>, num_blocks, block_size, 0, stream,
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0, nullptr, nullptr, nullptr);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false>
-                <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
+            mmq_launch_kernel(cc, quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false>, num_blocks, block_size, 0, stream,
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0, nullptr, nullptr, nullptr);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -1005,4 +1010,59 @@ void quantize_mmq_fp4_cuda(
 
         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
     }
+}
+
+// C6a: preserve standalone FWHT butterfly and MMQ scale/rounding; only stores differ.
+// SWIGLU: the input is a SwiGLU no other node reads. Each element is formed with the expression of
+// unary_gated_op_kernel<op_silu, T> (x activated, g the multiplier, row strides o0/o1 in elements),
+// so it is the value that kernel would have stored and the plain variant would load here.
+template <typename T, bool SIGNED, bool SWIGLU>
+__launch_bounds__(256, 1)
+static __global__ void fwht_quantize_mmq_d4(const T * x, const T * g, const float * signs, block_q8_1_mmq * y,
+                                         int64_t k, int64_t kp, int64_t rows, int64_t o0, int64_t o1) {
+    constexpr int N=4096, NT=256, NE=N/NT;
+    __shared__ float shared[N];
+    const int tid=threadIdx.x, lane=tid%32;
+    const int64_t row=blockIdx.y, base=int64_t(blockIdx.x)*N;
+    float v[NE];
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    if (base<k) {
+#pragma unroll
+        for(int i=0;i<NE;++i) {
+            if constexpr(SWIGLU) {
+                const int64_t col=base+i*NT+tid;
+                v[i]=float(T(ggml_cuda_op_silu_single(float(x[row*o0+col]))*float(g[row*o1+col])))*(1.0f/64.0f);
+            } else {
+                v[i]=float(x[row*k+base+i*NT+tid])*(1.0f/64.0f);
+            }
+            if constexpr(SIGNED) v[i]*=signs[base+i*NT+tid];
+        }
+        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    } else {
+#pragma unroll
+        for(int i=0;i<NE;++i) v[i]=0.0f;
+    }
+#pragma unroll
+    for(int i=0;i<NE;++i) {
+        const int64_t col=base+i*NT+tid;
+        const float amax=warp_reduce_max<32>(fabsf(v[i]));
+        const float d_inv=127.0f/amax;
+        const int8_t q=roundf(v[i]*d_inv);
+        const int64_t ib=(col/QK8_1_MMQ)*rows+row;
+        y[ib].qs[col%QK8_1_MMQ]=q;
+        if(lane==0) y[ib].d4[(col%QK8_1_MMQ)/32]=1.0f/d_inv;
+    }
+    GGML_UNUSED(kp); GGML_UNUSED(g); GGML_UNUSED(o0); GGML_UNUSED(o1);
+}
+void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * signs, void * y,
+    int64_t k, int64_t kp, int64_t rows, cudaStream_t stream, const void * g, int64_t o0, int64_t o1) {
+    GGML_ASSERT(k%4096==0 && kp%4096==0 && kp>=k);
+    const dim3 grid(kp/4096,rows,1);
+    const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
+#define C6_LAUNCH(T, GLU) do { if(signs) { ggml_cuda_kernel_launch(fwht_quantize_mmq_d4<T,true,GLU>,lp,(const T*)x,(const T*)g,signs,(block_q8_1_mmq*)y,k,kp,rows,o0,o1); } else { ggml_cuda_kernel_launch(fwht_quantize_mmq_d4<T,false,GLU>,lp,(const T*)x,(const T*)g,signs,(block_q8_1_mmq*)y,k,kp,rows,o0,o1); } } while(0)
+#define C6_LAUNCH_T(T) do { if(g) { C6_LAUNCH(T, true); } else { C6_LAUNCH(T, false); } } while(0)
+    if(type==GGML_TYPE_F32) { C6_LAUNCH_T(float); } else { GGML_ASSERT(type==GGML_TYPE_F16); C6_LAUNCH_T(half); }
+#undef C6_LAUNCH_T
+#undef C6_LAUNCH
 }
