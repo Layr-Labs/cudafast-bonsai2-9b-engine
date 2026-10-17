@@ -117,9 +117,15 @@ int main() {
         const int64_t o1 = (src1 ? src1->nb[1] : src0->nb[1]) / ts;
 
         std::vector<unsigned char> ref(qbytes + guard), fused(qbytes + guard);
+        // the kernels launch as programmatic dependents on a non-blocking stream: poison the outputs on
+        // that stream and let it drain, so no memset is still in flight when a kernel starts
+        auto poison = [&]() {
+            check(cudaMemsetAsync(qr, 0xa5, qbytes + guard, cuda.stream()));
+            check(cudaMemsetAsync(qf, 0xa5, qbytes + guard, cuda.stream()));
+            check(cudaStreamSynchronize(cuda.stream()));
+        };
         for (bool capture : {false, true}) {
-            check(cudaMemset(qr, 0xa5, qbytes + guard));
-            check(cudaMemset(qf, 0xa5, qbytes + guard));
+            poison();
             if (capture) check(cudaStreamBeginCapture(cuda.stream(), cudaStreamCaptureModeGlobal));
             ggml_cuda_op_swiglu(cuda, glu);
             fwht_quantize_mmq_d4_cuda(dt, type, signs_on ? ds : nullptr, qr, k, kp, rows, cuda.stream());
@@ -135,6 +141,7 @@ int main() {
                     if (replay) {
                         fill();
                         upload();
+                        poison();
                     }
                     check(cudaGraphLaunch(exec, cuda.stream()));
                 }

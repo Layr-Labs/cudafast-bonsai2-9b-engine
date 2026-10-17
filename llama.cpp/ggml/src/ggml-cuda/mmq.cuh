@@ -1617,6 +1617,7 @@ static void mmq_launch_kernel(const int cc, Kernel kernel, const dim3 & block_nu
 }
 
 #include "mmq-pq2-j16.cuh"
+#include "mmq-j16-dl.cuh"
 
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -1624,6 +1625,23 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int cc = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
+
+    // GB10 J=16 PQ2_0 / Q8_0 weight with a decode layout copy (made at model load, mmq-j16-dl.cuh):
+    // bit-exact streaming kernels on the copy.
+    if constexpr ((type == GGML_TYPE_PQ2_0 || type == GGML_TYPE_Q8_0) && J == 16 && !fallback) {
+        if (cc == GGML_CUDA_CC_DGX_SPARK) {
+            const ggml_cuda_dl_entry * e = ggml_cuda_dl_find(args.x);
+            if (e != nullptr && ggml_cuda_mmq_dl_supported(args, *e)) {
+                const int grid = ggml_cuda_mmq_pq2_j16_grid(args, nsm);
+                ggml_cuda_pool_alloc<float> tmp_fixup(ctx.pool(id));
+                if (ggml_cuda_mmq_pq2_j16_needs_fixup(args, grid)) {
+                    tmp_fixup.alloc((size_t) grid*16*128);
+                }
+                ggml_cuda_mmq_dl_run<type>(args, *e, grid, nsm, tmp_fixup.ptr, stream);
+                return;
+            }
+        }
+    }
 
     // GB10 J=16 PQ2_0: bit-exact kernel without the X shared-memory tile (mmq-pq2-j16.cuh).
     if constexpr (type == GGML_TYPE_PQ2_0 && J == 16 && !fallback) {

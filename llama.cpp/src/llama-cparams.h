@@ -72,6 +72,13 @@ struct llama_cparams {
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
+    // the extracted layer inputs stay on the device for llama_set_embd_import_layer_inp (no host copy)
+    bool embeddings_layer_inp_dev = false;
+
+    // > 0: the encoder takes its embeddings input as this many slabs of [n_embd_inp_enc / n, n_tokens]
+    // and puts them side by side in one row per token
+    uint32_t encoder_inp_slabs = 0;
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 

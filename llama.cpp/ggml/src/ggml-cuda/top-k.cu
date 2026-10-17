@@ -86,13 +86,19 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         if (cc == GGML_CUDA_CC_DGX_SPARK) {
             // topk_select_launch with programmatic stream serialization (both passes wait for their predecessor)
-            const int nchunks = (ncols + TOPK_SELECT_CHUNK - 1) / TOPK_SELECT_CHUNK;
+            const int nchunks = topk_select_nchunks(ncols);
             ggml_cuda_kernel_launch(topk_select_partial,
                 ggml_cuda_kernel_launch_params(dim3(nchunks, nrows, 1), dim3(TOPK_SELECT_NT), 0, stream),
                 src0_d, scratch.get(), ncols, k);
-            ggml_cuda_kernel_launch(topk_select_merge,
-                ggml_cuda_kernel_launch_params(dim3(nrows, 1, 1), dim3(TOPK_SELECT_NT), 0, stream),
-                (const uint64_t *) scratch.get(), dst_d, nchunks, k);
+            if (nchunks <= TOPK_SELECT_MERGE_WARP) {
+                ggml_cuda_kernel_launch(topk_select_merge_warp,
+                    ggml_cuda_kernel_launch_params(dim3(nrows, 1, 1), dim3(32), 0, stream),
+                    (const uint64_t *) scratch.get(), dst_d, nchunks, k);
+            } else {
+                ggml_cuda_kernel_launch(topk_select_merge,
+                    ggml_cuda_kernel_launch_params(dim3(nrows, 1, 1), dim3(TOPK_SELECT_NT), 0, stream),
+                    (const uint64_t *) scratch.get(), dst_d, nchunks, k);
+            }
             return;
         }
         topk_select_launch(src0_d, dst_d, scratch.get(), ncols, nrows, k, stream);

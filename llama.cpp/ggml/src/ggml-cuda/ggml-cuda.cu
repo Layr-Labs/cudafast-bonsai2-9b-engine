@@ -745,6 +745,8 @@ struct ggml_backend_cuda_buffer_context {
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    // decode layout copies of weights in this buffer (mmq-j16-dl.cuh)
+    ggml_cuda_dl_unregister_range(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -847,11 +849,51 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     GGML_UNUSED(buffer);
 }
 
+// GB10: a whole-buffer clear (every llama memory clear, e.g. at each prefill request) is not waited for on the
+// host. The buffer's own host transfers use the same stream (cudaStreamPerThread), so they stay ordered after it,
+// and every backend stream waits for the latest clear of its device before its next use
+// (ggml_cuda_wait_buffer_clears), so no kernel or async copy can see the buffer before it is cleared.
+struct ggml_cuda_buffer_clears {
+    std::mutex                                 mutex;
+    cudaEvent_t                                event[GGML_CUDA_MAX_DEVICES]      = { nullptr };
+    uint64_t                                   generation[GGML_CUDA_MAX_DEVICES] = { 0 };
+    std::unordered_map<cudaStream_t, uint64_t> seen; // generation each backend stream has waited for
+};
+
+static ggml_cuda_buffer_clears & ggml_cuda_buffer_clears_state() {
+    static ggml_cuda_buffer_clears state;
+    return state;
+}
+
+static void ggml_cuda_wait_buffer_clears(const int device, cudaStream_t stream) {
+    ggml_cuda_buffer_clears & st = ggml_cuda_buffer_clears_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    const uint64_t gen = st.generation[device];
+    if (gen == 0) {
+        return;
+    }
+    uint64_t & seen = st.seen[stream];
+    if (seen != gen) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, st.event[device], 0));
+        seen = gen;
+    }
+}
+
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
+    if (ggml_cuda_info().devices[ctx->device].cc == GGML_CUDA_CC_DGX_SPARK) {
+        ggml_cuda_buffer_clears & st = ggml_cuda_buffer_clears_state();
+        std::lock_guard<std::mutex> lock(st.mutex);
+        if (!st.event[ctx->device]) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&st.event[ctx->device], cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(st.event[ctx->device], cudaStreamPerThread));
+        st.generation[ctx->device]++;
+        return;
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -2456,6 +2498,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_wait_buffer_clears(cuda_ctx->device, cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -2465,6 +2508,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_wait_buffer_clears(cuda_ctx->device, cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -2475,6 +2519,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_wait_buffer_clears(cuda_ctx->device, cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -2486,6 +2531,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_wait_buffer_clears(cuda_ctx->device, cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -2516,6 +2562,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         return false;
     }
 
+    ggml_cuda_wait_buffer_clears(cuda_ctx_src->device, cuda_ctx_src->stream());
     if (backend_src != backend_dst) {
         // copy on src stream
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
@@ -3472,6 +3519,35 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 }
 
 
+// ADD -> RMS_NORM -> MUL as add_rms_norm_f32: one block per row, and every element is touched by one thread
+// only (read a and b, write the sum; after the block reduction read the sum, write dst). An output that starts
+// at the same address as a same-sized ADD input (the graph allocator's in-place ADD) is therefore safe; any
+// other overlap of an output with an input is refused, as in ggml_cuda_check_fusion_memory_ranges.
+static bool ggml_cuda_add_rms_norm_alias_ok(const ggml_tensor * add, const ggml_tensor * mul, const ggml_tensor * weight) {
+    auto extent = [](const ggml_tensor * t) {
+        const int64_t start = (int64_t) t->data;
+        return std::make_pair(start, start + (int64_t) ggml_backend_buft_get_alloc_size(t->buffer->buft, t));
+    };
+    auto overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        const auto ea = extent(a);
+        const auto eb = extent(b);
+        return ea.first < eb.second && eb.first < ea.second;
+    };
+    const ggml_tensor * outs[] = { add, mul };
+    const ggml_tensor * srcs[] = { add->src[0], add->src[1] };
+    if (overlap(add, mul) || overlap(add, weight) || overlap(mul, weight)) {
+        return false;
+    }
+    for (const ggml_tensor * o : outs) {
+        for (const ggml_tensor * x : srcs) {
+            if (overlap(o, x) && (o->data != x->data || ggml_nbytes(o) != ggml_nbytes(x) || !ggml_is_contiguous(x))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -3816,11 +3892,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_are_same_shape(node, rms_norm) && ggml_is_contiguous(node->src[0]) &&
                 ggml_is_contiguous(node->src[1]) && ggml_is_contiguous(node) &&
                 ggml_is_contiguous(rms_norm) && ggml_is_contiguous(mul) &&
-                ggml_can_fuse_subgraph(cgraph, i, 3, ops, out_nodes, 2) &&
-                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 2)) {
+                ggml_can_fuse_subgraph(cgraph, i, 3, ops, out_nodes, 2)) {
             const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
             if (weight && weight->type == GGML_TYPE_F32 && ggml_is_contiguous(weight) &&
-                    weight->ne[0] == node->ne[0] && ggml_nrows(weight) == 1) {
+                    weight->ne[0] == node->ne[0] && ggml_nrows(weight) == 1 &&
+                    (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 2) ||
+                     ggml_cuda_add_rms_norm_alias_ok(node, mul, weight))) {
                 ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, rms_norm, mul);
                 return 2;
             }
@@ -5003,6 +5080,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_wait_buffer_clears(cuda_ctx->device, cuda_ctx->stream());
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -6240,8 +6318,24 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// GB10: decode layout copy (value-exact block permutation, mmq-j16-dl.cuh) of a weight that the J=16 decode
+// matmuls read. Called once per weight at model load. Returns the bytes allocated (0: not eligible).
+static size_t ggml_backend_cuda_register_decode_layout(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr || tensor->data == nullptr || tensor->view_src != nullptr ||
+            !ggml_backend_buffer_is_cuda(tensor->buffer) || !ggml_is_contiguous(tensor) ||
+            tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+        return 0;
+    }
+    const ggml_backend_cuda_buffer_context * ctx = (const ggml_backend_cuda_buffer_context *) tensor->buffer->context;
+    ggml_cuda_set_device(ctx->device);
+    return ggml_cuda_dl_register(tensor->data, tensor->ne[1], tensor->ne[0], tensor->type);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_register_decode_layout") == 0) {
+        return (void *)ggml_backend_cuda_register_decode_layout;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
