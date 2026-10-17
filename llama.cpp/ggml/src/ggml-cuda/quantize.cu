@@ -1006,3 +1006,48 @@ void quantize_mmq_fp4_cuda(
         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
     }
 }
+
+// C6a: preserve standalone FWHT butterfly and MMQ scale/rounding; only stores differ.
+template <typename T, bool SIGNED>
+__launch_bounds__(256, 1)
+static __global__ void fwht_quantize_mmq_d4(const T * x, const float * signs, block_q8_1_mmq * y,
+                                         int64_t k, int64_t kp, int64_t rows) {
+    constexpr int N=4096, NT=256, NE=N/NT;
+    __shared__ float shared[N];
+    const int tid=threadIdx.x, lane=tid%32;
+    const int64_t row=blockIdx.y, base=int64_t(blockIdx.x)*N;
+    float v[NE];
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    if (base<k) {
+#pragma unroll
+        for(int i=0;i<NE;++i) {
+            v[i]=float(x[row*k+base+i*NT+tid])*(1.0f/64.0f);
+            if constexpr(SIGNED) v[i]*=signs[base+i*NT+tid];
+        }
+        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    } else {
+#pragma unroll
+        for(int i=0;i<NE;++i) v[i]=0.0f;
+    }
+#pragma unroll
+    for(int i=0;i<NE;++i) {
+        const int64_t col=base+i*NT+tid;
+        const float amax=warp_reduce_max<32>(fabsf(v[i]));
+        const float d_inv=127.0f/amax;
+        const int8_t q=roundf(v[i]*d_inv);
+        const int64_t ib=(col/QK8_1_MMQ)*rows+row;
+        y[ib].qs[col%QK8_1_MMQ]=q;
+        if(lane==0) y[ib].d4[(col%QK8_1_MMQ)/32]=1.0f/d_inv;
+    }
+    GGML_UNUSED(kp);
+}
+void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * signs, void * y,
+    int64_t k, int64_t kp, int64_t rows, cudaStream_t stream) {
+    GGML_ASSERT(k%4096==0 && kp%4096==0 && kp>=k);
+    const dim3 grid(kp/4096,rows,1);
+    const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
+#define C6_LAUNCH(T) do { if(signs) { ggml_cuda_kernel_launch(fwht_quantize_mmq_d4<T,true>,lp,(const T*)x,signs,(block_q8_1_mmq*)y,k,kp,rows); } else { ggml_cuda_kernel_launch(fwht_quantize_mmq_d4<T,false>,lp,(const T*)x,signs,(block_q8_1_mmq*)y,k,kp,rows); } } while(0)
+    if(type==GGML_TYPE_F32) { C6_LAUNCH(float); } else { GGML_ASSERT(type==GGML_TYPE_F16); C6_LAUNCH(half); }
+#undef C6_LAUNCH
+}
