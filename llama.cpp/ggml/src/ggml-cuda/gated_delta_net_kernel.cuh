@@ -802,7 +802,7 @@ gated_delta_net_l8_cuda(const float * q, const float * k, const float * v, const
 // GB10 verify-sized ubatches (n_tokens <= GDN_L8V_MAX_TOKENS): gated_delta_net_l8_cuda with all token inputs but q
 // staged in shared memory before the recurrence and the gates activated once per token (by lane t), so a step
 // waits on no global load of k, v, g or beta. Values and their order are those of gated_delta_net_l8_cuda.
-template <bool RAW, bool G_PRECOMPUTED, bool LAZY>
+template <bool RAW, bool G_PRECOMPUTED, bool LAZY, int FIXED_TOKENS = 0>
 __global__ void __launch_bounds__(128, 6)
 gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, const float * g, const float * beta,
                         const float * raw_dt_bias, const float * raw_a, const float * curr_state, float * dst,
@@ -811,6 +811,9 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
                         int64_t sb1, int64_t sb2, int64_t sb3, const uint3 neqk1_magic, const uint3 rq3_magic,
                         float scale, int64_t state_slot_stride, int K, const int32_t * s_ids, int64_t s_row_stride,
                         int lazy) {
+    if constexpr (FIXED_TOKENS > 0) {
+        n_tokens = FIXED_TOKENS;
+    }
     constexpr int S_v = 128;
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
