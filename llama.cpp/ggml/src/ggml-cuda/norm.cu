@@ -166,6 +166,9 @@ static __global__ void add_rms_norm_f32(
     sum += row*ncols;
     dst += row*ncols;
 
+    // programmatic stream serialization on GB10 (ggml_cuda_op_add_rms_norm_fused)
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
     float tmp = 0.0f;
     for (int col = tid; col < ncols; col += block_size) {
         const float xi = __fadd_rn(a[col], b[col]);
@@ -604,12 +607,13 @@ void ggml_cuda_op_add_rms_norm_fused(
     const int ncols = add->ne[0];
     const dim3 grid(add->ne[1], add->ne[2], add->ne[3]);
     cudaStream_t stream = ctx.stream();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (ncols < 1024) {
-        add_rms_norm_f32<256><<<grid, 256, 32*sizeof(float), stream>>>(
+        ggml_cuda_kernel_launch_gb10(cc, add_rms_norm_f32<256>, ggml_cuda_kernel_launch_params(grid, dim3(256), 32*sizeof(float), stream),
             (const float *) a->data, (const float *) b->data, (const float *) weight->data,
             (float *) add->data, (float *) mul->data, ncols, eps);
     } else {
-        add_rms_norm_f32<1024><<<grid, 1024, 32*sizeof(float), stream>>>(
+        ggml_cuda_kernel_launch_gb10(cc, add_rms_norm_f32<1024>, ggml_cuda_kernel_launch_params(grid, dim3(1024), 32*sizeof(float), stream),
             (const float *) a->data, (const float *) b->data, (const float *) weight->data,
             (float *) add->data, (float *) mul->data, ncols, eps);
     }

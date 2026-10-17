@@ -1889,3 +1889,15 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     CUDA_CHECK(cudaGetLastError());
 }
 
+// GB10 (DGX Spark): launch through ggml_cuda_kernel_launch (programmatic stream serialization); other devices
+// keep the plain launch. The kernel must call ggml_cuda_pdl_sync() before it reads memory written by an
+// earlier kernel of the stream or writes memory an earlier kernel may still read.
+template<typename Kernel, typename... Args>
+static __inline__ void ggml_cuda_kernel_launch_gb10(const int cc, Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
+    if (cc == GGML_CUDA_CC_DGX_SPARK) {
+        ggml_cuda_kernel_launch(kernel, launch_params, std::forward<Args>(args)...);
+        return;
+    }
+    kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
+}
+
