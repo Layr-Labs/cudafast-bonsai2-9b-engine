@@ -8,6 +8,10 @@ option(LLAMA_RESIDENT_BUILD_TESTS "Build llama-resident unit tests" ON)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 option(LLAMA_RESIDENT_CUDA "Build with the CUDA ggml backend" ON)
 set(GGML_CUDA ${LLAMA_RESIDENT_CUDA} CACHE BOOL "Build CUDA backend" FORCE)
+if(LLAMA_RESIDENT_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+endif()
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -50,6 +54,31 @@ set_target_properties(llama-resident-min PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${
 
 if(LLAMA_RESIDENT_BUILD_TESTS)
     enable_testing()
+    if(LLAMA_RESIDENT_CUDA)
+        add_executable(fwht-mmq-equivalence test/fwht_mmq_equivalence.cu)
+        target_include_directories(fwht-mmq-equivalence PRIVATE
+            ${LLAMA_CPP_DIR}/ggml/src
+            ${LLAMA_CPP_DIR}/ggml/src/ggml-cuda)
+        # This test uses the internal CUDA context; graph-related macros affect its ABI.
+        target_compile_definitions(fwht-mmq-equivalence PRIVATE
+            $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
+        target_link_libraries(fwht-mmq-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        add_test(NAME fwht-mmq-equivalence COMMAND fwht-mmq-equivalence)
+
+        add_executable(logits-topk-equivalence test/logits_topk_equivalence.cpp)
+        target_compile_features(logits-topk-equivalence PRIVATE cxx_std_17)
+        target_include_directories(logits-topk-equivalence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(logits-topk-equivalence PRIVATE ggml)
+        add_test(NAME logits-topk-equivalence COMMAND logits-topk-equivalence)
+        add_executable(swiglu-fwht-equivalence test/swiglu_fwht_equivalence.cu)
+        target_include_directories(swiglu-fwht-equivalence PRIVATE
+            ${LLAMA_CPP_DIR}/ggml/src
+            ${LLAMA_CPP_DIR}/ggml/src/ggml-cuda)
+        target_compile_definitions(swiglu-fwht-equivalence PRIVATE
+            $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
+        target_link_libraries(swiglu-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        add_test(NAME swiglu-fwht-equivalence COMMAND swiglu-fwht-equivalence)
+    endif()
     add_executable(llama-resident-tests
         test/test_session.cpp
         engine_fake.cpp
