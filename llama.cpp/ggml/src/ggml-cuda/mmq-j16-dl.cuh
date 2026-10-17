@@ -947,7 +947,7 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
             if (tiling && ntiles > 4*nsm) {
                 ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);
             } else {
-                ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+                ggml_cuda_mmq_dl_launch_ring<FMT, 2, 4>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
             }
         } else if (e.dl_type == GGML_TYPE_PTQ1_0 && ring_pt && args.nrows_x >= 2048) {
             constexpr int FMT = GGML_CUDA_DL_FMT_PTQ1;
