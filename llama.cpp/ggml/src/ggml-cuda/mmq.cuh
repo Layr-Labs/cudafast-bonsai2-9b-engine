@@ -930,7 +930,8 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int tile_y_stride = GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     constexpr bool async_buffer_y =
-        type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0;
+        type == GGML_TYPE_Q1_0 || type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0 ||
+        (type == GGML_TYPE_Q8_0 && J <= 32);
 #else
     constexpr bool async_buffer_y = false;
 #endif
@@ -1611,7 +1612,8 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
     const size_t nbs_y_padded = GGML_PAD(nbs_y, config.nthreads*sizeof(int));
     const bool async_buffer_y = cc == GGML_CUDA_CC_DGX_SPARK &&
-        (config.type == GGML_TYPE_Q1_0 || config.type == GGML_TYPE_Q2_0 || config.type == GGML_TYPE_PQ2_0);
+        (config.type == GGML_TYPE_Q1_0 || config.type == GGML_TYPE_Q2_0 || config.type == GGML_TYPE_PQ2_0 ||
+         (config.type == GGML_TYPE_Q8_0 && config.J <= 32));
     const int y_buffers = async_buffer_y ? 2 : 1;
     return nbs_ids + nbs_x + y_buffers*nbs_y_padded;
 }
