@@ -1586,6 +1586,7 @@ struct ggml_cuda_gdn_gather_context {
 // later PTQ1_0 mat-vec whose src1 landed there must not mistake its F32 rows for q8_1. Valid for one
 // graph evaluation.
 struct ggml_cuda_fwht_q8 {
+    bool mmq_d4 = false; // distinct packed MMQ layout; never consumed by MMVQ
     ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
     int64_t               ne0    = 0;       // padded row width the quantizer wrote (what the mat-vec expects)
     int64_t               ncols  = 0;       // rows quantized (src1->ne[1] of every consumer)
