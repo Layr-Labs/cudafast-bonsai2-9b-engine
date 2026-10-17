@@ -49,6 +49,18 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
+            // GB10 prefill-sized ubatches: the lane-permuted reduction variant (bit-identical, see the kernel).
+            // GGML_CUDA_GDN_L8=0 disables it.
+            static const bool l8_enabled = getenv("GGML_CUDA_GDN_L8") == nullptr || atoi(getenv("GGML_CUDA_GDN_L8")) != 0;
+            if constexpr (keep_rs_t && !KDA) {
+                if (l8_enabled && cc == GGML_CUDA_CC_DGX_SPARK && warp_size == 32 && cols_per_warp == 4 && n_tokens >= 64) {
+                    ggml_cuda_kernel_launch(gated_delta_net_l8_cuda<RAW, G_PRECOMPUTED>, launch_params,
+                        q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, lazy);
+                    break;
+                }
+            }
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
@@ -171,6 +183,29 @@ static void ggml_cuda_op_gated_delta_net_impl(
         g_precomputed = true;
     }
 
+    // GB10 prefill with raw gates on the lane-permuted path: activate the gates once per (token, head) and run the
+    // G_PRECOMPUTED kernel on them (gdn_precompute_raw_gates uses the RAW kernel's expressions).
+    ggml_cuda_pool_alloc<float> raw_g_alloc(ctx.pool());
+    ggml_cuda_pool_alloc<float> raw_b_alloc(ctx.pool());
+    bool raw_precomputed = false;
+    {
+        static const bool l8_enabled = getenv("GGML_CUDA_GDN_L8") == nullptr || atoi(getenv("GGML_CUDA_GDN_L8")) != 0;
+        if (raw && keep_rs && l8_enabled && S_v == 128 && n_tokens >= 64 &&
+                ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+                ggml_nelements(src_g) == ggml_nelements(src_beta) && src_g->ne[0] == 1 && sb1 == 1 && nbb1 == sizeof(float)) {
+            const int64_t n_g = ggml_nelements(src_g);
+            raw_g_alloc.alloc(n_g);
+            raw_b_alloc.alloc(n_g);
+            const int block = 256;
+            const int grid  = (int) std::min<int64_t>((n_g + block - 1)/block, 4096);
+            gdn_precompute_raw_gates<<<grid, block, 0, stream>>>(g_d, b_d, rb_d, ra_d, raw_g_alloc.ptr, raw_b_alloc.ptr,
+                                                                  (int) H, n_g);
+            g_d = raw_g_alloc.ptr;
+            b_d = raw_b_alloc.ptr;
+            raw_precomputed = true;
+        }
+    }
+
 #define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_)                                                       \
     launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, \
         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                    \
@@ -178,6 +213,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     if (kda) {
         if (keep_rs) { GDN_LAUNCH(true,  true,  false, false); } else { GDN_LAUNCH(true,  false, false, false); }
+    } else if (raw_precomputed) {
+        GDN_LAUNCH(false, true,  false, true);
     } else if (raw) {
         if (keep_rs) { GDN_LAUNCH(false, true,  true,  false); } else { GDN_LAUNCH(false, false, true,  false); }
     } else {

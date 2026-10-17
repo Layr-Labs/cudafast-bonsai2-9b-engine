@@ -2138,6 +2138,29 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 rotations.size(), sign_tensors.size());
     }
 
+    // GB10 (ggml-cuda): decode layout copies of the weights read by the J=16 decode matmuls, a value-exact
+    // load-time block permutation (ggml-cuda/mmq-j16-dl.cuh). Input-independent, made once here; the
+    // weights themselves are unchanged. The token embedding is only gathered (unless it is the output).
+    if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA")) {
+        using register_fn_t = size_t (*)(const ggml_tensor *);
+        auto * register_fn = (register_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_register_decode_layout");
+        if (register_fn != nullptr) {
+            size_t bytes = 0;
+            int    count = 0;
+            for (const auto & [name, tensor] : tensors_by_name) {
+                if (tensor == nullptr || (tensor == tok_embd && tensor != output)) {
+                    continue;
+                }
+                const size_t b = register_fn(tensor);
+                bytes += b;
+                count += b > 0;
+            }
+            if (count > 0) {
+                LLAMA_LOG_INFO("%s: GB10 decode layout copies of %d weight(s), %.2f MiB\n", __func__, count, bytes/1024.0/1024.0);
+            }
+        }
+    }
+
     return true;
 }
 

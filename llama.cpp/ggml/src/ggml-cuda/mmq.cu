@@ -3,8 +3,11 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -507,4 +510,87 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+}
+
+// -----------------------------------------------------------------------
+// GB10 decode layout registry (mmq-j16-dl.cuh). Written at model load, read when launch_mul_mat_q runs
+// (graph capture or eager), erased when the weight buffer is freed.
+
+static std::mutex & ggml_cuda_dl_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+static std::unordered_map<const void *, ggml_cuda_dl_entry> & ggml_cuda_dl_map() {
+    static std::unordered_map<const void *, ggml_cuda_dl_entry> m;
+    return m;
+}
+
+const ggml_cuda_dl_entry * ggml_cuda_dl_find(const void * src) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
+    auto & m = ggml_cuda_dl_map();
+    const auto it = m.find(src);
+    return it == m.end() ? nullptr : &it->second;
+}
+
+// Copy of a contiguous [nrows][ncols] PQ2_0 / Q8_0 weight in the decode layout (TM), on the current
+// device. Returns the bytes allocated (0: not eligible, disabled, or out of memory: the weight then keeps
+// the regular kernels). GGML_CUDA_DECODE_LAYOUT=0 disables it.
+size_t ggml_cuda_dl_register(const void * src, const int64_t nrows, const int64_t ncols, const ggml_type type) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_DECODE_LAYOUT");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || src == nullptr || (type != GGML_TYPE_PQ2_0 && type != GGML_TYPE_Q8_0)) {
+        return 0;
+    }
+    if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_DGX_SPARK) {
+        return 0;
+    }
+    const int64_t qk = type == GGML_TYPE_PQ2_0 ? QK_PQ2_0 : QK8_0;
+    if (nrows < 1024 || nrows % 128 != 0 || ncols % MMQ_ITER_K != 0 || nrows > INT_MAX || ncols/qk > INT_MAX) {
+        return 0;
+    }
+    static_assert(sizeof(block_pq2_0) == 34 && sizeof(block_q8_0) == 34, "34-byte blocks");
+    const int64_t nkb   = ncols/qk;
+    const size_t  bytes = (size_t) (nrows*nkb*34);
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
+    auto & m = ggml_cuda_dl_map();
+    if (m.count(src)) {
+        return 0;
+    }
+    char * dl = nullptr;
+    if (cudaMalloc(&dl, bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    // The weight upload (possibly asynchronous, other streams) must be complete.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    if (type == GGML_TYPE_PQ2_0) {
+        ggml_cuda_dl_repack<1, 34>((const char *) src, dl, (int) nrows, (int) nkb, GGML_CUDA_DL_TM, stream);
+    } else {
+        ggml_cuda_dl_repack<4, 34>((const char *) src, dl, (int) nrows, (int) nkb, GGML_CUDA_DL_TM, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    m.emplace(src, ggml_cuda_dl_entry{ (const char *) src, dl, nrows, ncols, type });
+    return bytes;
+}
+
+void ggml_cuda_dl_unregister_range(const void * base, const size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
+    auto & m = ggml_cuda_dl_map();
+    for (auto it = m.begin(); it != m.end();) {
+        const char * p = (const char *) it->first;
+        if (p >= (const char *) base && p < (const char *) base + size) {
+            CUDA_CHECK(cudaFree(it->second.dl));
+            it = m.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
