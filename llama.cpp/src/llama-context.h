@@ -81,6 +81,9 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    // k > 0 when the last decode copied only the top-k ids and values of each output row
+    int32_t get_logits_topk_ith(int32_t i, const int32_t ** ids, const float ** vals);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -133,6 +136,7 @@ struct llama_context {
     void set_dspark_ctx(const float * feat, int64_t n_ctx_rows, int64_t n_embd_cap, const int32_t * pos);
 
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_logits_topk(int32_t k);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -330,6 +334,12 @@ private:
     // [n_outputs][n_capture_layers * n_embd]). populated only when
     // cparams.n_capture_layers > 0 and the model graph filled t_h_capture.
     buffer_view<float> embd_capture = { nullptr, 0 };
+
+    // populated instead of logits when cparams.logits_topk > 0 (2-dimensional arrays:
+    // [n_outputs][logits_topk]); logits_topk_n is the k the last decode copied, 0 if none
+    buffer_view<int32_t> logits_topk_ids  = { nullptr, 0 };
+    buffer_view<float>   logits_topk_vals = { nullptr, 0 };
+    int32_t              logits_topk_n    = 0;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
