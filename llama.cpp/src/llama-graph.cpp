@@ -1343,16 +1343,11 @@ int64_t llm_graph_result::get_max_nodes() const {
 void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
-
-    embd_import = false;
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
     t_h_capture   = nullptr;
-
-    t_logits_topk_ids  = nullptr;
-    t_logits_topk_vals = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1402,10 +1397,6 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
-    }
-    if (t_logits_topk_ids != nullptr) {
-        ggml_set_output(t_logits_topk_ids);
-        ggml_set_output(t_logits_topk_vals);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -3886,25 +3877,6 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
-}
-
-void llm_graph_context::build_logits_topk() const {
-    const int64_t k = cparams.logits_topk;
-    if (k == 0 || !samplers.empty() || !res->t_logits) {
-        return;
-    }
-
-    ggml_tensor * logits = res->t_logits;
-
-    // [k, n_outputs]: on CUDA the streaming selection, in descending order with equal
-    // logits (-0.0 and +0.0 included) in ascending id order
-    res->t_logits_topk_ids = ggml_top_k(ctx0, logits, k);
-
-    // [1, k, n_outputs]: the logits at those ids, gathered row by row
-    res->t_logits_topk_vals = ggml_get_rows(ctx0,
-            ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], logits->ne[1]), res->t_logits_topk_ids);
-
-    ggml_build_forward_expand(gf, res->t_logits_topk_vals);
 }
 
 void llm_graph_context::build_sampling() const {

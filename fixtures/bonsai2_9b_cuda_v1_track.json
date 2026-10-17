@@ -6,6 +6,7 @@
   "golden_pins_provisional": false,
   "official_pairs": 3,
   "official_pair_combine": "mean",
+  "control_band_mode": "mean_of_legs",
   "runner": {
     "provider": "github-actions",
     "workflow": "benchmark.yml",

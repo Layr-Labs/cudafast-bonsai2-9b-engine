@@ -386,29 +386,6 @@ static void ggml_cpy_f32_iq4_nl_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
-// 16-byte words, so dst receives the same bytes as from cudaMemcpyAsync
-static __global__ void cpy_d2d_16b(const int4 * src, int4 * dst, const int64_t n) {
-    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
-    // launched with programmatic stream serialization: src may be written, dst still read, by earlier kernels
-    ggml_cuda_pdl_sync();
-    ggml_cuda_pdl_lc();
-    if (i < n) {
-        dst[i] = src[i];
-    }
-}
-
-bool ggml_cuda_memcpy_d2d_gb10(void * dst, const void * src, const size_t nbytes, cudaStream_t stream) {
-    if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_DGX_SPARK || nbytes == 0 ||
-            nbytes % sizeof(int4) != 0 || (uintptr_t) dst % sizeof(int4) != 0 || (uintptr_t) src % sizeof(int4) != 0) {
-        return false;
-    }
-    const int64_t n  = nbytes / sizeof(int4);
-    const int     bs = 256;
-    ggml_cuda_kernel_launch(cpy_d2d_16b, ggml_cuda_kernel_launch_params(dim3((n + bs - 1) / bs), dim3(bs), 0, stream),
-        (const int4 *) src, (int4 *) dst, n);
-    return true;
-}
-
 // check if a same-type copy reduces to a 2D strided copy (height rows of width
 // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
 static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
@@ -493,7 +470,7 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
             CUDA_CHECK(mudnnMemcpyAsync(ctx, src1, src0));
         } else
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
-        if (!ggml_cuda_memcpy_d2d_gb10(src1_ddc, src0_ddc, ggml_nbytes(src0), main_stream)) {
+        {
             CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
         }
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {

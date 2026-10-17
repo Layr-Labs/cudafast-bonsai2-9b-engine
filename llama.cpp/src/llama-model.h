@@ -673,9 +673,6 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
-    // DFlash2 drafter head: when > 0, the drafter scores only token ids [0, dflash_head_rows)
-    // of the shared LM head (a view of its leading rows, read in place); 0 = the full head
-    int64_t dflash_head_rows = 0;
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
