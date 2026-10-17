@@ -9,6 +9,7 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <iterator>
 #include <cfloat>
 #include <cmath>
 
@@ -12281,5 +12282,26 @@ void ggml_compute_forward_dflash2_conv(
             }
             od[t * n_embd + h] = resid ? acc + ((const float *) resid->data)[t * n_embd + h] : acc;
         }
+    }
+}
+
+// ggml_compute_forward_dflash_walk: the reference for the CUDA walk (common/speculative.cpp host walk)
+
+void ggml_compute_forward_dflash_walk(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * src0 = dst->src[0];
+    const int32_t top_k   = ggml_get_op_params_i32(dst, 0);
+    const int32_t row0    = ggml_get_op_params_i32(dst, 1);
+    const int32_t n_steps = ggml_get_op_params_i32(dst, 2);
+    int32_t * out = (int32_t *) dst->data;
+
+    int32_t predecessor = 0;
+    for (int32_t i = 0; i < n_steps; ++i) {
+        const float * row    = (const float *) ((const char *) src0->data + (int64_t) (row0 + i)*src0->nb[1]);
+        const float * scores = row + top_k + (int64_t) predecessor*top_k;
+        predecessor = (int32_t) std::distance(scores, std::max_element(scores, scores + top_k));
+        out[i] = (int32_t) row[predecessor];
     }
 }

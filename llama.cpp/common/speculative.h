@@ -83,6 +83,10 @@ bool common_speculative_need_embd_capture(common_speculative * spec);
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
+// true when the last draft's ids are placeholders and the real ids are on the draft context's device
+// (DFlash2 device walk): import them with llama_set_token_import_dflash_walk, read them with llama_get_dflash_walk
+bool common_speculative_draft_on_device(const common_speculative * spec);
+
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 

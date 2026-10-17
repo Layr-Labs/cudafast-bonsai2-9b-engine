@@ -95,6 +95,9 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
 LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+// false: the extracted rows stay on the device (llama_set_embd_import_nextn reads them there) and
+// llama_get_embeddings_nextn is not to be called (default true)
+LLAMA_API void llama_set_embeddings_nextn_host(struct llama_context * ctx, bool value);
 
 // Select which appended NextN block the DECODER_MTP graph runs (offset past
 // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
@@ -159,6 +162,17 @@ LLAMA_API bool llama_set_embd_import_nextn(struct llama_context * ctx);
 // ahead of the noise block takes those rows from the staged embeddings import (the encoder output,
 // llama_set_embd_import_nextn) and injects them with the block's own K/V projections.
 LLAMA_API void llama_set_dflash_ctx_rows(struct llama_context * ctx, uint32_t n);
+// DFlash2 device walk: run the greedy selector walk on the device after each single-sequence draft graph of
+// ctx (a draft context), and keep its ids on the device.
+LLAMA_API void llama_set_dflash_device_walk(struct llama_context * ctx, bool enable);
+// keep ctx's token input on the GPU backend, so a device-walk import can write it there
+LLAMA_API void llama_set_inp_tokens_on_device(struct llama_context * ctx, bool enable);
+// the ids of ctx's last device walk, waiting for them; returns their count, or -1 if none or n_out is short
+LLAMA_API int32_t llama_get_dflash_walk(struct llama_context * ctx, int32_t * out, int32_t n_out);
+// the next llama_decode of ctx overwrites its input tokens [row0, row0 + n) with the first n ids of src's last
+// device walk, on the device and after the walk completes; returns false if src has no such walk
+LLAMA_API bool llama_set_token_import_dflash_walk(struct llama_context * ctx, const struct llama_context * src,
+                                                  int32_t row0, int32_t n);
 
 //
 // model/context data extraction

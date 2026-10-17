@@ -960,6 +960,15 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     g.cb(packed, "dflash2_lattice", -1);
     res->t_h_nextn = packed;
     ggml_build_forward_expand(g.gf, packed);
+
+    // Device walk (llama_set_dflash_device_walk): the greedy selector walk of a single sequence's block
+    // runs right after its lattice, over the rows the host walk reads (1 .. block_size - 1), so a target
+    // context can take the drafted ids without a host round trip.
+    if (g.cparams.dflash_device_walk && n_blocks == 1 && block_size > 1) {
+        res->t_dflash_walk = ggml_dflash_walk(ctx0, packed, (int) top_k, 1, (int) block_size - 1);
+        ggml_set_output(res->t_dflash_walk);
+        ggml_build_forward_expand(g.gf, res->t_dflash_walk);
+    }
 }
 
 // DFlash decoder, dual-mode by batch type:

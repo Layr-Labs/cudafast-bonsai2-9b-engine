@@ -67,6 +67,20 @@ static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_
 // replays all W window tokens from slot 1 instead. Any other write of slot 0 (a final-state store,
 // the eager snapshots, a zeroing of the row) removes the mark.
 
+// State traffic with the streaming (evict-first) cache operators when evs: the recurrent state and the lazy records
+// are touched once per ubatch, so they leave L2 before the layer's activations. Cache policy only.
+static __device__ __forceinline__ float gdn_ld(const bool evs, const float * p) {
+    return evs ? __ldcs(p) : *p;
+}
+
+static __device__ __forceinline__ void gdn_st(const bool evs, float * p, const float v) {
+    if (evs) {
+        __stcs(p, v);
+    } else {
+        *p = v;
+    }
+}
+
 #define GDN_LAZY_MAGIC   0x4744314cu  // "GD1L"
 #define GDN_LAZY_NOFINAL 0x4e4f4631u  // hdr[2]: slot 0 does not hold the final state ("NOF1")
 #define GDN_LAZY_SLOT0_MARK0 0x1e3d5b79u  // ~1.0e-20
@@ -814,6 +828,8 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
     // [C45 prefetch hook] an L2 prefetch of the next weights goes here (before the wait), as in gated_delta_net_cuda.
 
     ggml_cuda_pdl_sync();
+    // bit 3 of lazy: state, base and record traffic with the streaming (evict-first) cache operators
+    const bool evs = (lazy & 8) != 0;
 
     const int64_t state_in_offset  = (s_ids ? (int64_t) s_ids[sequence] * s_row_stride : sequence * H * S_v * S_v)
                                      + h_idx * S_v * S_v;
@@ -875,14 +891,14 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
                 for (int m = 0; m < 4; ++m) {
 #pragma unroll
                     for (int r = 0; r < 4; ++r) {
-                        s[m*4 + r] = base[my_col * S_v + r * 32 + n + 8 * m];
+                        s[m*4 + r] = gdn_ld(evs, &base[my_col * S_v + r * 32 + n + 8 * m]);
                     }
                 }
                 const int n_replay = W - (int) rb;
                 for (int t = 0; t < n_replay; t++) {
                     const float * tok = rec + GDN_LAZY_HDR + t * gdn_lazy_token_stride<S_v, 4>();
-                    const float g_val    = tok[S_v + GDN_LAZY_NWARPS * 4 + 0];
-                    const float beta_val = tok[S_v + GDN_LAZY_NWARPS * 4 + 1];
+                    const float g_val    = gdn_ld(evs, &tok[S_v + GDN_LAZY_NWARPS * 4 + 0]);
+                    const float beta_val = gdn_ld(evs, &tok[S_v + GDN_LAZY_NWARPS * 4 + 1]);
                     float kr[GDN_L8_ROWS];
                     float p[4];
 #pragma unroll
@@ -890,12 +906,12 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
                         p[m] = 0.0f;
 #pragma unroll
                         for (int r = 0; r < 4; ++r) {
-                            kr[m*4 + r] = tok[r * 32 + n + 8 * m];
+                            kr[m*4 + r] = gdn_ld(evs, &tok[r * 32 + n + 8 * m]);
                             p[m] += s[m*4 + r] * kr[m*4 + r];
                         }
                     }
                     const float kv_col    = gdn_l8_reduce(p);
-                    const float delta_col = (tok[S_v + threadIdx.y * 4 + grp] - g_val * kv_col) * beta_val;
+                    const float delta_col = (gdn_ld(evs, &tok[S_v + threadIdx.y * 4 + grp]) - g_val * kv_col) * beta_val;
 #pragma unroll
                     for (int j = 0; j < GDN_L8_ROWS; ++j) {
                         s[j] = g_val * s[j] + kr[j] * delta_col;
@@ -910,7 +926,7 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
         for (int m = 0; m < 4; ++m) {
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                s[m*4 + r] = curr_state[my_col * S_v + r * 32 + n + 8 * m];
+                s[m*4 + r] = gdn_ld(evs, &curr_state[my_col * S_v + r * 32 + n + 8 * m]);
             }
         }
     }
@@ -944,7 +960,7 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
         for (int m = 0; m < 4; ++m) {
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                base[my_col * S_v + r * 32 + n + 8 * m] = s[m*4 + r];
+                gdn_st(evs, &base[my_col * S_v + r * 32 + n + 8 * m], s[m*4 + r]);
             }
         }
         __syncwarp();
@@ -955,11 +971,11 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
         for (int e = tid; e < (int) n_tokens * (S_v + 16); e += 128) {
             const int t = e / (S_v + 16);
             const int i = e % (S_v + 16);
-            rec[t * stride + i] = i < S_v ? stage[t][((i / 32) * 8 + i % 8) * 4 + (i % 32) / 8] : stage[t][i];
+            gdn_st(evs, &rec[t * stride + i], i < S_v ? stage[t][((i / 32) * 8 + i % 8) * 4 + (i % 32) / 8] : stage[t][i]);
         }
         if (threadIdx.y == 0 && lane < n_tokens) {
-            rec[lane * stride + S_v + GDN_LAZY_NWARPS * 4 + 0] = g_lane;
-            rec[lane * stride + S_v + GDN_LAZY_NWARPS * 4 + 1] = beta_lane;
+            gdn_st(evs, &rec[lane * stride + S_v + GDN_LAZY_NWARPS * 4 + 0], g_lane);
+            gdn_st(evs, &rec[lane * stride + S_v + GDN_LAZY_NWARPS * 4 + 1], beta_lane);
         }
     }
 

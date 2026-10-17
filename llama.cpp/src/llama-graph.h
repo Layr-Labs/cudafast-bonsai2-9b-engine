@@ -1031,6 +1031,7 @@ public:
 
     // built with its embeddings input on the device of an embeddings import (llama_set_embd_import_*)
     bool embd_import = false;
+    bool inp_tokens_dev = false; // built with the token input pinned to the GPU (llama_set_inp_tokens_on_device)
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
@@ -1038,6 +1039,7 @@ public:
     // by the per-model graph builder when cparams.n_capture_layers > 0.
     ggml_tensor * t_h_capture   = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_dflash_walk = nullptr; // [n_draft] i32 DFlash2 ids of the device selector walk
 
     ggml_tensor * t_logits_topk_ids  = nullptr; // [k, n_outputs] ids of the k largest logits, descending
     ggml_tensor * t_logits_topk_vals = nullptr; // [1, k, n_outputs] the logits at those ids

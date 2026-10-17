@@ -44,7 +44,10 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
             /*result*/ st.draft,
         };
         common_speculative_draft(eng_->spec_.get());
-        if (eng_->ctx_dft_) {
+        // DFlash2 device walk: the ids stay on the device and verify_decode imports them, so the host
+        // does not wait for the draft graph here; the verify graph queues behind it on the device
+        draft_on_device_ = common_speculative_draft_on_device(eng_->spec_.get());
+        if (eng_->ctx_dft_ && !draft_on_device_) {
             llama_synchronize(eng_->ctx_dft_);
         }
         if (eng_->ctx_dft_) {
@@ -82,9 +85,30 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
         for (size_t i = 0; i < st.draft->size(); ++i) {
             common_batch_add(batch_tgt, (*st.draft)[i], *st.n_past + static_cast<int>(i), {eng_->seq_id_}, true);
         }
+        const bool on_device = draft_on_device_ && !st.draft->empty();
+        draft_on_device_ = false;
+        if (on_device && !llama_set_token_import_dflash_walk(eng_->ctx_tgt_, eng_->ctx_dft_, 1,
+                                                             static_cast<int32_t>(st.draft->size()))) {
+            llama_batch_free(batch_tgt);
+            throw std::runtime_error("DFlash2 device walk import failed");
+        }
         if (llama_decode(eng_->ctx_tgt_, batch_tgt) != 0) {
             llama_batch_free(batch_tgt);
             throw std::runtime_error("speculative verify decode failed");
+        }
+        if (on_device) {
+            // the verify graph already holds the device ids; the host takes the same ids for the accept,
+            // the emits and the bookkeeping (a prefix of the walk when the draft was truncated)
+            std::vector<int32_t> walk(static_cast<size_t>(eng_->depth_) + 1);
+            const int32_t n_walk = llama_get_dflash_walk(eng_->ctx_dft_, walk.data(), static_cast<int32_t>(walk.size()));
+            if (n_walk < static_cast<int32_t>(st.draft->size())) {
+                llama_batch_free(batch_tgt);
+                throw std::runtime_error("DFlash2 device walk returned too few ids");
+            }
+            for (size_t i = 0; i < st.draft->size(); ++i) {
+                (*st.draft)[i] = walk[i];
+                batch_tgt.token[i + 1] = walk[i];
+            }
         }
         if (!common_speculative_process(eng_->spec_.get(), batch_tgt)) {
             llama_batch_free(batch_tgt);
@@ -93,6 +117,10 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
         llama_batch_free(batch_tgt);
     }
 
+  private:
+    bool draft_on_device_ = false;
+
+  public:
     std::unique_ptr<void, void (*)(void *)> clone_sampler() override {
         if (!eng_->use_ckpt_tgt_) {
             return {nullptr, noop_sampler_holder_free};
@@ -197,6 +225,8 @@ static common_params make_engine_params(const std::string &model_path, const std
         params.speculative.draft.n_max = draft_depth;
         // CPU draft sampling only: backend top-k offload is not reproducible on GB10.
         params.speculative.draft.backend_sampling = false;
+        // verify_decode imports DFlash2 drafts walked on the device
+        params.speculative.draft.device_draft = true;
     }
     return params;
 }

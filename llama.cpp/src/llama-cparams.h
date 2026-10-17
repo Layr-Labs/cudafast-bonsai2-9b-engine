@@ -37,6 +37,10 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+    bool embeddings_nextn_host;   // copy the extracted rows to the host (llama_get_embeddings_nextn); off when only
+                                  // device imports read them (llama_set_embeddings_nextn_host)
+    bool dflash_device_walk;      // DFlash2: run the greedy selector walk on the device (llama_set_dflash_device_walk)
+    bool inp_tokens_on_device;    // keep the token input on the GPU backend (llama_set_inp_tokens_on_device)
 
     // multi-layer hidden-state tap (EAGLE3 / dspark target-feature reuse)
     // when n_capture_layers > 0 the model graph concatenates the per-layer output

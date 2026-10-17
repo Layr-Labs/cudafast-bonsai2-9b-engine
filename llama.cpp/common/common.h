@@ -337,6 +337,10 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // the caller takes DFlash2 drafts walked on the device: it checks common_speculative_draft_on_device and imports
+    // them with llama_set_token_import_dflash_walk (the drafted ids are placeholders on the host otherwise)
+    bool device_draft = false;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

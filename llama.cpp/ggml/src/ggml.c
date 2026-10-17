@@ -1115,9 +1115,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "DFLASH_WALK",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1231,9 +1233,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "dflash_walk(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5422,6 +5426,29 @@ struct ggml_tensor * ggml_top_k(
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, a->ne[1], a->ne[2], a->ne[3]);
 
     result->op     = GGML_OP_TOP_K;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_dflash_walk
+
+struct ggml_tensor * ggml_dflash_walk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   top_k,
+        int                   row0,
+        int                   n_steps) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    GGML_ASSERT(top_k > 0 && a->ne[0] >= (int64_t) top_k + (int64_t) top_k*top_k);
+    GGML_ASSERT(row0 >= 0 && n_steps > 0 && (int64_t) row0 + n_steps <= ggml_nrows(a));
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_steps);
+
+    const int32_t params[] = { top_k, row0, n_steps };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DFLASH_WALK;
     result->src[0] = a;
 
     return result;

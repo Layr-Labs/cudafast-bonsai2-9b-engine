@@ -597,6 +597,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_DFLASH_WALK,
+
         GGML_OP_COUNT,
     };
 
@@ -2418,6 +2420,17 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // greedy DFlash2 selector walk: a holds one row per position (top_k candidate ids as f32, then a
+    // top_k x top_k score matrix whose row p scores the successors of predecessor slot p). Starting from
+    // predecessor slot 0, step i takes row row0 + i, picks the first maximum of the predecessor's scores
+    // (std::max_element semantics) and emits that candidate id. Result: n_steps i32 ids.
+    GGML_API struct ggml_tensor * ggml_dflash_walk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   top_k,
+            int                   row0,
+            int                   n_steps);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

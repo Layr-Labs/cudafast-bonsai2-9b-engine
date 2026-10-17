@@ -2037,6 +2037,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_top_k(params, tensor);
             } break;
+        case GGML_OP_DFLASH_WALK:
+            {
+                ggml_compute_forward_dflash_walk(params, tensor);
+            } break;
         case GGML_OP_LEAKY_RELU:
             {
                 ggml_compute_forward_leaky_relu(params, tensor);
@@ -2360,6 +2364,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                     GGML_ABORT("fatal error");
             }
             break;
+        case GGML_OP_DFLASH_WALK:
+            {
+                n_tasks = 1;
+            } break;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(node)) {
                 case GGML_GLU_OP_REGLU:

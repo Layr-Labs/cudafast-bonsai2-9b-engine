@@ -198,6 +198,9 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.embeddings_nextn_host   = true;
+    cparams.dflash_device_walk      = false;
+    cparams.inp_tokens_on_device    = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -1545,6 +1548,12 @@ void llama_context::set_embeddings(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_embeddings_nextn_host(bool value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+
+    cparams.embeddings_nextn_host = value;
+}
+
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
@@ -1656,6 +1665,74 @@ void llama_context::set_causal_attn(bool value) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_dflash_device_walk(bool enable) {
+    if (cparams.dflash_device_walk == enable) {
+        return;
+    }
+    cparams.dflash_device_walk = enable;
+    sched_need_reserve = true;
+}
+
+void llama_context::set_inp_tokens_on_device(bool enable) {
+    if (cparams.inp_tokens_on_device == enable) {
+        return;
+    }
+    cparams.inp_tokens_on_device = enable;
+    sched_need_reserve = true;
+}
+
+void llama_context::dflash_walk_stage(ggml_tensor * t) {
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+    GGML_ASSERT(backend != nullptr);
+
+    // the ids leave the compute buffer before the next graph is allocated over it
+    if (walk_dev == nullptr || walk_dev->ne[0] != t->ne[0]) {
+        // an import may still read the old copy
+        ggml_backend_sched_synchronize(sched.get());
+
+        walk_dev = nullptr;
+        buf_walk_dev.reset();
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_walk_dev.reset(ggml_init(params));
+        ggml_tensor * dev_t = ggml_new_tensor_1d(ctx_walk_dev.get(), GGML_TYPE_I32, t->ne[0]);
+
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        buf_walk_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_walk_dev.get(), ggml_backend_buffer_get_type(buf)));
+        GGML_ASSERT(buf_walk_dev && "failed to allocate the DFlash2 walk buffer");
+        walk_dev = dev_t;
+    }
+    if (!walk_event) {
+        walk_event.reset(ggml_backend_event_new(ggml_backend_get_device(backend)));
+        GGML_ASSERT(walk_event && "the DFlash2 device walk needs backend events");
+    }
+
+    ggml_backend_tensor_copy_async(backend, backend, t, walk_dev);
+    ggml_backend_event_record(walk_event.get(), backend);
+}
+
+int32_t llama_context::get_dflash_walk(int32_t * out, int32_t n_out) {
+    if (walk_dev == nullptr || !walk_event || n_out < walk_dev->ne[0]) {
+        return -1;
+    }
+    // the ids were written on this context's stream; the event orders the host read after them
+    ggml_backend_event_synchronize(walk_event.get());
+    ggml_backend_tensor_get(walk_dev, out, 0, ggml_nbytes(walk_dev));
+    return (int32_t) walk_dev->ne[0];
+}
+
+bool llama_context::set_token_import_dflash_walk(const llama_context & src, int32_t row0, int32_t n) {
+    if (src.walk_dev == nullptr || !src.walk_event || row0 < 0 || n <= 0 || n > src.walk_dev->ne[0]) {
+        return false;
+    }
+    token_import = { &src, row0, n };
+    return true;
+}
+
 void llama_context::set_graph_slots(uint32_t n) {
     LLAMA_LOG_DEBUG("%s: n = %u\n", __func__, n);
 
@@ -1674,7 +1751,8 @@ void llama_context::set_graph_slots(uint32_t n) {
 bool llama_context::graph_slot_select(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx,
                                       bool embd_import) {
     const auto fits = [&](llm_graph_result * res) {
-        return res->embd_import == embd_import && res->can_reuse(graph_params(res, ubatch, mctx, gtype));
+        return res->embd_import == embd_import && res->inp_tokens_dev == cparams.inp_tokens_on_device &&
+               res->can_reuse(graph_params(res, ubatch, mctx, gtype));
     };
 
     if (fits(gf_res_prev.get())) {
@@ -1868,18 +1946,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (slot_reuse || (n_graph_slots == 1 && !graph_reuse_disable && res->embd_import == embd_import_now && res->can_reuse(gparams))) {
+    if (slot_reuse || (n_graph_slots == 1 && !graph_reuse_disable && res->embd_import == embd_import_now &&
+                       res->inp_tokens_dev == cparams.inp_tokens_on_device && res->can_reuse(gparams))) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
+        // that the previous compute is still reading. The same holds for the device token input of a
+        // DFlash2 device-walk import, which set_inputs rewrites.
+        if (cparams.pipeline_parallel || cparams.inp_tokens_on_device) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
         n_reused++;
     } else {
+        if (cparams.inp_tokens_on_device) {
+            ggml_backend_sched_synchronize(sched.get()); // the previous graph may still read the device token input
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1902,7 +1985,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         "embeddings import into a graph without an embeddings input");
             ggml_backend_sched_set_tensor_backend(sched.get(), res->t_inp_embd, embd_import_cur.backend_dst);
         }
-        res->embd_import = embd_import_now;
+        res->embd_import    = embd_import_now;
+        res->inp_tokens_dev = cparams.inp_tokens_on_device;
+
+        // a context that imports DFlash2 device-walk ids keeps its token input on the GPU backend, so the
+        // import can write it there (llama_set_inp_tokens_on_device); the ids and the ops reading them stay
+        if (cparams.inp_tokens_on_device && res->t_inp_tokens) {
+            for (auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                            ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), res->t_inp_tokens, backend.get());
+                    break;
+                }
+            }
+        }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -1922,6 +2019,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             res->set_inputs(&ubatch_inp);
         } else {
             res->set_inputs(&ubatch);
+        }
+
+        // a staged DFlash2 device walk import overwrites input tokens [row0, row0 + n) on the device, on
+        // the inputs' stream after the walk's event: after the host-side placeholders, before the graph
+        if (token_import.src) {
+            const llama_context & src = *token_import.src;
+            ggml_tensor * dst = res->t_inp_tokens;
+            GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 && src.walk_dev);
+            const int64_t n = token_import.n;
+            GGML_ASSERT(n <= src.walk_dev->ne[0] && token_import.row0 + n <= ggml_nelements(dst));
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), dst);
+            GGML_ASSERT(backend != nullptr);
+            GGML_ASSERT(dst->buffer && !ggml_backend_buffer_is_host(dst->buffer) &&
+                        "DFlash2 walk import needs the token input on the device (llama_set_inp_tokens_on_device)");
+            ggml_tensor dst_rows = *dst;
+            dst_rows.ne[0] = n;
+            dst_rows.ne[1] = dst_rows.ne[2] = dst_rows.ne[3] = 1;
+            dst_rows.data  = (char *) dst->data + (size_t) token_import.row0*sizeof(int32_t);
+            ggml_tensor src_rows = *src.walk_dev;
+            src_rows.ne[0] = n;
+            // both views are n contiguous i32: same shape and strides, as the copy requires
+            for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+                src_rows.nb[d] = dst_rows.nb[d] = (size_t) n*sizeof(int32_t);
+            }
+            ggml_backend_event_wait(backend, src.walk_event.get());
+            ggml_backend_tensor_copy_async(backend, backend, &src_rows, &dst_rows);
+            token_import = {};
         }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -2115,7 +2239,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     }
 
     // extract nextn embeddings (hidden state before the final output norm)
-    if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+    if (embd_nextn.data && t_h_nextn && cparams.embeddings_nextn_host && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
         GGML_ASSERT(backend_h != nullptr);
 
@@ -2580,7 +2704,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.embeddings_nextn_host &&
+                    cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -2590,6 +2715,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
             }
+        }
+
+        // DFlash2 device walk: keep the drafted ids on the device for a target context to import
+        if (res->t_dflash_walk) {
+            dflash_walk_stage(res->t_dflash_walk);
         }
 
         if (has_samplers) {
@@ -4479,6 +4609,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
 }
 
+void llama_set_embeddings_nextn_host(llama_context * ctx, bool value) {
+    ctx->set_embeddings_nextn_host(value);
+}
+
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
 }
@@ -4992,4 +5126,20 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+void llama_set_dflash_device_walk(llama_context * ctx, bool enable) {
+    ctx->set_dflash_device_walk(enable);
+}
+
+void llama_set_inp_tokens_on_device(llama_context * ctx, bool enable) {
+    ctx->set_inp_tokens_on_device(enable);
+}
+
+int32_t llama_get_dflash_walk(llama_context * ctx, int32_t * out, int32_t n_out) {
+    return ctx->get_dflash_walk(out, n_out);
+}
+
+bool llama_set_token_import_dflash_walk(llama_context * ctx, const llama_context * src, int32_t row0, int32_t n) {
+    return ctx->set_token_import_dflash_walk(*src, row0, n);
 }

@@ -55,6 +55,9 @@ static void launch_gated_delta_net(
             // variant (bit-identical, see the kernel).
             // GGML_CUDA_GDN_L8=0 disables it.
             static const bool l8_enabled = getenv("GGML_CUDA_GDN_L8") == nullptr || atoi(getenv("GGML_CUDA_GDN_L8")) != 0;
+            // the 16-row verify kernel's state, base and record traffic with the streaming (evict-first) operators;
+            // GGML_CUDA_GDN_STATE_EVICT=0 keeps the normal ones (cache policy only, same bits)
+            static const bool gdn_state_evict = getenv("GGML_CUDA_GDN_STATE_EVICT") == nullptr || atoi(getenv("GGML_CUDA_GDN_STATE_EVICT")) != 0;
             if constexpr (keep_rs_t && !KDA) {
                 // the lazy condition gated_delta_net_cuda evaluates on the device
                 const bool lazy_eff = lazy && state_slot_stride > 0 && 2 + (int) grid_dims.z <= K;
@@ -64,12 +67,14 @@ static void launch_gated_delta_net(
                         ggml_cuda_kernel_launch(gated_delta_net_l8v_cuda<RAW, G_PRECOMPUTED, true>, launch_params,
                             q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, 1);
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride,
+                            1 | (gdn_state_evict ? 8 : 0));
                     } else {
                         ggml_cuda_kernel_launch(gated_delta_net_l8v_cuda<RAW, G_PRECOMPUTED, false>, launch_params,
                             q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, 0);
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride,
+                            gdn_state_evict ? 8 : 0);
                     }
                     break;
                 }

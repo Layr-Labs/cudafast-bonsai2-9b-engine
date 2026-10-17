@@ -176,6 +176,9 @@ struct common_speculative_impl {
 
     virtual bool need_embd() const { return false; }
 
+    // the last draft's ids are placeholders; the real ids are on the device (llama_get_dflash_walk)
+    virtual bool draft_on_device() const { return false; }
+
     virtual bool need_embd_nextn() const { return false; }
 
     virtual bool need_embd_capture() const { return false; }
@@ -1718,6 +1721,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     llama_seq_id           pend_seq     = 0;
     std::vector<llama_pos> pend_pos; // [pend_n]
 
+    // DFlash2 device walk (see the constructor) and whether the last draft's ids are on the device
+    bool device_walk    = false;
+    bool device_pending = false;
+
+    bool draft_on_device() const override { return device_pending; }
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
@@ -1865,6 +1874,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // for every request.
         llama_set_graph_slots(ctx_dft, inject_merge ? 6 : 3);
         LOG_INF("%s: - DFlash2 merged K/V inject: %s\n", __func__, inject_merge ? "on" : "off");
+
+        // DFlash2 greedy drafts walked on the device (llama_set_dflash_device_walk): a single sequence's
+        // drafted ids stay on the device and the target imports them, so no host round trip separates the
+        // draft graph from the verify graph. Only the plain greedy walk qualifies (beam width 1, no p_min or
+        // n_min cut, no prompt lookup), and only for a caller that imports device drafts (params.device_draft).
+        // LLAMA_DFLASH2_DEVICE_WALK=0 keeps the host walk.
+        {
+            const char * walk = getenv("LLAMA_DFLASH2_DEVICE_WALK");
+            device_walk = this->params.device_draft && is_dflash2 && n_seq == 1 && selector_beam_width == 1 && this->params.p_min <= 0.0f &&
+                          this->params.n_min <= 0 && !prompt_lookup && (!walk || atoi(walk) != 0);
+            llama_set_dflash_device_walk(ctx_dft, device_walk);
+            llama_set_inp_tokens_on_device(ctx_tgt, device_walk);
+            // with the walk on the device and the encoder output imported on the device, nothing reads the drafter's
+            // rows on the host: no 256 KiB device-to-host copy after the draft and encoder graphs.
+            // LLAMA_DFLASH_NEXTN_HOST=1 keeps the copies.
+            const char * host = getenv("LLAMA_DFLASH_NEXTN_HOST");
+            llama_set_embeddings_nextn_host(ctx_dft, !(device_walk && features_on_device) || (host && atoi(host) != 0));
+        }
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -2070,6 +2097,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        device_pending = false;
         common_batch_clear(batch);
 
         // build one batch holding every drafting sequence's noise block into a single decode)
@@ -2160,6 +2188,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto & result = *dp.result;
 
             if (is_dflash2) {
+                if (device_walk) {
+                    // the walk ran on the device after the lattice: placeholders here, the ids stay there
+                    result.assign(n_block_tokens - 1, mask_token_id >= 0 ? mask_token_id : 0);
+                    device_pending = true;
+                    continue;
+                }
+
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
@@ -3929,6 +3964,18 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     return result;
+}
+
+bool common_speculative_draft_on_device(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+    for (const auto & impl : spec->impls) {
+        if (impl->draft_on_device()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void common_speculative_draft(common_speculative * spec) {

@@ -624,10 +624,12 @@ static void ggml_cuda_dl_repack(const char * src, char * dst, const int nrows, c
 #define GGML_CUDA_DL_FMT_PQ2  0
 #define GGML_CUDA_DL_FMT_PTQ1 1
 #define GGML_CUDA_DL_FMT_Q8   2
+#define GGML_CUDA_DL_FMT_PTQ1S 3 // PTQ1_0 with one signed mma per sub-block (ggml_cuda_ptq1_j16_compute<true>)
 
 template <int FMT> struct ggml_cuda_dl_fmt;
 template <> struct ggml_cuda_dl_fmt<GGML_CUDA_DL_FMT_PQ2>  { static constexpr int GB = sizeof(block_pq2_0);   static constexpr int G = 1; static constexpr int BPI = MMQ_ITER_K / QK_PQ2_0; };
 template <> struct ggml_cuda_dl_fmt<GGML_CUDA_DL_FMT_PTQ1> { static constexpr int GB = sizeof(block_ptq1_0);  static constexpr int G = 1; static constexpr int BPI = MMQ_ITER_K / QK_PQ2_0; };
+template <> struct ggml_cuda_dl_fmt<GGML_CUDA_DL_FMT_PTQ1S> : ggml_cuda_dl_fmt<GGML_CUDA_DL_FMT_PTQ1> {};
 template <> struct ggml_cuda_dl_fmt<GGML_CUDA_DL_FMT_Q8>   { static constexpr int GB = 4*sizeof(block_q8_0);  static constexpr int G = 4; static constexpr int BPI = MMQ_ITER_K / QK8_0;   };
 
 static __device__ __forceinline__ uint32_t ggml_cuda_dl_smem_u32(const void * p) {
@@ -720,10 +722,10 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
         ggml_cuda_pq2_j16_stage<1> st;
         ggml_cuda_pq2_j16_load<1>(st, sx, (int) sizeof(block_pq2_0), sy, c);
         ggml_cuda_pq2_j16_compute<1>(sum, st, c);
-    } else if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1) {
+    } else if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1 || FMT == GGML_CUDA_DL_FMT_PTQ1S) {
         ggml_cuda_ptq1_j16_stage st;
         ggml_cuda_ptq1_j16_load(st, sx, sy, c);
-        ggml_cuda_ptq1_j16_compute(sum, st, c);
+        ggml_cuda_ptq1_j16_compute<FMT == GGML_CUDA_DL_FMT_PTQ1S>(sum, st, c);
     } else {
         ggml_cuda_dl_q8_xstage xs;
         ggml_cuda_dl_q8_ystage ys;
@@ -937,7 +939,17 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
         const int64_t bytes = args.nrows_x*nkb*(int64_t) sizeof(block_pq2_0);
         // PTQ1_0 matrices of at least 2048 rows: bulk-copy ring of 2-step stages (c64); GGML_CUDA_DL_RING_PT=0 off.
         static const bool ring_pt = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_PT", 1) != 0;
-        if (e.dl_type == GGML_TYPE_PTQ1_0 && ring_pt && args.nrows_x >= 2048) {
+        // one signed mma per sub-block instead of two (same integers, ggml_cuda_ptq1_j16_compute);
+        // GGML_CUDA_PTQ1_SIGNED=0 keeps the two.
+        static const bool ptq1_sgn = ggml_cuda_dl_env_int("GGML_CUDA_PTQ1_SIGNED", 1) != 0;
+        if (e.dl_type == GGML_TYPE_PTQ1_0 && ring_pt && args.nrows_x >= 2048 && ptq1_sgn) {
+            constexpr int FMT = GGML_CUDA_DL_FMT_PTQ1S;
+            if (tiling && ntiles > 4*nsm) {
+                ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);
+            } else {
+                ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+            }
+        } else if (e.dl_type == GGML_TYPE_PTQ1_0 && ring_pt && args.nrows_x >= 2048) {
             constexpr int FMT = GGML_CUDA_DL_FMT_PTQ1;
             if (tiling && ntiles > 4*nsm) {
                 ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);

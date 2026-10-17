@@ -1345,10 +1345,12 @@ void llm_graph_result::reset() {
     t_inp_embd    = nullptr;
 
     embd_import = false;
+    inp_tokens_dev = false;
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_dflash_walk = nullptr;
     t_h_capture   = nullptr;
 
     t_logits_topk_ids  = nullptr;

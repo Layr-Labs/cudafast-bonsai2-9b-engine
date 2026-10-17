@@ -125,6 +125,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_embeddings_nextn_host(bool value);
 
     // register the ordered set of intermediate layers to capture. pass an empty
     // list to disable. the concatenation order follows the order of layer_ids.
@@ -150,6 +151,13 @@ struct llama_context {
 
     // keep up to n built graphs, see llama_set_graph_slots
     void set_graph_slots(uint32_t n);
+
+    // DFlash2 device walk, see llama_set_dflash_device_walk and friends
+    void    set_dflash_device_walk(bool enable);
+    void    set_inp_tokens_on_device(bool enable);
+    int32_t get_dflash_walk(int32_t * out, int32_t n_out);
+    bool    set_token_import_dflash_walk(const llama_context & src, int32_t row0, int32_t n);
+    void    dflash_walk_stage(ggml_tensor * t);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -375,6 +383,21 @@ private:
     ggml_context_ptr        ctx_nextn_dev;
     ggml_backend_buffer_ptr buf_nextn_dev;
     ggml_tensor *           nextn_dev = nullptr;
+
+    // DFlash2 device walk (llama_set_dflash_device_walk): the ids of the last draft graph's walk, kept on
+    // the device past the graph, and an event recorded after they are written
+    ggml_context_ptr        ctx_walk_dev;
+    ggml_backend_buffer_ptr buf_walk_dev;
+    ggml_tensor *           walk_dev = nullptr;
+    ggml_backend_event_ptr  walk_event;
+
+    // a staged import of another context's device walk into this context's next input tokens
+    struct token_import_info {
+        const llama_context * src  = nullptr;
+        int32_t               row0 = 0;
+        int32_t               n    = 0;
+    };
+    token_import_info token_import;
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE

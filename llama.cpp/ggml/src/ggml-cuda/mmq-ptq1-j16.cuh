@@ -122,6 +122,10 @@ static __device__ __forceinline__ void ggml_cuda_ptq1_j16_decode(uint32_t (&b)[4
     }
 }
 
+// SGN: the trits {0, 1, 2} become signed bytes {-1, 0, 1} (per byte (t + 0x7F) ^ 0x80, no carry since t <= 2) and
+// one s8.s8 mma accumulates sum(a*(t - 1)) onto MAGIC, the integer the base forms as MAGIC - sum(a) + sum(a*t)
+// with two mma; int32 accumulation is exact, so C and every float below are the same bits.
+template <bool SGN = false>
 static __device__ __forceinline__ void ggml_cuda_ptq1_j16_compute(float (&sum)[1][4], const ggml_cuda_ptq1_j16_stage & st, const int c) {
     // dA of the C rows 2c and 2c+1 of the 8-row tile: the scale of row r was loaded by lanes 4r..4r+3.
     const int xd   = (int) (st.w6 >> 16);
@@ -140,8 +144,14 @@ static __device__ __forceinline__ void ggml_cuda_ptq1_j16_compute(float (&sum)[1
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
         int C[4] = {GGML_CUDA_PQ2_J16_MAGIC, GGML_CUDA_PQ2_J16_MAGIC, GGML_CUDA_PQ2_J16_MAGIC, GGML_CUDA_PQ2_J16_MAGIC};
-        ggml_cuda_pq2_j16_mma(C, st.ya[s][0][0], st.ya[s][1][0], st.ya[s][0][1], st.ya[s][1][1], -1, -1);           // MAGIC - sum(a)
-        ggml_cuda_ptq1_j16_mma_u8(C, st.ya[s][0][0], st.ya[s][1][0], st.ya[s][0][1], st.ya[s][1][1], (int) b[s][0], (int) b[s][1]);
+        if constexpr (SGN) {
+            const int b0 = (int) ((b[s][0] + 0x7F7F7F7Fu) ^ 0x80808080u);
+            const int b1 = (int) ((b[s][1] + 0x7F7F7F7Fu) ^ 0x80808080u);
+            ggml_cuda_pq2_j16_mma(C, st.ya[s][0][0], st.ya[s][1][0], st.ya[s][0][1], st.ya[s][1][1], b0, b1);    // MAGIC + sum(a*(t-1))
+        } else {
+            ggml_cuda_pq2_j16_mma(C, st.ya[s][0][0], st.ya[s][1][0], st.ya[s][0][1], st.ya[s][1][1], -1, -1);       // MAGIC - sum(a)
+            ggml_cuda_ptq1_j16_mma_u8(C, st.ya[s][0][0], st.ya[s][1][0], st.ya[s][0][1], st.ya[s][1][1], (int) b[s][0], (int) b[s][1]);
+        }
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const float cf = __int_as_float(C[l]) - 12582912.0f; // == (float) idot, exactly
