@@ -163,13 +163,32 @@ void ggml_cuda_mul_mat_q(
             ggml_cuda_mmq_q8_buffer_size(src0->type, fallback, cc, ne10_padded, ne11, ne12, ne13);
         GGML_ASSERT(!external_q8 || (!gate && !use_native_fp4));
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
-        char * src1_q8_ptr = external_q8 ? (char *) external_q8 : src1_q8_1.alloc(nbytes_src1_q8_1);
+        void * shared_q8 = nullptr;
+        bool shared_ready = false;
+        auto & reuse = ctx.fwht_q8();
+        const auto users = reuse.plain_q8_users.find(src1);
+        if (!external_q8 && !gate && !norm_weight && !use_native_fp4 &&
+            src0->type == GGML_TYPE_Q8_0 && !fallback && ctx.curr_stream_no == 0 &&
+            users != reuse.plain_q8_users.end() && users->second > 1) {
+            const auto found = reuse.plain_q8.find(src1);
+            if (found != reuse.plain_q8.end()) {
+                shared_q8 = found->second;
+                shared_ready = true;
+            } else {
+                auto buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes_src1_q8_1);
+                shared_q8 = buf->get();
+                reuse.held.push_back(std::move(buf));
+                reuse.plain_q8[src1] = shared_q8;
+            }
+        }
+        char * src1_q8_ptr = external_q8 ? (char *) external_q8 :
+            shared_q8 ? (char *) shared_q8 : src1_q8_1.alloc(nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        if (!external_q8 || quantize_external) {
+        if ((!external_q8 || quantize_external) && !shared_ready) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;

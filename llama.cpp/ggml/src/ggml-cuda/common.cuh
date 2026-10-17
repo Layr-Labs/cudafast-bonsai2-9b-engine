@@ -1601,6 +1601,11 @@ struct ggml_cuda_fwht_q8 {
 struct ggml_cuda_fwht_q8_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_fwht_q8> entries;
     std::vector<std::unique_ptr<ggml_cuda_pool_alloc<char>>> held; // released at reset(), newest first (VMM pool is LIFO)
+    // Plain Q8_0 activations shared by projections of this graph only. Buffers
+    // use the same LIFO owner as fused activation buffers, never request state.
+    std::unordered_map<const ggml_tensor *, int> plain_q8_users;
+    std::unordered_map<const ggml_tensor *, void *> plain_q8;
+
 
     // the implicit destructor would release `held` oldest first, which the VMM pool asserts on. The
     // owning context also calls reset() before its pools go away (this member is declared before them).
@@ -1610,6 +1615,8 @@ struct ggml_cuda_fwht_q8_context {
 
     void reset() {
         entries.clear();
+        plain_q8_users.clear();
+        plain_q8.clear();
         while (!held.empty()) {
             held.pop_back();
         }

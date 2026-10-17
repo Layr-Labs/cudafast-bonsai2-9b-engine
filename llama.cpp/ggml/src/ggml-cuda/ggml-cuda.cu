@@ -6602,6 +6602,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             cuda_ctx->gdn_gathers().reset();
             cuda_ctx->fwht_q8().reset();
+            // Reuse quantization only for exact shared tensor objects on plain
+            // Q8_0 projections. Distinct views and fused activations stay separate.
+            for (int qi = 0; qi < cgraph->n_nodes; ++qi) {
+                const ggml_tensor * mm = cgraph->nodes[qi];
+                if (mm->op == GGML_OP_MUL_MAT && mm->src[0]->type == GGML_TYPE_Q8_0 &&
+                    mm->src[0]->ne[1] % 128 == 0 && mm->src[1]->type == GGML_TYPE_F32 &&
+                    mm->src[1]->ne[1] > 1 && mm->src[1]->ne[1] <= 32 &&
+                    ggml_is_contiguous(mm->src[1])) {
+                    ++cuda_ctx->fwht_q8().plain_q8_users[mm->src[1]];
+                }
+            }
+
             cuda_ctx->glu_prefused.clear();
             if (ggml_cuda_dirty_tracking()) {
                 ggml_cuda_dirty_mark_graph(cgraph, cuda_ctx->stream());
