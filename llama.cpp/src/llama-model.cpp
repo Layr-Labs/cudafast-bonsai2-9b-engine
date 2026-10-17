@@ -30,6 +30,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -2157,6 +2158,39 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (count > 0) {
                 LLAMA_LOG_INFO("%s: GB10 decode layout copies of %d weight(s), %.2f MiB\n", __func__, count, bytes/1024.0/1024.0);
+            }
+        }
+    }
+    // ffn_gate and ffn_up of a layer read the same input: a row-interleaved copy of the pair lets the prefill GEMM write
+    // silu(gate)*up directly (ggml-cuda ggml_cuda_mul_mat_q_glu); the blocks are copied verbatim.
+    // LLAMA_PREFILL_GLU_PAIR=0 makes no copies.
+    if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA")) {
+        static const bool glu_pairs = getenv("LLAMA_PREFILL_GLU_PAIR") == nullptr || atoi(getenv("LLAMA_PREFILL_GLU_PAIR")) != 0;
+        using register_pair_fn_t = size_t (*)(const ggml_tensor *, const ggml_tensor *);
+        auto * register_pair_fn = (register_pair_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_register_prefill_glu_pair");
+        if (glu_pairs && register_pair_fn != nullptr) {
+            std::unordered_map<std::string, ggml_tensor *> by_name;
+            for (const auto & [name, tensor] : tensors_by_name) {
+                by_name.emplace(name, tensor);
+            }
+            size_t bytes = 0;
+            int    count = 0;
+            for (const auto & [name, tensor] : tensors_by_name) {
+                const std::string suffix = ".ffn_gate.weight";
+                if (tensor == nullptr || name.size() <= suffix.size() ||
+                        name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+                    continue;
+                }
+                const auto it = by_name.find(name.substr(0, name.size() - suffix.size()) + ".ffn_up.weight");
+                if (it == by_name.end() || it->second == nullptr) {
+                    continue;
+                }
+                const size_t b = register_pair_fn(tensor, it->second);
+                bytes += b;
+                count += b > 0;
+            }
+            if (count > 0) {
+                LLAMA_LOG_INFO("%s: GB10 prefill gate/up pair copies of %d layer(s), %.2f MiB\n", __func__, count, bytes/1024.0/1024.0);
             }
         }
     }

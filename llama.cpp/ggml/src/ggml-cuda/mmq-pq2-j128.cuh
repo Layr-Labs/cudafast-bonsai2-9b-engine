@@ -27,6 +27,7 @@
 // per K block (completing on an mbarrier) plus a transposed copy of its D4 scales in shared memory.
 
 #include "common.cuh"
+#include "unary.cuh"
 // cp-async.cuh (no include guard) is included by mmq.cuh before this header
 
 #include <cstdint>
@@ -475,13 +476,42 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_res_hint(const float *
     }
 }
 
+// GLU epilogue for a gate/up row-interleaved weight (ggml_cuda_glu_pair): in every 16-row mma tile rows 0-7 are
+// gate rows of 8 features and rows 8-15 the up rows of the same features, so a thread holds gate (row g) and up
+// (row g + 8) of feature row_base/2 + 8*rt + g. It stores silu(gate)*up there with the expression of
+// unary_gated_op_kernel<op_silu, float> (the SWIGLU node's value); out has the gate output's layout.
+static __device__ __forceinline__ void ggml_cuda_pq2_j128_store_glu(
+        const float (&acc)[2][4][4], float * out, const int stride_col, const int row_base, const int col_base,
+        const int j_max) {
+    const int lane = threadIdx.x;
+    const int g    = lane / 4;
+    const int c    = lane % 4;
+#pragma unroll
+    for (int rt = 0; rt < 2; ++rt) {
+#pragma unroll
+        for (int ct = 0; ct < 4; ++ct) {
+#pragma unroll
+            for (int l = 0; l < 2; ++l) {
+                const int j = col_base + ct*8 + 2*c + l;
+                if (j > j_max) {
+                    continue;
+                }
+                const int i = row_base/2 + rt*8 + g;
+                out[(int64_t) j*stride_col + i] = ggml_cuda_op_silu_single(acc[rt][ct][l]) * acc[rt][ct][l + 2];
+            }
+        }
+    }
+}
+
 // grid = old grid * 2 (1D: row half q = blockIdx.x % 2 fastest), block = (32, 8), 2 CTAs per SM.
 // PURE: pure tiling (grid == number of tiles), block b is tile b with the full K range.
 // ADD (C74): the residual ADD that is this matmul's only reader is folded in. A segment that runs its whole tile
 // (K blocks 0..nkb) writes dst_add = acc + res; the first segment of a stream-k tile that another block started
 // writes its partial sum to dst as before, and mul_mat_q_pq2_j128_fixup_add completes that tile into dst_add.
 // res and dst_add have dst's layout (stride_col_dst). dst_add may be dst or res; it overlaps nothing else.
-template <bool PURE, bool ADD>
+// GLU (pure tiling only): x is a gate/up row-interleaved weight of 2*F rows, dst the F-row gate output (see
+// ggml_cuda_pq2_j128_store_glu); every accumulator is the one the separate gate and up launches compute.
+template <bool PURE, bool ADD, bool GLU = false>
 __launch_bounds__(256, 2)
 static __global__ void mul_mat_q_pq2_j128(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
@@ -561,6 +591,9 @@ static __global__ void mul_mat_q_pq2_j128(
             const int64_t off = (int64_t) jt*J*stride_col_dst + it*I;
             ggml_cuda_pq2_j128_store_add(acc, dst_add + off, res + off, stride_col_dst, row_in_tile, col_in_tile,
                                          ncols_dst - jt*J - 1);
+        } else if constexpr (GLU) {
+            ggml_cuda_pq2_j128_store_glu(acc, dst + (int64_t) jt*J*stride_col_dst + it*(I/2), stride_col_dst, row_in_tile,
+                                         col_in_tile, ncols_dst - jt*J - 1);
         } else {
             ggml_cuda_pq2_j128_store(acc, dst + (int64_t) jt*J*stride_col_dst + it*I, stride_col_dst, row_in_tile, col_in_tile,
                                      ncols_dst - jt*J - 1);
@@ -778,6 +811,29 @@ static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid,
             nullptr, nullptr, args.dst, tmp_fixup, blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst,
             (int) args.nrows_dst, one_fd, (int) args.stride_channel_dst, one_fd, (int) args.stride_sample_dst, ntx_fd);
     }
+}
+
+// The GLU kernel over a 2*F-row interleaved weight (args.nrows_x = 2*F, args.dst = the gate output, args.nrows_dst its
+// column stride): pure tiling, one CTA per 128-row tile, no fixup.
+template <ggml_type type>
+static void ggml_cuda_mmq_pq2_j128_glu_launch(const mmq_args & args, cudaStream_t stream) {
+    static_assert(type == GGML_TYPE_PQ2_0, "PQ2_0 only");
+    constexpr size_t smem = ggml_cuda_pq2_j128_smem();
+    const int nkb = (int) (args.ncols_x / QK_PQ2_0);
+    const int ntx = (int) ((args.ncols_max + 127) / 128);
+    const int ntiles = (int) (args.nrows_x / 128) * ntx;
+    const auto kernel = mul_mat_q_pq2_j128<true, false, true>;
+    static bool attr_set[GGML_CUDA_MAX_DEVICES] = { false };
+    const int device = ggml_cuda_get_device();
+    if (!attr_set[device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
+        attr_set[device] = true;
+    }
+    ggml_cuda_kernel_launch(kernel,
+        ggml_cuda_kernel_launch_params(dim3(2*ntiles, 1, 1), dim3(32, 8, 1), smem, stream),
+        args.x, args.y, args.dst, nullptr, (int) args.nrows_x, nkb, (int) args.stride_row_x, (int) args.ncols_y,
+        (int) args.nrows_dst, (int) args.ncols_dst, ntx, (const float *) nullptr, (float *) nullptr);
 }
 
 // Template so that only the PQ2_0 MMQ translation unit instantiates the kernels. Pure tiling loads the

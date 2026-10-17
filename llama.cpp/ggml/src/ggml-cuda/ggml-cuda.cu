@@ -3702,6 +3702,18 @@ static int ggml_cuda_try_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cg
     if (plan_only) {
         return 1; // the caller only asks whether this node would be folded
     }
+    // A prefused SWIGLU (ggml_cuda_try_prefill_glu): its value is already in the gate operand, which the plain
+    // transform reads (same element value, same layout: contiguous rows of K).
+    bool glu_pre = false;
+    if (glu && !gn_glu && !rms && !add) {
+        const auto it = std::find(ctx.glu_prefused.begin(), ctx.glu_prefused.end(), glu);
+        if (it != ctx.glu_prefused.end()) {
+            if (glu_x != glu->src[0]->data || glu_o0 != K) {
+                return 0;
+            }
+            glu_pre = true;
+        }
+    }
 
     // Separate held storage avoids allocator aliasing and includes MMQ lookahead padding.
     auto blk = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
@@ -3728,7 +3740,10 @@ static int ggml_cuda_try_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cg
                                       rms_norm_out, out, K, ncols, ctx.stream());
     } else {
         fwht_quantize_mmq_d4_cuda(glu ? glu_x : x->data, x->type, signs ? (const float *) signs->data : nullptr,
-                                   out, K, ne0_padded, ncols, ctx.stream(), glu_g, glu_o0, glu_o1);
+                                   out, K, ne0_padded, ncols, ctx.stream(), glu_pre ? nullptr : glu_g, glu_o0, glu_o1);
+    }
+    if (glu_pre) {
+        ctx.glu_prefused.erase(std::find(ctx.glu_prefused.begin(), ctx.glu_prefused.end(), glu));
     }
 
     ggml_cuda_fwht_q8 e;
@@ -3743,6 +3758,71 @@ static int ggml_cuda_try_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cg
         return i_mm - i_rms + 1;
     }
     return add ? 3 : rms ? 2 : consumed + (glu ? 1 : 0);
+}
+
+// GB10 prefill: MUL_MAT(up), MUL_MAT(gate), GLU(SWIGLU, gate, up) on one D4 activation, with the gate/up pair copy
+// registered at load: one GEMM over the copy writes silu(gate)*up into the gate output (ggml_cuda_mul_mat_q_glu), the
+// up output is never written, and the GLU is marked prefused. Returns the nodes consumed (2) or 0.
+// GGML_CUDA_PREFILL_GLU=0 disables it.
+static int ggml_cuda_try_prefill_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = getenv("GGML_CUDA_PREFILL_GLU") == nullptr || atoi(getenv("GGML_CUDA_PREFILL_GLU")) != 0;
+#if defined(GGML_USE_HOPPER_Q1)
+    return 0;
+#endif
+    if (!enabled || i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * a   = cgraph->nodes[i];
+    ggml_tensor * b   = cgraph->nodes[i + 1];
+    ggml_tensor * glu = cgraph->nodes[i + 2];
+    if (a->op != GGML_OP_MUL_MAT || b->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU ||
+            ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+        return 0;
+    }
+    ggml_tensor * gate = glu->src[0];
+    ggml_tensor * up   = glu->src[1];
+    if (!((gate == a && up == b) || (gate == b && up == a))) {
+        return 0;
+    }
+    if (ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
+            ((a->flags | b->flags) & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_get_op_params_i32(a, 1) == GGML_HINT_SRC0_IS_HADAMARD || ggml_get_op_params_i32(b, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return 0;
+    }
+    const ggml_tensor * wg = gate->src[0];
+    const ggml_tensor * wu = up->src[0];
+    const ggml_tensor * xg = gate->src[1];
+    const ggml_tensor * xu = up->src[1];
+    if (!wg || !wu || !xg || !xu || wg->type != GGML_TYPE_PQ2_0 || wu->type != GGML_TYPE_PQ2_0 ||
+            !ggml_are_same_shape(wg, wu) || !ggml_are_same_shape(xg, xu) || !ggml_are_same_shape(gate, up) ||
+            gate->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate) || !ggml_is_contiguous(glu) ||
+            !ggml_are_same_shape(gate, glu) || ggml_is_transposed(wg) || ggml_is_transposed(xg)) {
+        return 0;
+    }
+    const auto * pg = ctx.fwht_q8().find(xg);
+    const auto * pu = ctx.fwht_q8().find(xu);
+    if (!pg || !pu || !pg->mmq_d4 || !pu->mmq_d4 || pg->data != pu->data ||
+            pg->ne0 != GGML_PAD(xg->ne[0], MATRIX_ROW_PADDING) || pg->ncols != xg->ne[1]) {
+        return 0;
+    }
+    // the path ggml_cuda_mul_mat takes for each of the two matmuls: MMQ (not MMVF, MMF or MMVQ)
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const int64_t ne11  = xg->ne[1];
+    if (ggml_cuda_should_use_mmvf(wg->type, cc, wg->ne, wg->nb, ne11) ||
+            ggml_cuda_should_use_mmf(wg->type, cc, warp_size, wg->ne, wg->nb, ne11, false) ||
+            ggml_cuda_should_use_mmvq(wg->type, cc, ne11) || !ggml_cuda_should_use_mmq(wg->type, cc, ne11, 0)) {
+        return 0;
+    }
+    const ggml_cuda_glu_pair * pair = ggml_cuda_glu_pair_find(wg->data);
+    if (pair == nullptr || pair->up != wu->data || pair->nrows != wg->ne[1] || pair->ncols != wg->ne[0]) {
+        return 0;
+    }
+    if (!ggml_cuda_mul_mat_q_glu(ctx, wg, xg, gate, pair->stacked, const_cast<void *>(pg->data))) {
+        return 0;
+    }
+    ctx.glu_prefused.push_back(glu);
+    return 2;
 }
 
 static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
@@ -6518,6 +6598,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             cuda_ctx->gdn_gathers().reset();
             cuda_ctx->fwht_q8().reset();
+            cuda_ctx->glu_prefused.clear();
             if (ggml_cuda_dirty_tracking()) {
                 ggml_cuda_dirty_mark_graph(cgraph, cuda_ctx->stream());
             }
@@ -6667,6 +6748,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     const int consumed = mmq_consumed ? mmq_consumed : ggml_cuda_try_fwht_q8(*cuda_ctx, cgraph, i);
                     if (consumed > 0) {
                         i += consumed - 1;
+                        continue;
+                    }
+                }
+
+                // prefill gate/up pair as one GEMM writing the SWIGLU value (its GLU is then prefused)
+                if (node->op == GGML_OP_MUL_MAT && !is_concurrent_event_active && stream_ctx.concurrent_events.empty()) {
+                    const int glu_consumed = ggml_cuda_try_prefill_glu(*cuda_ctx, cgraph, i);
+                    if (glu_consumed > 0) {
+                        i += glu_consumed - 1;
+                        continue;
+                    }
+                }
+                // a prefused GLU that no FWHT quantizer took: its value is the gate operand
+                if (node->op == GGML_OP_GLU && !cuda_ctx->glu_prefused.empty()) {
+                    const auto it = std::find(cuda_ctx->glu_prefused.begin(), cuda_ctx->glu_prefused.end(), node);
+                    if (it != cuda_ctx->glu_prefused.end()) {
+                        cuda_ctx->glu_prefused.erase(it);
+                        if (node->data != node->src[0]->data) {
+                            CUDA_CHECK(cudaMemcpyAsync(node->data, node->src[0]->data, ggml_nbytes(node), cudaMemcpyDeviceToDevice,
+                                                       cuda_ctx->stream()));
+                        }
                         continue;
                     }
                 }
@@ -8166,10 +8268,31 @@ static size_t ggml_backend_cuda_register_decode_layout(const ggml_tensor * tenso
     return ggml_cuda_dl_register(tensor->data, tensor->ne[1], tensor->ne[0], tensor->type);
 }
 
+// GB10: row-interleaved prefill copy of a layer's ffn_gate/ffn_up (ggml_cuda_glu_pair). Returns the bytes allocated.
+static size_t ggml_backend_cuda_register_prefill_glu_pair(const ggml_tensor * gate, const ggml_tensor * up) {
+    if (gate == nullptr || up == nullptr || gate->buffer == nullptr || up->buffer == nullptr || gate->data == nullptr ||
+            up->data == nullptr || gate->view_src != nullptr || up->view_src != nullptr ||
+            !ggml_backend_buffer_is_cuda(gate->buffer) || !ggml_backend_buffer_is_cuda(up->buffer) ||
+            gate->type != GGML_TYPE_PQ2_0 || up->type != GGML_TYPE_PQ2_0 || !ggml_are_same_shape(gate, up) ||
+            !ggml_is_contiguous(gate) || !ggml_is_contiguous(up) || gate->ne[2] != 1 || gate->ne[3] != 1) {
+        return 0;
+    }
+    const ggml_backend_cuda_buffer_context * cg = (const ggml_backend_cuda_buffer_context *) gate->buffer->context;
+    const ggml_backend_cuda_buffer_context * cu = (const ggml_backend_cuda_buffer_context *) up->buffer->context;
+    if (cg->device != cu->device) {
+        return 0;
+    }
+    ggml_cuda_set_device(cg->device);
+    return ggml_cuda_glu_pair_register(gate->data, up->data, gate->ne[1], gate->ne[0], gate->type);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_cuda_register_decode_layout") == 0) {
         return (void *)ggml_backend_cuda_register_decode_layout;
+    }
+    if (strcmp(name, "ggml_backend_cuda_register_prefill_glu_pair") == 0) {
+        return (void *)ggml_backend_cuda_register_prefill_glu_pair;
     }
     if (strcmp(name, "ggml_backend_cuda_clear_ranges") == 0) {
         return (void *)ggml_backend_cuda_clear_ranges;

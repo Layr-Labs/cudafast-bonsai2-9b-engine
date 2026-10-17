@@ -1717,6 +1717,10 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_fwht_q8_context & fwht_q8() { return fwht_q8_context; }
 
+    // SWIGLU nodes whose value the prefill gate/up GEMM already wrote into its gate operand (ggml_cuda_try_prefill_glu);
+    // the node is then not computed: its FWHT quantizer reads the gate operand, or it is a copy of it.
+    std::vector<const ggml_tensor *> glu_prefused;
+
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);

@@ -617,8 +617,117 @@ size_t ggml_cuda_dl_register(const void * src, const int64_t nrows, const int64_
     return bytes;
 }
 
+bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * src1,
+                             ggml_tensor * gate_dst, const void * stacked, void * external_q8) {
+    const int id  = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[id].cc;
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+    if (cc != GGML_CUDA_CC_DGX_SPARK || gate_w->type != GGML_TYPE_PQ2_0 || src1->type != GGML_TYPE_F32 ||
+            gate_dst->type != GGML_TYPE_F32 || external_q8 == nullptr || stacked == nullptr ||
+            gate_w->ne[2] != 1 || gate_w->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            gate_dst->ne[2] != 1 || gate_dst->ne[3] != 1 || gate_w->nb[0] != ggml_type_size(gate_w->type) ||
+            gate_dst->nb[0] != sizeof(float) || gate_w->ne[1] % 128 != 0 || gate_dst->ne[0] != gate_w->ne[1] ||
+            gate_dst->ne[1] != src1->ne[1] || src1->ne[0] != gate_w->ne[0]) {
+        return false;
+    }
+    // the J that mul_mat_q_switch_J<PQ2_0, false> picks for these columns
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    int J_best = 0;
+    int ntiles_J_best = INT_MAX;
+    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(GGML_TYPE_PQ2_0, J, false, cc);
+        if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc) > smpbo) {
+            continue;
+        }
+        const int ntiles_x = (int) ((src1->ne[1] + config.J - 1) / config.J);
+        if (ntiles_x < ntiles_J_best) {
+            J_best = J;
+            ntiles_J_best = ntiles_x;
+        }
+    }
+    if (J_best != 128) {
+        return false;
+    }
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const int64_t s01 = gate_w->nb[1] / ggml_type_size(gate_w->type);
+    const int64_t s1  = gate_dst->nb[1] / sizeof(float);
+    const int64_t s12 = src1->ne[1]*ne10_padded*sizeof(block_q8_1)/(QK8_1*sizeof(int));
+    mmq_args args = {
+        (const char *) gate_w->data, GGML_TYPE_PQ2_0, (const int *) external_q8, nullptr, nullptr, (float *) gate_dst->data,
+        nullptr,
+        gate_w->ne[0], gate_w->ne[1], gate_dst->ne[1], s01, src1->ne[1], s1,
+        1, 1, s01*gate_w->ne[1], s12, s1*gate_dst->ne[1],
+        1, 1, s01*gate_w->ne[1], s12, s1*gate_dst->ne[1],
+        gate_dst->ne[1], nullptr, nullptr};
+    const int ntiles = (int) (args.nrows_x/128) * (int) ((args.ncols_max + 127)/128);
+    if (!ggml_cuda_mmq_pq2_j128_use(args, nsm) || ggml_cuda_mmq_pq2_j128_grid(args, nsm) != ntiles) {
+        return false; // the separate launch would not be pure tiling in the J=128 kernel
+    }
+    args.x       = (const char *) stacked;
+    args.nrows_x = 2*gate_w->ne[1];
+    if (!ggml_cuda_mmq_pq2_j128_supported(args)) {
+        return false;
+    }
+    ggml_cuda_mmq_pq2_j128_glu_launch<GGML_TYPE_PQ2_0>(args, ctx.stream());
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+static std::unordered_map<const void *, ggml_cuda_glu_pair> & ggml_cuda_glu_map() {
+    static std::unordered_map<const void *, ggml_cuda_glu_pair> m;
+    return m;
+}
+
+const ggml_cuda_glu_pair * ggml_cuda_glu_pair_find(const void * gate) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
+    auto & m = ggml_cuda_glu_map();
+    const auto it = m.find(gate);
+    return it == m.end() ? nullptr : &it->second;
+}
+
+// Returns the bytes allocated (0: not eligible or out of memory; the pair then keeps the separate launches).
+size_t ggml_cuda_glu_pair_register(const void * gate, const void * up, const int64_t nrows, const int64_t ncols,
+                                   const ggml_type type) {
+    if (gate == nullptr || up == nullptr || type != GGML_TYPE_PQ2_0 || nrows % 128 != 0 || ncols % QK_PQ2_0 != 0 ||
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_DGX_SPARK) {
+        return 0;
+    }
+    const size_t row_bytes = (size_t) (ncols/QK_PQ2_0)*sizeof(block_pq2_0);
+    const size_t bytes     = 2*(size_t) nrows*row_bytes;
+    std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
+    auto & m = ggml_cuda_glu_map();
+    if (m.count(gate)) {
+        return 0;
+    }
+    char * stacked = nullptr;
+    if (cudaMalloc(&stacked, bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    // The weight upload (possibly asynchronous, other streams) must be complete.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy2D(stacked,             16*row_bytes, gate, 8*row_bytes, 8*row_bytes, (size_t) nrows/8, cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpy2D(stacked + 8*row_bytes, 16*row_bytes, up, 8*row_bytes, 8*row_bytes, (size_t) nrows/8, cudaMemcpyDeviceToDevice));
+    m[gate] = { gate, up, stacked, nrows, ncols };
+    return bytes;
+}
+
 void ggml_cuda_dl_unregister_range(const void * base, const size_t size) {
     std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
+    {
+        auto & g = ggml_cuda_glu_map();
+        const auto in_range = [&](const void * p) {
+            return (const char *) p >= (const char *) base && (const char *) p < (const char *) base + size;
+        };
+        for (auto it = g.begin(); it != g.end();) {
+            if (in_range(it->second.gate) || in_range(it->second.up)) {
+                CUDA_CHECK(cudaFree(it->second.stacked));
+                it = g.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     auto & m = ggml_cuda_dl_map();
     for (auto it = m.begin(); it != m.end();) {
         const char * p = (const char *) it->first;

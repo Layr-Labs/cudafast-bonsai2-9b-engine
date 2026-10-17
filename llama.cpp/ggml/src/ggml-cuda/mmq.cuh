@@ -1918,6 +1918,25 @@ void ggml_cuda_mul_mat_q(
 
 size_t ggml_cuda_mul_mat_q_q8_size(const ggml_tensor * src0, const ggml_tensor * src1);
 
+// GB10 prefill: ffn_gate and ffn_up of one input as one launch over their row-interleaved copy `stacked` (2*F rows,
+// ggml_cuda_glu_pair), writing silu(gate)*up into gate_dst; external_q8 is the D4 activation both would read. Only
+// when the separate gate (and up) matmul would run the pure-tiling J=128 kernel, so every value is the one the two
+// launches and the SWIGLU node compute. Returns false (nothing launched) otherwise.
+bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * src1,
+                             ggml_tensor * gate_dst, const void * stacked, void * external_q8);
+
+// GB10 prefill: the row-interleaved copy of a layer's ffn_gate/ffn_up PQ2_0 weights (made at model load): in every
+// 16-row group, 8 gate rows then the up rows of the same 8 features; the blocks are copied verbatim.
+struct ggml_cuda_glu_pair {
+    const void * gate;
+    const void * up;
+    char       * stacked;
+    int64_t      nrows; // F (rows of each weight)
+    int64_t      ncols;
+};
+const ggml_cuda_glu_pair * ggml_cuda_glu_pair_find(const void * gate);
+size_t ggml_cuda_glu_pair_register(const void * gate, const void * up, int64_t nrows, int64_t ncols, ggml_type type);
+
 void ggml_cuda_mul_mat_q_fused_two(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0_a, const ggml_tensor * src0_b, const ggml_tensor * src1,
