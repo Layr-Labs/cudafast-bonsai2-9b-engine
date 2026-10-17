@@ -1,7 +1,7 @@
 #include "engine_llama.hpp"
 
 #include "common.h"
-// Staging API: llama_set_embeddings_nextn, llama_set_logits_topk (common/speculative.cpp includes it the same way).
+// Staging API: llama_set_embeddings_nextn (common/speculative.cpp includes it the same way).
 #include "../src/llama-ext.h"
 #include "logits_rank.hpp"
 #include "speculative_round.hpp"
@@ -169,13 +169,6 @@ static common_params make_engine_params(const std::string &model_path, const std
     params.n_ubatch = draft_depth > 0 ? n_batch : n_ubatch;
     params.n_parallel = 1;
     params.n_gpu_layers = -1;
-    // llama.cpp keeps the token embedding table in host memory, which puts a CPU split (the row
-    // lookup) and a synchronous upload in front of every graph; on the GPU the lookup runs inside
-    // the graph and dequantizes the same way (test/token_embd_equivalence.cpp)
-    if (ggml_backend_dev_t gpu = ggml_backend_dev_by_name("CUDA0")) {
-        params.tensor_buft_overrides.push_back({"^token_embd\\.weight$", ggml_backend_dev_buffer_type(gpu)});
-        params.tensor_buft_overrides.push_back({nullptr, nullptr});
-    }
     constexpr int n_threads = 4;
     params.cpuparams.n_threads = n_threads;
     params.cpuparams_batch.n_threads = n_threads;
@@ -224,7 +217,6 @@ LlamaEngine::LlamaEngine(const std::string &model_path, const std::string &spec_
     model_ = main_init_->model();
     ctx_tgt_ = main_init_->context();
     llama_set_sampler(ctx_tgt_, seq_id_, nullptr);
-    logits_topk_ = llama_set_logits_topk(ctx_tgt_, kTopK);
 
     const llama_vocab *vocab = llama_model_get_vocab(model_);
     vocab_size_ = llama_vocab_n_tokens(vocab);
@@ -341,15 +333,6 @@ void LlamaEngine::prefill_prompt(const llama_tokens &inp) {
 
 Emit LlamaEngine::emit_logits(int idx) const {
     llama_synchronize(ctx_tgt_);
-    if (logits_topk_) {
-        const int32_t *ids = nullptr;
-        const float *top = nullptr;
-        const float *head = nullptr;
-        Emit e;
-        if (llama_get_logits_topk_ith(ctx_tgt_, idx, &ids, &top, &head) && top_from_selection(ids, top, head, e)) {
-            return e;
-        }
-    }
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_));
     const float *logits = llama_get_logits_ith(ctx_tgt_, idx);
     if (!logits) {

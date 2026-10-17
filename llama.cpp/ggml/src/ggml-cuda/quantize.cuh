@@ -88,9 +88,3 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
-
-// Exact signed/unsigned FWHT4096 followed by PQ2 MMQ D4 activation quantization.
-// With g, the input is SWIGLU(x, g) as ggml_cuda_op_swiglu computes it (row strides o0/o1 in elements).
-void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * signs, void * y,
-    int64_t k, int64_t kp, int64_t rows, cudaStream_t stream,
-    const void * g = nullptr, int64_t o0 = 0, int64_t o1 = 0);

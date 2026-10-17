@@ -117,40 +117,6 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
-// Select the k largest logits of every output row on the device (k <= 32, 0 turns it off) and
-// copy only those and the row's first k logits to the host. llama_get_logits_ith still returns
-// the full row, copied from the device when it is first read. Returns false when the output
-// layer is not on a CUDA device or its rows are too narrow for the streaming selection.
-LLAMA_API bool llama_set_logits_topk(struct llama_context * ctx, int32_t k);
-
-// The selection for output i: the ids and logits of the k largest logits in descending order
-// (equal logits, -0.0 and +0.0 among them, in ascending id order; +NaN ranks above +inf and
-// -NaN below -inf) and the first k logits of the row. Returns false without a selection.
-LLAMA_API bool llama_get_logits_topk_ith(struct llama_context * ctx, int32_t i, const int32_t ** ids,
-                                         const float ** logits, const float ** head);
-
-// Keep up to n built graphs (default 1), each with its own scheduler and compute buffers, so a
-// context that alternates graph types reuses each graph instead of rebuilding it every call.
-LLAMA_API void llama_set_graph_slots(struct llama_context * ctx, uint32_t n);
-
-// Keep the layer inputs llama_set_embeddings_layer_inp extracts on the device only, for
-// llama_set_embd_import_layer_inp (llama_get_embeddings_layer_inp has no rows then).
-LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);
-
-// The encoder takes its embeddings input as n slabs of [n_embd_inp_enc / n, n_tokens] and puts
-// them side by side in one row per token (0: one [n_embd_inp_enc, n_tokens] input).
-LLAMA_API bool llama_set_encoder_inp_slabs(struct llama_context * ctx, uint32_t n);
-
-// Device embeddings hand-off. The next llama_encode/llama_decode of ctx, with a batch of
-// embeddings in one ubatch, fills its embeddings input on the device instead of from batch.embd:
-// - llama_set_embd_import_layer_inp: slab k gets the rows from batch index row0 on of the input
-//   of layer lids[k] in src's last decode (extracted with llama_set_embeddings_layer_inp)
-// - llama_set_embd_import_nextn: the nextn embeddings of ctx's last llama_encode
-// The copies are ordered after the work that produced the rows. Returns false when there are none.
-LLAMA_API bool llama_set_embd_import_layer_inp(struct llama_context * ctx, const struct llama_context * src,
-                                               const int32_t * lids, uint32_t n_lids, int32_t row0);
-LLAMA_API bool llama_set_embd_import_nextn(struct llama_context * ctx);
-
 //
 // model/context data extraction
 //

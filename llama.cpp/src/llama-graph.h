@@ -1023,9 +1023,6 @@ public:
     // important graph nodes
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
-
-    // built with its embeddings input on the device of an embeddings import (llama_set_embd_import_*)
-    bool embd_import = false;
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
@@ -1033,9 +1030,6 @@ public:
     // by the per-model graph builder when cparams.n_capture_layers > 0.
     ggml_tensor * t_h_capture   = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
-
-    ggml_tensor * t_logits_topk_ids  = nullptr; // [k, n_outputs] ids of the k largest logits, descending
-    ggml_tensor * t_logits_topk_vals = nullptr; // [1, k, n_outputs] the logits at those ids
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1499,9 +1493,6 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
-
-    // logits top-k (cparams.logits_topk): the k largest logits of every output row
-    void build_logits_topk() const;
 
     //
     // dense (out)

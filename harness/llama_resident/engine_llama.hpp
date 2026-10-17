@@ -87,9 +87,6 @@ class LlamaEngine : public IEngine {
     llama_context *ctx_tgt_ = nullptr;
     llama_context *ctx_dft_ = nullptr;
 
-    // The target selects each output row's top kTopK on the device (llama_set_logits_topk).
-    bool logits_topk_ = false;
-
     // DFlash: the target layers whose inputs the drafter reads, and whether
     // their extraction is on (the speculative state turns it on when it is
     // created; start_frontier_only turns it off).

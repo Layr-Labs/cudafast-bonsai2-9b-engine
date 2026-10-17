@@ -363,21 +363,11 @@ template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
     auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
 
-    // one row per token, or one slab per target layer that the graph puts side by side per token
-    const int64_t n_slabs = cparams.encoder_inp_slabs;
-    inp_target->embd = n_slabs > 0
-        ? ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc() / n_slabs, n_tokens, n_slabs)
-        : ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);
+    inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);
     ggml_set_input(inp_target->embd);
 
     ggml_tensor * cur = inp_target->embd;
     cb(cur, "inp_embd", -1);
-    res->t_inp_embd = cur;
-
-    if (n_slabs > 0) {
-        cur = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, cur, 0, 2, 1, 3)), hparams.n_embd_inp_enc(), n_tokens);
-        cb(cur, "inp_embd_rows", -1);
-    }
 
     res->add_input(std::move(inp_target));
 
@@ -894,7 +884,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         ggml_tensor * inp_g = inp->embd;
         cb(inp_g, "inp_g_embeddings", -1);
-        res->t_inp_embd = inp_g;
 
         res->add_input(std::move(inp));
 
@@ -1203,7 +1192,6 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
         ggml_tensor * inp_g = inp->embd;
         cb(inp_g, "inp_g_embeddings", -1);
-        res->t_inp_embd = inp_g;
 
         res->add_input(std::move(inp));
 
