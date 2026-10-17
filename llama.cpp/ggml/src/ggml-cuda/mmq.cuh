@@ -1445,12 +1445,6 @@ static __global__ void mul_mat_q_stream_k_fixup(
         float * tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
         const int stride_sample_dst, const uint3 ntx) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
-    // Programmatic stream serialization on GB10 (launch_mul_mat_q): the partial sums in tmp_last_tile and
-    // dst are written by the mul_mat_q kernel this launch follows.
-    ggml_cuda_pdl_sync();
-    ggml_cuda_pdl_lc();
-#endif
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -1475,6 +1469,12 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const bool did_not_have_any_data   = kbc0 == kbc0_stop;
     const bool wrote_beginning_of_tile = fastmodulo(kbc0, blocks_per_ne00) == 0;
     const bool did_not_write_last      = fastdiv(kbc0, blocks_per_ne00) == fastdiv(kbc0_stop, blocks_per_ne00) && fastmodulo(kbc0_stop, blocks_per_ne00) != 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    // Index arithmetic above has no dependency on the preceding matmul. All CTAs
+    // still acquire its completion before any partial/destination load or return.
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+#endif
     if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
         return;
     }
