@@ -705,10 +705,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
-    logits_materialize();
     synchronize();
-
-    graph_slots.clear();
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -926,8 +923,6 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
-        logits_materialize();
-
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
@@ -965,7 +960,6 @@ enum llama_pooling_type llama_context::pooling_type() const {
 
 float * llama_context::get_logits() {
     output_reorder();
-    logits_materialize();
 
     return logits.data;
 }
@@ -1001,7 +995,6 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
 
 float * llama_context::get_logits_ith(int32_t i) {
     output_reorder();
-    logits_materialize();
 
     try {
         if (logits.data == nullptr) {
@@ -1018,162 +1011,6 @@ float * llama_context::get_logits_ith(int32_t i) {
         return nullptr;
 #endif
     }
-}
-
-bool llama_context::set_logits_topk(int32_t k) {
-    LLAMA_LOG_DEBUG("%s: k = %d\n", __func__, k);
-
-    // the ordering contract is that of the CUDA streaming selection (ggml_cuda_op_top_k takes it
-    // for k <= 32 on rows wider than 1024)
-    ggml_backend_dev_t dev = model.dev_output();
-    const bool on_cuda = dev && std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0;
-    if (k < 0 || k > 32 || (k > 0 && (!on_cuda || model.vocab.n_tokens() <= 1024))) {
-        return false;
-    }
-
-    cparams.logits_topk = (uint32_t) k;
-
-    sched_need_reserve = true;
-
-    return true;
-}
-
-bool llama_context::get_logits_topk_ith(int32_t i, const int32_t ** ids, const float ** vals, const float ** head) {
-    output_reorder();
-
-    if (!logits_topk_ready) {
-        return false;
-    }
-
-    try {
-        const int64_t j = output_resolve_row(i);
-        const int64_t k = cparams.logits_topk;
-
-        *ids  = logits_topk_ids.data  + j*k;
-        *vals = logits_topk_vals.data + j*k;
-        *head = logits_topk_head.data + j*k;
-
-        return true;
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
-        return false;
-    }
-}
-
-void llama_context::logits_materialize() {
-    if (logits_dev == nullptr) {
-        return;
-    }
-
-    ggml_tensor * t = logits_dev;
-    logits_dev = nullptr;
-
-    ggml_backend_sched_synchronize(sched.get());
-    ggml_backend_tensor_get(t, logits.data + logits_dev_row*model.vocab.n_tokens(), 0, ggml_nbytes(t));
-}
-
-// rows [i0, i0 + n) of a contiguous tensor, as a 2d tensor for the backend copy functions
-static ggml_tensor tensor_rows(const ggml_tensor * t, int64_t i0, int64_t n) {
-    ggml_tensor v = *t;
-    v.data  = (char *) t->data + i0*t->nb[1];
-    v.ne[1] = n;
-    v.ne[2] = 1;
-    v.ne[3] = 1;
-    v.nb[2] = n*t->nb[1];
-    v.nb[3] = v.nb[2];
-    return v;
-}
-
-void llama_context::set_embeddings_layer_inp_dev(bool value) {
-    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
-
-    cparams.embeddings_layer_inp_dev = value;
-}
-
-bool llama_context::set_encoder_inp_slabs(uint32_t n) {
-    LLAMA_LOG_DEBUG("%s: n = %u\n", __func__, n);
-
-    if (n > 0 && model.hparams.n_embd_inp_enc() % n != 0) {
-        return false;
-    }
-
-    if (cparams.encoder_inp_slabs != n) {
-        cparams.encoder_inp_slabs = n;
-
-        sched_need_reserve = true;
-    }
-
-    return true;
-}
-
-bool llama_context::embd_import_stage(std::vector<embd_import_src> srcs) {
-    const ggml_tensor *   t   = srcs.front().tensor;
-    ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
-    ggml_backend_dev_t    dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
-    for (const auto & b : backends) {
-        if (ggml_backend_get_device(b.get()) == dev) {
-            embd_import = { std::move(srcs), b.get() };
-            return true;
-        }
-    }
-    return false;
-}
-
-bool llama_context::set_embd_import_layer_inp(const llama_context & src, const int32_t * lids, uint32_t n_lids, int32_t row0) {
-    const int64_t r = row0 - src.layer_inp_tok0;
-
-    std::vector<embd_import_src> srcs;
-    for (uint32_t k = 0; k < n_lids; ++k) {
-        const int32_t lid = lids[k];
-        if (lid < 0 || (size_t) lid >= src.cparams.embeddings_layer_inp.size() || !src.cparams.embeddings_layer_inp[lid]) {
-            return false;
-        }
-        ggml_tensor * t = src.gf_res_prev->get_layer_inp(lid);
-        if (t == nullptr || r < 0 || r >= ggml_nrows(t)) {
-            return false;
-        }
-        srcs.push_back({ t, ggml_backend_sched_get_tensor_backend(src.sched.get(), t), r });
-    }
-
-    return !srcs.empty() && embd_import_stage(std::move(srcs));
-}
-
-bool llama_context::set_embd_import_nextn() {
-    ggml_tensor * t = gf_res_prev->get_h_nextn();
-    if (t == nullptr || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
-        return false;
-    }
-
-    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
-
-    // the rows leave the compute buffer before the next graph is allocated over it
-    if (nextn_dev == nullptr || nextn_dev->ne[0] != t->ne[0] || nextn_dev->ne[1] < t->ne[1]) {
-        // an import may still read the old copy
-        ggml_backend_sched_synchronize(sched.get());
-
-        nextn_dev = nullptr;
-        buf_nextn_dev.reset();
-
-        ggml_init_params params = {
-            /*.mem_size   =*/ ggml_tensor_overhead(),
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
-        };
-        ctx_nextn_dev.reset(ggml_init(params));
-        ggml_tensor * dev_t = ggml_new_tensor_2d(ctx_nextn_dev.get(), GGML_TYPE_F32, t->ne[0], std::max<int64_t>(t->ne[1], cparams.n_ubatch));
-
-        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
-        buf_nextn_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_nextn_dev.get(), ggml_backend_buffer_get_type(buf)));
-        if (!buf_nextn_dev) {
-            return false;
-        }
-        nextn_dev = dev_t;
-    }
-
-    ggml_tensor dst = tensor_rows(nextn_dev, 0, t->ne[1]);
-    ggml_backend_tensor_copy_async(backend, backend, t, &dst);
-
-    return embd_import_stage({ { nextn_dev, backend, 0 } });
 }
 
 float * llama_context::get_embeddings() {
@@ -1578,64 +1415,6 @@ void llama_context::set_causal_attn(bool value) {
     sched_need_reserve = true;
 }
 
-void llama_context::set_graph_slots(uint32_t n) {
-    LLAMA_LOG_DEBUG("%s: n = %u\n", __func__, n);
-
-    n = std::max<uint32_t>(n, 1);
-    if (n == n_graph_slots) {
-        return;
-    }
-
-    // a parked graph may still be running
-    synchronize();
-
-    graph_slots.clear();
-    n_graph_slots = n;
-}
-
-bool llama_context::graph_slot_select(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx,
-                                      bool embd_import) {
-    const auto fits = [&](llm_graph_result * res) {
-        return res->embd_import == embd_import && res->can_reuse(graph_params(res, ubatch, mctx, gtype));
-    };
-
-    if (fits(gf_res_prev.get())) {
-        return true;
-    }
-
-    graph_slot next;
-    bool       reuse = false;
-
-    for (auto it = graph_slots.begin(); it != graph_slots.end(); ++it) {
-        if (fits(it->res.get())) {
-            next = std::move(*it);
-            graph_slots.erase(it);
-            reuse = true;
-            break;
-        }
-    }
-
-    if (!reuse) {
-        // rebuild in a new slot while there is room, else in the least recently used one
-        if (graph_slots.size() + 1 < n_graph_slots) {
-            const size_t max_nodes = graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
-
-            next.res.reset(new llm_graph_result(max_nodes));
-            next.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
-                                                    max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-        } else {
-            next = std::move(graph_slots.front());
-            graph_slots.erase(graph_slots.begin());
-        }
-    }
-
-    graph_slots.push_back({ std::move(gf_res_prev), std::move(sched) });
-    gf_res_prev = std::move(next.res);
-    sched       = std::move(next.sched);
-
-    return reuse;
-}
-
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1766,22 +1545,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    // the previous ubatch's raw logits must leave the device before its graph is replaced
-    logits_materialize();
-
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
-
-    // an embeddings import (llama_set_embd_import_*) needs a graph whose embeddings input is on the
-    // import's device, and only a graph built that way serves it
-    const bool embd_import_now = !embd_import_cur.srcs.empty() && ubatch.embd != nullptr;
-
-    // with graph slots (llama_set_graph_slots) the active graph becomes a parked one this ubatch can
-    // reuse, or else the slot to rebuild
-    const bool slot_reuse = n_graph_slots > 1 && !graph_reuse_disable && graph_slot_select(ubatch, gtype, mctx, embd_import_now);
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1790,7 +1558,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (slot_reuse || (n_graph_slots == 1 && !graph_reuse_disable && res->embd_import == embd_import_now && res->can_reuse(gparams))) {
+    if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1819,13 +1587,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (embd_import_now) {
-            GGML_ASSERT(res->t_inp_embd != nullptr && (res->t_inp_embd->flags & GGML_TENSOR_FLAG_INPUT) &&
-                        "embeddings import into a graph without an embeddings input");
-            ggml_backend_sched_set_tensor_backend(sched.get(), res->t_inp_embd, embd_import_cur.backend_dst);
-        }
-        res->embd_import = embd_import_now;
-
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1838,39 +1599,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        if (embd_import_now) {
-            llama_ubatch ubatch_inp = ubatch;
-            ubatch_inp.embd = nullptr;
-            res->set_inputs(&ubatch_inp);
-        } else {
-            res->set_inputs(&ubatch);
-        }
+        res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-    }
-
-    if (embd_import_now) {
-        // the rows go straight into the embeddings input on the device, one slab per source; a
-        // copy from another context runs on that context's stream, so this one must not still
-        // use the memory
-        ggml_tensor *  dst  = res->t_inp_embd;
-        const int64_t  n    = dst->ne[1];
-        const auto   & srcs = embd_import_cur.srcs;
-        GGML_ASSERT(ggml_nrows(dst) == n*(int64_t) srcs.size());
-
-        for (const auto & s : srcs) {
-            if (s.backend != embd_import_cur.backend_dst) {
-                ggml_backend_sched_synchronize(sched.get());
-                break;
-            }
-        }
-        for (size_t k = 0; k < srcs.size(); ++k) {
-            GGML_ASSERT(srcs[k].tensor->ne[0] == dst->ne[0] && srcs[k].row0 + n <= ggml_nrows(srcs[k].tensor));
-            ggml_tensor src_rows = tensor_rows(srcs[k].tensor, srcs[k].row0, n);
-            ggml_tensor dst_rows = tensor_rows(dst, (int64_t) k*n, n);
-            ggml_backend_tensor_copy_async(srcs[k].backend, embd_import_cur.backend_dst, &src_rows, &dst_rows);
-        }
-        embd_import_cur = {};
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -1889,10 +1620,6 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
-
-    // a staged embeddings import serves this call only, and only a batch of embeddings
-    embd_import_cur = batch_inp.embd ? std::move(embd_import) : embd_import_info{};
-    embd_import     = {};
 
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -2152,10 +1879,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return encode(batch_inp);
     }
 
-    // a staged embeddings import serves this call only, and only a batch of embeddings
-    embd_import_cur = batch_inp.embd ? std::move(embd_import) : embd_import_info{};
-    embd_import     = {};
-
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2327,11 +2050,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        // an embeddings import covers the whole batch in one ubatch
-        GGML_ASSERT(embd_import_cur.srcs.empty() || ubatch.n_tokens == n_tokens_all);
-
-        layer_inp_tok0 = n_tokens_prev;
-
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
@@ -2408,27 +2126,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                if (res->t_logits_topk_ids) {
-                    // copy the top-k and the first k logits of every row; the rows stay on the device
-                    const int64_t k = cparams.logits_topk;
-                    const int64_t o = n_outputs_prev*k;
-
-                    ggml_backend_t backend_topk = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_logits_topk_vals);
-                    GGML_ASSERT(backend_topk != nullptr);
-
-                    ggml_backend_tensor_get_async(backend_topk, res->t_logits_topk_ids,  logits_topk_ids.data  + o, 0, n_outputs*k*sizeof(int32_t));
-                    ggml_backend_tensor_get_async(backend_topk, res->t_logits_topk_vals, logits_topk_vals.data + o, 0, n_outputs*k*sizeof(float));
-                    ggml_backend_tensor_get_2d_async(backend_res, t_logits, logits_topk_head.data + o, 0, k*sizeof(float), n_outputs,
-                            n_vocab*sizeof(float), k*sizeof(float));
-
-                    // ready while every ubatch with outputs has its top-k
-                    logits_topk_ready = logits_topk_ready || n_outputs_prev == 0;
-                    logits_dev        = t_logits;
-                    logits_dev_row    = n_outputs_prev;
-                } else {
-                    logits_topk_ready = false;
-                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
-                }
+                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
         }
 
@@ -2624,7 +2322,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
-        if (enabled && !cparams.embeddings_layer_inp_dev) {
+        if (enabled) {
             embd_layer_inp_float_count += (size_t) n_embd * n_batch;
         }
     }
@@ -2641,15 +2339,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         output_ids.resize(n_batch);
     }
 
-    // logits top-k: ids, logits and the first logits of every output row
-    const size_t logits_topk_size = has_logits ? (size_t) cparams.logits_topk*n_outputs_max : 0;
-
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     embd_capture.size      = has_embd_capture ? (size_t) cparams.n_capture_layers * hparams.n_embd * n_outputs_max : 0;
     const size_t new_size  = (logits.size + embd.size + embd_nextn.size + embd_capture.size +
-                              embd_layer_inp_float_count + backend_float_count + 2*logits_topk_size) *
+                              embd_layer_inp_float_count + backend_float_count) *
                                  sizeof(float) +
-                             (backend_token_count + logits_topk_size) * sizeof(llama_token);
+                             (backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2702,7 +2397,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     offset += embd_nextn.size * sizeof(float);
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
-        if (cparams.embeddings_layer_inp[il] && !cparams.embeddings_layer_inp_dev) {
+        if (cparams.embeddings_layer_inp[il]) {
             embd_layer_inp[il] = buffer_view<float>{(float *) (base + offset), (size_t) n_embd * n_batch};
             offset += embd_layer_inp[il].size * sizeof(float);
         } else {
@@ -2713,18 +2408,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd_capture = has_embd_capture ? buffer_view<float>{ (float *) (base + offset), embd_capture.size } :
                                       buffer_view<float>{ nullptr, 0 };
     offset += embd_capture.size * sizeof(float);
-
-    logits_topk_ids = {(int32_t *) (base + offset), logits_topk_size};
-    offset += logits_topk_size * sizeof(int32_t);
-
-    logits_topk_vals = {(float *) (base + offset), logits_topk_size};
-    offset += logits_topk_size * sizeof(float);
-
-    logits_topk_head = {(float *) (base + offset), logits_topk_size};
-    offset += logits_topk_size * sizeof(float);
-
-    logits_topk_ready = false;
-    logits_dev        = nullptr;
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -2774,7 +2457,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
 void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
-        if (!cparams.embeddings_layer_inp[il] || cparams.embeddings_layer_inp_dev) {
+        if (!cparams.embeddings_layer_inp[il]) {
             continue;
         }
         if (!embd_layer_inp[il].has_data()) {
@@ -2804,11 +2487,6 @@ void llama_context::output_reorder() {
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
-    const uint64_t n_topk      = cparams.logits_topk;
-
-    if (!output_swaps.empty()) {
-        logits_materialize();
-    }
 
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
@@ -2817,14 +2495,6 @@ void llama_context::output_reorder() {
         if (logits.size > 0) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
-            }
-        }
-
-        if (logits_topk_ids.size > 0) {
-            for (uint64_t k = 0; k < n_topk; k++) {
-                std::swap(logits_topk_ids.data [i0*n_topk + k], logits_topk_ids.data [i1*n_topk + k]);
-                std::swap(logits_topk_vals.data[i0*n_topk + k], logits_topk_vals.data[i1*n_topk + k]);
-                std::swap(logits_topk_head.data[i0*n_topk + k], logits_topk_head.data[i1*n_topk + k]);
             }
         }
 
@@ -4431,38 +4101,6 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
     return ctx->get_embeddings_layer_inp(lid);
-}
-
-bool llama_set_logits_topk(llama_context * ctx, int32_t k) {
-    return ctx->set_logits_topk(k);
-}
-
-void llama_set_graph_slots(llama_context * ctx, uint32_t n) {
-    ctx->set_graph_slots(n);
-}
-
-bool llama_get_logits_topk_ith(llama_context * ctx, int32_t i, const int32_t ** ids, const float ** logits,
-                               const float ** head) {
-    ctx->synchronize();
-
-    return ctx->get_logits_topk_ith(i, ids, logits, head);
-}
-
-void llama_set_embeddings_layer_inp_dev(llama_context * ctx, bool value) {
-    ctx->set_embeddings_layer_inp_dev(value);
-}
-
-bool llama_set_encoder_inp_slabs(llama_context * ctx, uint32_t n) {
-    return ctx->set_encoder_inp_slabs(n);
-}
-
-bool llama_set_embd_import_layer_inp(llama_context * ctx, const llama_context * src, const int32_t * lids,
-                                     uint32_t n_lids, int32_t row0) {
-    return ctx->set_embd_import_layer_inp(*src, lids, n_lids, row0);
-}
-
-bool llama_set_embd_import_nextn(llama_context * ctx) {
-    return ctx->set_embd_import_nextn();
 }
 
 // multi-layer hidden-state tap C API (staging) -------------------------------

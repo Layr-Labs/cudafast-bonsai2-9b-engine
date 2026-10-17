@@ -1586,7 +1586,6 @@ struct ggml_cuda_gdn_gather_context {
 // later PTQ1_0 mat-vec whose src1 landed there must not mistake its F32 rows for q8_1. Valid for one
 // graph evaluation.
 struct ggml_cuda_fwht_q8 {
-    bool mmq_d4 = false; // distinct packed MMQ layout; never consumed by MMVQ
     ggml_cuda_q8_1_layout layout = GGML_CUDA_Q8_1_AOS;
     int64_t               ne0    = 0;       // padded row width the quantizer wrote (what the mat-vec expects)
     int64_t               ncols  = 0;       // rows quantized (src1->ne[1] of every consumer)
@@ -1887,17 +1886,5 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
-}
-
-// GB10 (DGX Spark): launch through ggml_cuda_kernel_launch (programmatic stream serialization); other devices
-// keep the plain launch. The kernel must call ggml_cuda_pdl_sync() before it reads memory written by an
-// earlier kernel of the stream or writes memory an earlier kernel may still read.
-template<typename Kernel, typename... Args>
-static __inline__ void ggml_cuda_kernel_launch_gb10(const int cc, Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
-    if (cc == GGML_CUDA_CC_DGX_SPARK) {
-        ggml_cuda_kernel_launch(kernel, launch_params, std::forward<Args>(args)...);
-        return;
-    }
-    kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
 }
 

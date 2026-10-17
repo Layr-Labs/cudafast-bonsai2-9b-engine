@@ -1679,9 +1679,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
 
-    // the target features and the encoder output stay on the device (llama_set_embd_import_*)
-    bool features_on_device = false;
-
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq)
@@ -1808,20 +1805,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
-        // turn on extraction of the target layers' input embeddings, kept on the device when the
-        // encoder can take them from there as one input slab per layer
+        // turn on extraction of the target layers' input embeddings
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
-        features_on_device = llama_set_encoder_inp_slabs(ctx_dft, target_layer_ids_n);
-        llama_set_embeddings_layer_inp_dev(ctx_tgt, features_on_device);
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
-
-        // each verify round runs the encoder, the injection and the draft graph on ctx_dft: keep all three
-        llama_set_graph_slots(ctx_dft, 3);
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1909,15 +1900,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather this chunk's target features, interleaved by extract layer (on the device,
-                // the encoder copies them from the target and features_buf only sizes the batch)
+                // gather this chunk's target features, interleaved by extract layer
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
-                if (features_on_device &&
-                    !llama_set_embd_import_layer_inp(ctx_dft, ctx_tgt, target_layer_ids, target_layer_ids_n,
-                                                     i_batch_beg[seq_id] + offset)) {
-                    GGML_ABORT("DFlash: target layer inputs not kept on the device.");
-                }
-                for (uint32_t k = 0; k < target_layer_ids_n && !features_on_device; ++k) {
+                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
@@ -1960,17 +1945,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     return false;
                 }
 
-                // inject the DFlash decoder K/V cache at the tokens' target positions (on the device,
-                // from the encoder output, and batch_inject.embd only sizes the batch)
+                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
+                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
+
+                // inject the DFlash decoder K/V cache at the tokens' target positions
                 batch_inject.n_tokens = n_chunk;
-                if (features_on_device) {
-                    const bool imported = llama_set_embd_import_nextn(ctx_dft);
-                    GGML_ASSERT(imported && "DFlash encoder produced no output.");
-                } else {
-                    const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                    GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-                    std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
-                }
+                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
