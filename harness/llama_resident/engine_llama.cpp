@@ -179,6 +179,9 @@ static common_params make_engine_params(const std::string &model_path, const std
     params.sampling.top_k = 1;
     params.sampling.seed = 1234;
     params.sampling.backend_sampling = false;
+    if (spec_mode == "dflash" && draft_depth > 0) {
+        params.n_outputs_max_per_seq = draft_depth + 1;
+    }
     if (draft_depth > 0) {
         if (spec_mode == "dflash") {
             params.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
@@ -263,9 +266,24 @@ LlamaEngine::LlamaEngine(const std::string &model_path, const std::string &spec_
 
     common_params_sampling sp = base_params_.sampling;
     smpl_ = common_sampler_init(model_, sp);
+
+    // Selection only: retain the exact top-eight IDs and raw logit values on
+    // the target backend. Greedy acceptance and protocol emission still use
+    // the resident's lower-ID tie rule; no sampling/RNG is offloaded.
+    if (spec_mode_ == "dflash" && llama_supports_gpu_offload()) {
+        target_topk_.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(target_topk_.get(), llama_sampler_init_top_k(kTopK));
+        if (!llama_set_sampler(ctx_tgt_, seq_id_, target_topk_.get())) {
+            target_topk_.reset();
+        }
+    }
 }
 
 LlamaEngine::~LlamaEngine() {
+    if (target_topk_) {
+        llama_set_sampler(ctx_tgt_, seq_id_, nullptr);
+        target_topk_.reset();
+    }
     if (smpl_) {
         common_sampler_free(smpl_);
         smpl_ = nullptr;
@@ -333,6 +351,24 @@ void LlamaEngine::prefill_prompt(const llama_tokens &inp) {
 
 Emit LlamaEngine::emit_logits(int idx) const {
     llama_synchronize(ctx_tgt_);
+    if (target_topk_) {
+        const auto n_logits = llama_get_sampled_logits_count_ith(ctx_tgt_, idx);
+        const auto n_ids = llama_get_sampled_candidates_count_ith(ctx_tgt_, idx);
+        const float *logits = llama_get_sampled_logits_ith(ctx_tgt_, idx);
+        const llama_token *ids = llama_get_sampled_candidates_ith(ctx_tgt_, idx);
+        if (n_logits != kTopK || n_ids != kTopK || !logits || !ids) {
+            throw std::runtime_error("missing target backend top-eight logits");
+        }
+        Emit e;
+        for (int i = 0; i < kTopK; ++i) {
+            e.top.push_back({ids[i], logits[i]});
+        }
+        std::sort(e.top.begin(), e.top.end(), [](const auto &a, const auto &b) {
+            return logit_id_before(a.second, a.first, b.second, b.first);
+        });
+        e.token = e.top.front().first;
+        return e;
+    }
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_));
     const float *logits = llama_get_logits_ith(ctx_tgt_, idx);
     if (!logits) {
