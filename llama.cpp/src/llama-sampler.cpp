@@ -1481,21 +1481,26 @@ static void llama_sampler_top_k_backend_apply(
         struct llama_sampler_data * data) {
     auto * sctx = (llama_sampler_top_k *) smpl->ctx;
 
-    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    // A selection-only chain can process independent verification rows in
+    // one backend invocation without flattening their vocabularies together.
+    struct ggml_tensor * logits = data->logits;
+    GGML_ASSERT(logits->ne[2] == 1 && logits->ne[3] == 1);
 
     struct ggml_tensor * top_k = ggml_top_k(ctx, logits, sctx->k);
     ggml_set_name(top_k, "top_k");
 
     if (data->candidates) {
-        struct ggml_tensor * candidates_rows = ggml_reshape_2d(ctx, data->candidates, 1, data->candidates->ne[0]);
-        data->candidates = ggml_get_rows(ctx, candidates_rows, top_k);
+        struct ggml_tensor * candidates_rows = ggml_reshape_3d(
+                ctx, data->candidates, 1, logits->ne[0], logits->ne[1]);
+        data->candidates = ggml_reshape_2d(ctx, ggml_get_rows(ctx, candidates_rows, top_k),
+                top_k->ne[0], top_k->ne[1]);
         ggml_set_name(data->candidates, "top_k_candidates");
     } else {
         data->candidates = top_k;
     }
 
-    struct ggml_tensor * logits_rows = ggml_reshape_2d(ctx, logits, 1, logits->ne[0]);
-    data->logits = ggml_get_rows(ctx, logits_rows, top_k);
+    struct ggml_tensor * logits_rows = ggml_reshape_3d(ctx, logits, 1, logits->ne[0], logits->ne[1]);
+    data->logits = ggml_reshape_2d(ctx, ggml_get_rows(ctx, logits_rows, top_k), top_k->ne[0], top_k->ne[1]);
     ggml_set_name(data->logits, "top_k_rows");
 
     GGML_UNUSED(gf);
