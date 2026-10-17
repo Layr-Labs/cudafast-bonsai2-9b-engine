@@ -977,12 +977,13 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
             ggml_cuda_mmq_dl_launch(mul_mat_q_pq2_j16_dl<TM, GGML_CUDA_DL_H_SECTOR, 2, 1>, attr, args, e, grid, 0, nkb, tmp_fixup, stream);
         }
     } else {
-        // Q8_0 matrices of at least 4096 rows: bulk-copy ring, 2 stages of one step (c64 microbenchmark);
+        // Q8_0 matrices of at least 4096 rows: bulk-copy ring, 2 stages of two steps.
+        // Two-step stages amortize mbarrier/bulk-copy overhead; arithmetic and stream-k partition are unchanged.
         // GGML_CUDA_DL_RING=0 keeps the warp-load kernel.
         static const bool ring     = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING", 1) != 0;
         static const int  ring_min = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_MIN_ROWS", 4096);
         if (ring && args.nrows_x >= ring_min) {
-            ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_Q8, 2, 1>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+            ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_Q8, 2, 2>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
         } else {
             static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
             ggml_cuda_mmq_dl_launch(mul_mat_q_q8_0_j16_dl<TM, GGML_CUDA_DL_H_SECTOR, 2, 1>, attr, args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
