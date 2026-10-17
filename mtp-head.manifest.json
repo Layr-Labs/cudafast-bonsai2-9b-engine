@@ -3,7 +3,8 @@
   "source": "pinned",
   "max_bytes": 3221225472,
   "spec": {
-    "enabled": false,
-    "num_speculative_tokens": 0
+    "enabled": true,
+    "mode": "dflash",
+    "num_speculative_tokens": 15
   }
 }
