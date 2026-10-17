@@ -170,6 +170,12 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
         LLAMA_RESIDENT_BIN="${CMAKE_BINARY_DIR}/bin/llama-resident")
     add_test(NAME llama-resident-tests COMMAND llama-resident-tests)
 
+    add_executable(verify-batch-equivalence test/verify_batch_equivalence.cpp)
+    target_compile_features(verify-batch-equivalence PRIVATE cxx_std_17)
+    target_include_directories(verify-batch-equivalence PRIVATE ${LLAMA_CPP_DIR}/common ${LLAMA_CPP_DIR}/include)
+    target_link_libraries(verify-batch-equivalence PRIVATE llama llama-common)
+    add_test(NAME verify-batch-equivalence COMMAND verify-batch-equivalence)
+
     add_executable(engine-boot-tests test/test_engine_boot.cpp engine_llama.cpp speculative_round.cpp)
     target_compile_features(engine-boot-tests PRIVATE cxx_std_17)
     target_include_directories(engine-boot-tests PRIVATE

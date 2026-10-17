@@ -79,7 +79,8 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
     }
 
     void verify_decode(SpeculativeRoundState &st) override {
-        llama_batch batch_tgt = llama_batch_init(llama_n_batch(eng_->ctx_tgt_), 0, 1);
+        // Exactly one frontier token and the current draft are inserted below.
+        llama_batch batch_tgt = llama_batch_init(static_cast<int32_t>(st.draft->size() + 1), 0, 1);
         common_batch_clear(batch_tgt);
         common_batch_add(batch_tgt, *st.id_last, (*st.n_past)++, {eng_->seq_id_}, true);
         for (size_t i = 0; i < st.draft->size(); ++i) {
