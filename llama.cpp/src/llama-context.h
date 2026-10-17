@@ -143,6 +143,7 @@ struct llama_context {
 
     // device embeddings hand-off, see llama_set_embd_import_layer_inp
     void set_embeddings_layer_inp_dev(bool value);
+    void set_dflash_ctx_rows(uint32_t n);
     bool set_encoder_inp_slabs(uint32_t n);
     bool set_embd_import_layer_inp(const llama_context & src, const int32_t * lids, uint32_t n_lids, int32_t row0);
     bool set_embd_import_nextn();
@@ -329,6 +330,10 @@ private:
     // see llama_dspark_ctx in llama-graph.h for why this needs its own side channel
     // instead of riding batch.token/embd.
     llama_dspark_ctx dspark_ctx;
+
+    // > 0: the next decode is a merged DFlash2 inject whose first rows are this many context rows,
+    // filled by the staged embeddings import (llama_set_dflash_ctx_rows)
+    uint32_t dflash_ctx_rows = 0;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

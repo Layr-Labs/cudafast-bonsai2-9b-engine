@@ -151,6 +151,11 @@ LLAMA_API bool llama_set_embd_import_layer_inp(struct llama_context * ctx, const
                                                const int32_t * lids, uint32_t n_lids, int32_t row0);
 LLAMA_API bool llama_set_embd_import_nextn(struct llama_context * ctx);
 
+// Merged DFlash2 K/V inject: while n > 0, a token decode of ctx whose ubatch holds n context rows
+// ahead of the noise block takes those rows from the staged embeddings import (the encoder output,
+// llama_set_embd_import_nextn) and injects them with the block's own K/V projections.
+LLAMA_API void llama_set_dflash_ctx_rows(struct llama_context * ctx, uint32_t n);
+
 //
 // model/context data extraction
 //

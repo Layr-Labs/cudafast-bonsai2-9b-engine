@@ -71,6 +71,11 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
         target_link_libraries(logits-topk-equivalence PRIVATE ggml)
         add_test(NAME logits-topk-equivalence COMMAND logits-topk-equivalence)
 
+        add_executable(conv-front-equivalence test/conv_front_equivalence.cpp)
+        target_compile_features(conv-front-equivalence PRIVATE cxx_std_17)
+        target_link_libraries(conv-front-equivalence PRIVATE ggml)
+        add_test(NAME conv-front-equivalence COMMAND conv-front-equivalence)
+
         add_executable(token-embd-equivalence test/token_embd_equivalence.cpp)
         target_compile_features(token-embd-equivalence PRIVATE cxx_std_17)
         target_link_libraries(token-embd-equivalence PRIVATE ggml)
@@ -84,6 +89,30 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
             $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
         target_link_libraries(swiglu-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
         add_test(NAME swiglu-fwht-equivalence COMMAND swiglu-fwht-equivalence)
+        add_executable(rms-fwht-equivalence test/rms_fwht_equivalence.cu)
+        target_include_directories(rms-fwht-equivalence PRIVATE
+            ${LLAMA_CPP_DIR}/ggml/src
+            ${LLAMA_CPP_DIR}/ggml/src/ggml-cuda)
+        target_compile_definitions(rms-fwht-equivalence PRIVATE
+            $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
+        target_link_libraries(rms-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        add_test(NAME rms-fwht-equivalence COMMAND rms-fwht-equivalence)
+        add_executable(gnorm-fwht-equivalence test/gnorm_fwht_equivalence.cu)
+        target_include_directories(gnorm-fwht-equivalence PRIVATE
+            ${LLAMA_CPP_DIR}/ggml/src
+            ${LLAMA_CPP_DIR}/ggml/src/ggml-cuda)
+        target_compile_definitions(gnorm-fwht-equivalence PRIVATE
+            $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
+        target_link_libraries(gnorm-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        add_test(NAME gnorm-fwht-equivalence COMMAND gnorm-fwht-equivalence)
+        add_executable(glu-perm-fwht-equivalence test/glu_perm_fwht_equivalence.cu)
+        target_include_directories(glu-perm-fwht-equivalence PRIVATE
+            ${LLAMA_CPP_DIR}/ggml/src
+            ${LLAMA_CPP_DIR}/ggml/src/ggml-cuda)
+        target_compile_definitions(glu-perm-fwht-equivalence PRIVATE
+            $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
+        target_link_libraries(glu-perm-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        add_test(NAME glu-perm-fwht-equivalence COMMAND glu-perm-fwht-equivalence)
         add_executable(ptq1-repack-equivalence test/ptq1_repack_equivalence.cu)
         target_include_directories(ptq1-repack-equivalence PRIVATE
             ${LLAMA_CPP_DIR}/ggml/src

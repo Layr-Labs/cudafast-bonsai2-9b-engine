@@ -1012,6 +1012,22 @@ void quantize_mmq_fp4_cuda(
     }
 }
 
+// MMQ D4 quantization of transformed rows held as v[i] = element base + i*NT + tid of row `row`.
+template <int N, int NT>
+static __device__ __forceinline__ void fwht_quantize_mmq_d4_store(const float * v, block_q8_1_mmq * y,
+        const int64_t base, const int64_t row, const int64_t rows, const int tid, const int lane) {
+#pragma unroll
+    for(int i=0;i<N/NT;++i) {
+        const int64_t col=base+i*NT+tid;
+        const float amax=warp_reduce_max<32>(fabsf(v[i]));
+        const float d_inv=127.0f/amax;
+        const int8_t q=roundf(v[i]*d_inv);
+        const int64_t ib=(col/QK8_1_MMQ)*rows+row;
+        y[ib].qs[col%QK8_1_MMQ]=q;
+        if(lane==0) y[ib].d4[(col%QK8_1_MMQ)/32]=1.0f/d_inv;
+    }
+}
+
 // C6a: preserve standalone FWHT butterfly and MMQ scale/rounding; only stores differ.
 // SWIGLU: the input is a SwiGLU no other node reads. Each element is formed with the expression of
 // unary_gated_op_kernel<op_silu, T> (x activated, g the multiplier, row strides o0/o1 in elements),
@@ -1043,16 +1059,7 @@ static __global__ void fwht_quantize_mmq_d4(const T * x, const T * g, const floa
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
     }
-#pragma unroll
-    for(int i=0;i<NE;++i) {
-        const int64_t col=base+i*NT+tid;
-        const float amax=warp_reduce_max<32>(fabsf(v[i]));
-        const float d_inv=127.0f/amax;
-        const int8_t q=roundf(v[i]*d_inv);
-        const int64_t ib=(col/QK8_1_MMQ)*rows+row;
-        y[ib].qs[col%QK8_1_MMQ]=q;
-        if(lane==0) y[ib].d4[(col%QK8_1_MMQ)/32]=1.0f/d_inv;
-    }
+    fwht_quantize_mmq_d4_store<N,NT>(v,y,base,row,rows,tid,lane);
     GGML_UNUSED(kp); GGML_UNUSED(g); GGML_UNUSED(o0); GGML_UNUSED(o1);
 }
 void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * signs, void * y,
@@ -1065,4 +1072,175 @@ void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * sig
     if(type==GGML_TYPE_F32) { C6_LAUNCH_T(float); } else { GGML_ASSERT(type==GGML_TYPE_F16); C6_LAUNCH_T(half); }
 #undef C6_LAUNCH_T
 #undef C6_LAUNCH
+}
+
+// C56: the transform input is SWIGLU(x, g) read through a permuted view of it (the GDN out-projection's
+// head-permute CONT, which is then not materialized). Transform column col = i0 + n0*(i1 + n1*i2) holds the
+// GLU element at offset i0 + s1*i1 + s2*i2 of its row; each element is formed with unary_gated_op_kernel
+// <op_silu, T>'s expression (x activated, g the multiplier, row strides o0/o1 in elements), so it is the
+// value that kernel and the CONT would have stored. The butterfly and the quantization are
+// fwht_quantize_mmq_d4's.
+template <typename T, bool SIGNED>
+__launch_bounds__(256, 1)
+static __global__ void fwht_quantize_mmq_d4_glu_perm(const T * x, const T * g, const float * signs, block_q8_1_mmq * y,
+        int64_t k, int64_t rows, int64_t o0, int64_t o1, int n0, int n1, int64_t s1, int64_t s2) {
+    constexpr int N=4096, NT=256, NE=N/NT;
+    __shared__ float shared[N];
+    const int tid=threadIdx.x, lane=tid%32;
+    const int64_t row=blockIdx.y, base=int64_t(blockIdx.x)*N;
+    float v[NE];
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    if (base<k) {
+#pragma unroll
+        for(int i=0;i<NE;++i) {
+            const int64_t col=base+i*NT+tid;
+            const int c=int(col), q=c/n0, i0=c-q*n0, i2=q/n1, i1=q-i2*n1;
+            const int64_t src=i0+s1*i1+s2*i2;
+            v[i]=float(T(ggml_cuda_op_silu_single(float(x[row*o0+src]))*float(g[row*o1+src])))*(1.0f/64.0f);
+            if constexpr(SIGNED) v[i]*=signs[col];
+        }
+        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    } else {
+#pragma unroll
+        for(int i=0;i<NE;++i) v[i]=0.0f;
+    }
+#pragma unroll
+    for(int i=0;i<NE;++i) {
+        const int64_t col=base+i*NT+tid;
+        const float amax=warp_reduce_max<32>(fabsf(v[i]));
+        const float d_inv=127.0f/amax;
+        const int8_t q=roundf(v[i]*d_inv);
+        const int64_t ib=(col/QK8_1_MMQ)*rows+row;
+        y[ib].qs[col%QK8_1_MMQ]=q;
+        if(lane==0) y[ib].d4[(col%QK8_1_MMQ)/32]=1.0f/d_inv;
+    }
+}
+
+void fwht_quantize_mmq_d4_glu_perm_cuda(const float * x, const float * g, const float * signs, void * y,
+    int64_t k, int64_t kp, int64_t rows, int64_t o0, int64_t o1, int n0, int n1, int64_t s1, int64_t s2,
+    cudaStream_t stream) {
+    GGML_ASSERT(k%4096==0 && kp%4096==0 && kp>=k && n0>0 && n1>0);
+    const dim3 grid(kp/4096,rows,1);
+    const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
+    if (signs) {
+        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_glu_perm<float,true>,lp,x,g,signs,(block_q8_1_mmq*)y,k,rows,o0,o1,n0,n1,s1,s2);
+    } else {
+        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_glu_perm<float,false>,lp,x,g,signs,(block_q8_1_mmq*)y,k,rows,o0,o1,n0,n1,s1,s2);
+    }
+}
+
+// RMS_NORM * w in front of the signed transform, one block per 4096-wide row. The sum of squares is
+// formed in the order of rms_norm_f32<1024, true>: its thread t accumulates columns t, t+1024, t+2048,
+// t+3072, here v[j], v[j+4], v[j+8], v[j+12] of thread t%256 (j = t/256), followed by the same xor
+// warp reduction, per-warp partials s_sum[t/32] and final warp reduction; mean, scale and the product
+// use its expressions. norm, when set, receives the product for the norm's other readers.
+template <bool SIGNED>
+__launch_bounds__(256, 1)
+static __global__ void fwht_quantize_mmq_d4_rms(const float * x, const int64_t stride_row, const float * w,
+        const int ncols, const float eps, const float * signs, float * norm, block_q8_1_mmq * y, int64_t rows) {
+    constexpr int N=4096, NT=256, NE=N/NT, NR=1024, NJ=NR/NT;
+    __shared__ float shared[N];
+    __shared__ float s_sum[NR/WARP_SIZE];
+    const int tid=threadIdx.x, lane=tid%WARP_SIZE, warp=tid/WARP_SIZE;
+    const int64_t row=blockIdx.y;
+    float v[NE];
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    x+=row*stride_row;
+#pragma unroll
+    for(int i=0;i<NE;++i) v[i]=x[i*NT+tid];
+#pragma unroll
+    for(int j=0;j<NJ;++j) {
+        float tmp=0.0f;
+#pragma unroll
+        for(int i=j;i<NE;i+=NJ) tmp+=v[i]*v[i];
+        tmp=warp_reduce_sum(tmp);
+        if(lane==0) s_sum[j*(NT/WARP_SIZE)+warp]=tmp;
+    }
+    __syncthreads();
+    const float tmp=warp_reduce_sum(s_sum[lane]);
+    const float mean=tmp/ncols;
+    const float scale=rsqrtf(mean+eps);
+#pragma unroll
+    for(int i=0;i<NE;++i) {
+        const int col=i*NT+tid;
+        const float xn=scale*v[i]*w[col];
+        if(norm) norm[row*N+col]=xn;
+        v[i]=xn*(1.0f/64.0f);
+        if constexpr(SIGNED) v[i]*=signs[col];
+    }
+    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
+}
+// GDN output projection input, one block per 4096-wide row (token): per-head RMS_NORM(x) * w over 128-wide heads
+// (as rms_norm_f32<128, true>), SWIGLU(z, normed) (as unary_gated_op_kernel<op_silu, float>) and the CONT of
+// the permuted view that regroups the heads, formed per element: feature f = a0 + 128*(a1 + ne1*a2) of row r reads
+// head row r*g3 + a1*g1 + a2*g2, column a0. Then the signed transform as fwht_quantize_mmq_d4. Register i of the
+// threads of half tid/128 holds one head, column tid%128 being thread tid%128 of that head's rms block: the same
+// square, xor warp reduction, four per-warp partials and final warp reduction (zeros above lane 3).
+template <bool SIGNED>
+__launch_bounds__(256, 1)
+static __global__ void fwht_quantize_mmq_d4_gnorm(const float * x, const float * z, const int64_t z_stride,
+        const float * w, const int ncols, const float eps, const uint3 ne1, const int64_t g1, const int64_t g2,
+        const int64_t g3, const float * signs, block_q8_1_mmq * y, const int64_t rows) {
+    constexpr int N=4096, NT=256, NE=N/NT, HD=128, HW=HD/WARP_SIZE;
+    __shared__ float shared[N];
+    __shared__ float s_sum[NE][NT/WARP_SIZE];
+    const int tid=threadIdx.x, lane=tid%WARP_SIZE, warp=tid/WARP_SIZE, a0=tid%HD;
+    const int64_t row=blockIdx.y;
+    float v[NE];
+    int64_t head[NE];
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for(int i=0;i<NE;++i) {
+        const uint2 a21=fast_div_modulo((uint32_t)(i*(NT/HD)+tid/HD), ne1);
+        head[i]=row*g3+(int64_t)a21.y*g1+(int64_t)a21.x*g2;
+        v[i]=x[head[i]*HD+a0];
+    }
+#pragma unroll
+    for(int i=0;i<NE;++i) {
+        float tmp=0.0f;
+        tmp+=v[i]*v[i];
+        tmp=warp_reduce_sum(tmp);
+        if(lane==0) s_sum[i][warp]=tmp;
+    }
+    __syncthreads();
+#pragma unroll
+    for(int i=0;i<NE;++i) {
+        float tmp=0.0f;
+        if(lane<HW) tmp=s_sum[i][(warp/HW)*HW+lane];
+        tmp=warp_reduce_sum(tmp);
+        const float mean=tmp/ncols;
+        const float scale=rsqrtf(mean+eps);
+        const float xn=scale*v[i]*w[a0];
+        const float g=ggml_cuda_op_silu_single(z[head[i]*z_stride+a0])*xn;
+        v[i]=g*(1.0f/64.0f);
+        if constexpr(SIGNED) v[i]*=signs[i*NT+tid];
+    }
+    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
+}
+void fwht_quantize_mmq_d4_gnorm_cuda(const float * x, const float * z, int64_t z_stride, const float * w, float eps,
+    int64_t ne1, int64_t g1, int64_t g2, int64_t g3, const float * signs, void * y, int64_t rows, cudaStream_t stream) {
+    const ggml_cuda_kernel_launch_params lp(dim3(1,rows,1),dim3(256,1,1),0,stream);
+    const uint3 ne1_fd=init_fastdiv_values(ne1);
+    if(signs) {
+        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_gnorm<true>,lp,x,z,z_stride,w,128,eps,ne1_fd,g1,g2,g3,signs,(block_q8_1_mmq*)y,rows);
+    } else {
+        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_gnorm<false>,lp,x,z,z_stride,w,128,eps,ne1_fd,g1,g2,g3,signs,(block_q8_1_mmq*)y,rows);
+    }
+}
+
+void fwht_quantize_mmq_d4_rms_cuda(const float * x, int64_t stride_row, const float * w, float eps,
+    const float * signs, float * norm, void * y, int64_t k, int64_t rows, cudaStream_t stream) {
+    GGML_ASSERT(k==4096);
+    const dim3 grid(1,rows,1);
+    const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
+    if(signs) {
+        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_rms<true>,lp,x,stride_row,w,(int)k,eps,signs,norm,(block_q8_1_mmq*)y,rows);
+    } else {
+        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_rms<false>,lp,x,stride_row,w,(int)k,eps,signs,norm,(block_q8_1_mmq*)y,rows);
+    }
 }

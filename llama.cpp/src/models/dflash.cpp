@@ -9,6 +9,48 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <vector>
+
+// Merged K/V inject (DFlash2 block drafts): the encoder rows of the previous verify ride in front of
+// the noise block in one token ubatch [ctx rows; block rows], filled on the device by the staged
+// embeddings import (llama_set_dflash_ctx_rows + llama_set_embd_import_nextn). Each layer projects
+// both with one wk/wv matmul instead of a separate inject graph re-reading wk/wv.
+
+// positions of the trailing block rows of a merged ubatch (the block queries rope with these)
+class llm_graph_input_dflash_blk_pos : public llm_graph_input_i {
+  public:
+    llm_graph_input_dflash_blk_pos(int64_t offset, int64_t n, int64_t n_pos_per_embd) :
+        offset(offset), n(n), n_pos_per_embd(n_pos_per_embd) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(ubatch->pos && ubatch->token && (int64_t) ubatch->n_tokens == offset + n);
+        // same expansion as llm_graph_input_pos for token batches
+        std::vector<llama_pos> data((size_t) (n * n_pos_per_embd));
+        for (int64_t i = 0; i < n; ++i) {
+            const llama_pos p = ubatch->pos[offset + i];
+            if (n_pos_per_embd == 4) {
+                data[i]         = p;
+                data[n + i]     = p;
+                data[2 * n + i] = p;
+                data[3 * n + i] = 0;
+            } else {
+                data[i] = p;
+            }
+        }
+        ggml_backend_tensor_set(pos, data.data(), 0, data.size() * sizeof(llama_pos));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        return (int64_t) params.ubatch.n_tokens == offset + n;
+    }
+
+    ggml_tensor * pos = nullptr; // I32 [n * n_pos_per_embd]
+    int64_t       offset;
+    int64_t       n;
+    int64_t       n_pos_per_embd;
+};
+
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -738,11 +780,12 @@ static ggml_tensor * build_dflash2_conv(
         ggml_tensor * hidden,
         ggml_tensor * dynamic,
         ggml_tensor * base,
-        int side) {
+        int side,
+        int64_t n_blocks_override = 0) {
     const auto & hparams = g.hparams;
     const int64_t hidden_size = hidden->ne[0];
     const int64_t n_tokens    = hidden->ne[1];
-    const int64_t n_blocks    = g.ubatch.n_seqs_unq;
+    const int64_t n_blocks    = n_blocks_override > 0 ? n_blocks_override : (int64_t) g.ubatch.n_seqs_unq;
     const int64_t kernel_size = hparams.dflash_conv_kernel_size;
     const int64_t group_size  = hparams.dflash_conv_group_size;
     const int64_t n_groups    = hidden_size / group_size;
@@ -803,17 +846,18 @@ static ggml_tensor * build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
+        int64_t n_tokens_override = 0, int64_t n_blocks_override = 0) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
     const auto & hparams = g.hparams;
-    const int64_t n_tokens = g.n_tokens;
+    const int64_t n_tokens = n_tokens_override > 0 ? n_tokens_override : (int64_t) g.n_tokens;
     const int64_t n_embd   = g.n_embd;
 
     const int64_t top_k    = hparams.dflash_selector_top_k;
     const int64_t rank     = hparams.dflash_selector_rank;
-    const int64_t n_blocks = g.ubatch.n_seqs_unq;
+    const int64_t n_blocks = n_blocks_override > 0 ? n_blocks_override : (int64_t) g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
     GGML_ASSERT(res->t_logits->ne[1] == n_tokens);
     if (!tokens) {
@@ -1034,7 +1078,41 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     ggml_tensor * inp_tokens = inp->tokens;
 
+    // merged K/V inject: the leading n_ctx_m rows of this ubatch are the previous verify's encoder rows
+    // (placeholder tokens; the rows come from the embeddings import), the trailing n_blk rows the noise
+    // block. Only the K/V projections see the context rows; the rest of the drafter runs on the block
+    // rows exactly as without them.
+    const bool merged = model.dflash_selector_hidden != nullptr && model.dfly_layer_fusion == nullptr &&
+                        model.dfly_hc_down == nullptr && model.dspark_markov_w1 == nullptr && model.d2t == nullptr &&
+                        !hparams.dspark_log_snr_conditioning && params.dflash_ctx_rows > 0 &&
+                        hparams.dflash_block_size > 0 &&
+                        n_tokens == (int64_t) params.dflash_ctx_rows + (int64_t) hparams.dflash_block_size;
+    const int64_t n_ctx_m = merged ? (int64_t) params.dflash_ctx_rows : 0;
+    const int64_t n_blk   = n_tokens - n_ctx_m;
+
+    ggml_tensor * ctx_g   = nullptr; // [n_embd, n_ctx_m] encoder rows to inject
+    ggml_tensor * pos_blk = nullptr; // positions of the block rows
+    if (merged) {
+        ctx_g = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_ctx_m);
+        ggml_set_input(ctx_g);
+        ggml_set_name(ctx_g, "dflash_ctx_rows");
+        res->t_inp_embd = ctx_g; // the embeddings import target
+
+        const int64_t n_pos_per_embd = hparams.n_pos_per_embd();
+        auto pos_in = std::make_unique<llm_graph_input_dflash_blk_pos>(n_ctx_m, n_blk, n_pos_per_embd);
+        pos_in->pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_blk * n_pos_per_embd);
+        ggml_set_input(pos_in->pos);
+        ggml_set_name(pos_in->pos, "dflash_blk_pos");
+        pos_blk = pos_in->pos;
+        res->add_input(std::move(pos_in));
+
+        inp_tokens = ggml_view_1d(ctx0, inp->tokens, n_blk, n_ctx_m * ggml_element_size(inp->tokens));
+    }
+
     ggml_tensor * inpL = build_embd_rows(tok_embd, inp->tokens);
+    if (merged) {
+        inpL = ggml_view_2d(ctx0, inpL, n_embd, n_blk, inpL->nb[1], n_ctx_m * inpL->nb[1]);
+    }
     cb(inpL, "inp_noise_embd", -1);
 
     // the DFly chain conditions position 1 on the block anchor's embedding; reuse the rows
@@ -1108,34 +1186,72 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * attn_dynamic = nullptr;
         if (layer.dflash_attn_conv_proj) {
             attn_dynamic = build_lora_mm(layer.dflash_attn_conv_proj, noise_norm);
-            noise_norm = build_dflash2_conv(*this, noise_norm, attn_dynamic, layer.dflash_attn_conv_base, 0);
+            noise_norm = build_dflash2_conv(*this, noise_norm, attn_dynamic, layer.dflash_attn_conv_base, 0, merged ? 1 : 0);
             cb(noise_norm, "attn_conv_in", il);
         }
 
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, noise_norm);
-        ggml_tensor * Kcur = build_lora_mm(layer.wk, noise_norm);
-        ggml_tensor * Vcur = build_lora_mm(layer.wv, noise_norm);
+        // merged: one wk/wv matmul covers [context rows; block rows]; the context rows get the same
+        // k_norm, RoPE (at their own positions) and cache store the separate inject graph applied
+        ggml_tensor * kv_in = merged ? ggml_concat(ctx0, ctx_g, noise_norm, 1) : noise_norm;
 
-        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+        ggml_tensor * Qcur = build_lora_mm(layer.wq, noise_norm);
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, kv_in);
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, kv_in);
+
+        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_blk);
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
         Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
         Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
 
-        Qcur = build_rope(Qcur, inp_pos);
+        Qcur = build_rope(Qcur, merged ? pos_blk : inp_pos);
         Kcur = build_rope(Kcur, inp_pos);
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
 
         // cache-aware, non-causal attention
-        ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        ggml_tensor * cur = nullptr;
+        if (merged) {
+            // store every row's K/V, then attend with the block queries only (their mask rows)
+            const bool is_swa = use_iswa && hparams.is_swa(il);
+            const llama_kv_cache_context * mctx_cur = use_iswa
+                ? (is_swa ? inp_attn_iswa->mctx->get_swa() : inp_attn_iswa->mctx->get_base())
+                : inp_attn->mctx;
+            ggml_tensor * k_idxs = use_iswa ? (is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs())
+                                            : inp_attn->get_k_idxs();
+            ggml_tensor * v_idxs = use_iswa ? (is_swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs())
+                                            : inp_attn->get_v_idxs();
+            ggml_tensor * mask   = use_iswa ? (is_swa ? inp_attn_iswa->get_kq_mask_swa() : inp_attn_iswa->get_kq_mask())
+                                            : inp_attn->get_kq_mask();
+            ggml_tensor * k_rot  = use_iswa ? (is_swa ? inp_attn_iswa->self_k_rot_swa : inp_attn_iswa->self_k_rot)
+                                            : inp_attn->self_k_rot;
+            ggml_tensor * v_rot  = use_iswa ? (is_swa ? inp_attn_iswa->self_v_rot_swa : inp_attn_iswa->self_v_rot)
+                                            : inp_attn->self_v_rot;
+            GGML_ASSERT(k_rot == nullptr && v_rot == nullptr && "merged DFlash inject does not support rotated KV");
+            GGML_ASSERT(mask->ne[1] == n_tokens);
+
+            ggml_build_forward_expand(gf, Qcur);
+            ggml_build_forward_expand(gf, Vcur);
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, v_idxs, il));
+
+            ggml_tensor * mask_blk = ggml_view_4d(ctx0, mask, mask->ne[0], n_blk, mask->ne[2], mask->ne[3],
+                                                  mask->nb[1], mask->nb[2], mask->nb[3], n_ctx_m * mask->nb[1]);
+            cur = build_attn_mha(Qcur, mctx_cur->get_k(ctx0, il), mctx_cur->get_v(ctx0, il), nullptr, mask_blk,
+                                 nullptr, nullptr, kq_scale, il);
+            cb(cur, "kqv_out", il);
+            cur = build_lora_mm(layer.wo, cur);
+        } else {
+            cur = use_iswa
+                ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
+                : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        }
 
         if (attn_dynamic) {
-            cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
+            cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1, merged ? 1 : 0);
             cb(cur, "attn_conv_out", il);
         }
 
@@ -1148,7 +1264,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * ffn_dynamic = nullptr;
         if (layer.dflash_ffn_conv_proj) {
             ffn_dynamic = build_lora_mm(layer.dflash_ffn_conv_proj, cur);
-            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 0);
+            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 0, merged ? 1 : 0);
             cb(cur, "ffn_conv_in", il);
         }
 
@@ -1161,7 +1277,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(cur, "ffn_out", il);
 
         if (ffn_dynamic) {
-            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 1);
+            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 1, merged ? 1 : 0);
             cb(cur, "ffn_conv_out", il);
         }
 
@@ -1276,7 +1392,14 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens);
+        build_dflash2_selector(*this, model, inp_tokens, merged ? n_blk : 0, merged ? 1 : 0);
+        if (merged) {
+            // llama_context copies one nextn row per ubatch token: the context rows read as zeros, the
+            // block's lattice keeps its rows at the block's batch indices
+            ggml_tensor * pad = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_ctx_m), 0.0f);
+            res->t_h_nextn = ggml_concat(ctx0, pad, res->t_h_nextn, 1);
+            ggml_build_forward_expand(gf, res->t_h_nextn);
+        }
     }
 }
 

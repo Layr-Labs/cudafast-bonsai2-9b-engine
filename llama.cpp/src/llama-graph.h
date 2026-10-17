@@ -861,6 +861,7 @@ struct llm_graph_params {
     bool                             dspark_has_context;
     int64_t                          dspark_ctx_rows;
     int64_t                          dspark_ctx_width;
+    uint32_t                         dflash_ctx_rows; // merged DFlash2 inject rows ahead of the block (llama_set_dflash_ctx_rows)
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
 
@@ -924,6 +925,10 @@ struct llm_graph_params {
         if ((dspark_ctx == nullptr) != (other.dspark_ctx == nullptr) ||
             dspark_has_context != other.dspark_has_context || dspark_ctx_rows != other.dspark_ctx_rows ||
             dspark_ctx_width != other.dspark_ctx_width) {
+            return false;
+        }
+
+        if (dflash_ctx_rows != other.dflash_ctx_rows) {
             return false;
         }
 

@@ -1643,8 +1643,9 @@ struct ggml_backend_cuda_context {
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
 
-        // sweep every 5s, evicting cuda graphs unused for >=10s
-        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
+        // sweep every 5s, evicting cuda graphs unused for >=10s once more than a few shapes are cached (a
+        // single-stream engine keeps its handful of graphs across idle gaps instead of re-capturing them)
+        if (cuda_graphs.size() > 32 && time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= 10'000'000) {

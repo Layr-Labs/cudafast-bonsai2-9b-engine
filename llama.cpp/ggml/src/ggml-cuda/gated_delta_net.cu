@@ -49,11 +49,29 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
-            // GB10 prefill-sized ubatches: the lane-permuted reduction variant (bit-identical, see the kernel).
+            // GB10 ubatches of >= GDN_L8_MIN_TOKENS tokens (prefill, the 16-row verify): the lane-permuted reduction
+            // variant (bit-identical, see the kernel).
             // GGML_CUDA_GDN_L8=0 disables it.
             static const bool l8_enabled = getenv("GGML_CUDA_GDN_L8") == nullptr || atoi(getenv("GGML_CUDA_GDN_L8")) != 0;
             if constexpr (keep_rs_t && !KDA) {
-                if (l8_enabled && cc == GGML_CUDA_CC_DGX_SPARK && warp_size == 32 && cols_per_warp == 4 && n_tokens >= 64) {
+                // the lazy condition gated_delta_net_cuda evaluates on the device
+                const bool lazy_eff = lazy && state_slot_stride > 0 && 2 + (int) grid_dims.z <= K;
+                if (l8_enabled && cc == GGML_CUDA_CC_DGX_SPARK && warp_size == 32 && cols_per_warp == 4 &&
+                        n_tokens >= GDN_L8V_MIN_TOKENS && n_tokens <= GDN_L8V_MAX_TOKENS && (!lazy_eff || n_tokens <= K)) {
+                    if (lazy_eff) {
+                        ggml_cuda_kernel_launch(gated_delta_net_l8v_cuda<RAW, G_PRECOMPUTED, true>, launch_params,
+                            q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
+                            n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, 1);
+                    } else {
+                        ggml_cuda_kernel_launch(gated_delta_net_l8v_cuda<RAW, G_PRECOMPUTED, false>, launch_params,
+                            q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
+                            n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, 0);
+                    }
+                    break;
+                }
+                if (l8_enabled && cc == GGML_CUDA_CC_DGX_SPARK && warp_size == 32 && cols_per_warp == 4 && n_tokens >= GDN_L8_MIN_TOKENS) {
                     ggml_cuda_kernel_launch(gated_delta_net_l8_cuda<RAW, G_PRECOMPUTED>, launch_params,
                         q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                         n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
@@ -190,7 +208,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     bool raw_precomputed = false;
     {
         static const bool l8_enabled = getenv("GGML_CUDA_GDN_L8") == nullptr || atoi(getenv("GGML_CUDA_GDN_L8")) != 0;
-        if (raw && keep_rs && l8_enabled && S_v == 128 && n_tokens >= 64 &&
+        if (raw && keep_rs && l8_enabled && S_v == 128 && n_tokens >= GDN_L8_RAW_PRE_MIN_TOKENS &&
                 ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
                 ggml_nelements(src_g) == ggml_nelements(src_beta) && src_g->ne[0] == 1 && sb1 == 1 && nbb1 == sizeof(float)) {
             const int64_t n_g = ggml_nelements(src_g);

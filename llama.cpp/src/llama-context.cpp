@@ -1084,6 +1084,10 @@ static ggml_tensor tensor_rows(const ggml_tensor * t, int64_t i0, int64_t n) {
     return v;
 }
 
+void llama_context::set_dflash_ctx_rows(uint32_t n) {
+    dflash_ctx_rows = n;
+}
+
 void llama_context::set_embeddings_layer_inp_dev(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1487,6 +1491,13 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     GGML_ASSERT(lid <= model.hparams.n_layer());
 
+    // Unchanged: nothing to re-reserve. The speculative state sets the drafter's layers on for every request;
+    // an unconditional reserve rebuilt the scheduler and graph results each time, so the first decode steps
+    // of every request ran without their CUDA graphs.
+    if (cparams.embeddings_layer_inp[lid] == enable) {
+        return;
+    }
+
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
@@ -1777,7 +1788,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // an embeddings import (llama_set_embd_import_*) needs a graph whose embeddings input is on the
     // import's device, and only a graph built that way serves it
-    const bool embd_import_now = !embd_import_cur.srcs.empty() && ubatch.embd != nullptr;
+    const bool embd_import_now = !embd_import_cur.srcs.empty() && (ubatch.embd != nullptr || (ubatch.token != nullptr && dflash_ctx_rows > 0));
 
     // with graph slots (llama_set_graph_slots) the active graph becomes a parked one this ubatch can
     // reuse, or else the slot to rebuild
@@ -2152,8 +2163,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return encode(batch_inp);
     }
 
-    // a staged embeddings import serves this call only, and only a batch of embeddings
-    embd_import_cur = batch_inp.embd ? std::move(embd_import) : embd_import_info{};
+    // a staged embeddings import serves this call only, and only a batch of embeddings (or the
+    // context rows of a merged DFlash2 inject, llama_set_dflash_ctx_rows)
+    embd_import_cur = batch_inp.embd || (batch_inp.token && dflash_ctx_rows > 0) ? std::move(embd_import) : embd_import_info{};
     embd_import     = {};
 
     if (batch_inp.n_tokens == 0) {
@@ -3080,6 +3092,7 @@ llm_graph_params llama_context::graph_params(
         /*.dspark_has_context =*/!dspark_ctx.v_ctx_feat.empty(),
         /*.dspark_ctx_rows =*/dspark_ctx.n_ctx_rows,
         /*.dspark_ctx_width =*/dspark_ctx.n_embd_cap,
+        /*.dflash_ctx_rows  =*/dflash_ctx_rows,
         /*.hadamard_rotations =*/&hadamard_rotations,
         /*.hadamard_inverses  =*/&hadamard_inverses,
         /*.samplers    =*/sampling.samplers,
@@ -4459,6 +4472,10 @@ bool llama_set_encoder_inp_slabs(llama_context * ctx, uint32_t n) {
 bool llama_set_embd_import_layer_inp(llama_context * ctx, const llama_context * src, const int32_t * lids,
                                      uint32_t n_lids, int32_t row0) {
     return ctx->set_embd_import_layer_inp(*src, lids, n_lids, row0);
+}
+
+void llama_set_dflash_ctx_rows(llama_context * ctx, uint32_t n) {
+    ctx->set_dflash_ctx_rows(n);
 }
 
 bool llama_set_embd_import_nextn(llama_context * ctx) {

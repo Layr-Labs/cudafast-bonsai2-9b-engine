@@ -1639,6 +1639,35 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
+// Merged DFlash2 K/V inject (GB10 only; LLAMA_DFLASH2_INJECT_MERGE=0 turns it off): the encoder
+// rows of a verify stay on the device (embeddings import) and are injected by the next draft's own
+// K/V projections instead of a separate inject graph. The draft KV cache is unified with a second
+// sequence that holds the staged rows the verify rejected, so the block never attends to them.
+static bool dflash2_device_is_gb10() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue; // GB10 registers as an integrated GPU
+        }
+        const char * desc = ggml_backend_dev_description(dev);
+        if (desc && std::strstr(desc, "GB10") != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool dflash2_inject_merge_enabled() {
+    const char * env = std::getenv("LLAMA_DFLASH2_INJECT_MERGE");
+    if (env && std::strcmp(env, "0") == 0) {
+        return false;
+    }
+    return dflash2_device_is_gb10();
+}
+
+static constexpr llama_seq_id DFLASH2_PAD_SEQ = 1; // holds the staged rows a verify rejected
+
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_params_speculative_draft params;
@@ -1681,6 +1710,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // the target features and the encoder output stay on the device (llama_set_embd_import_*)
     bool features_on_device = false;
+
+    // merged inject: positions of the last verify's encoder rows, staged as an embeddings import
+    // for the next draft graph
+    bool                   inject_merge = false;
+    int32_t                pend_n       = 0;
+    llama_seq_id           pend_seq     = 0;
+    std::vector<llama_pos> pend_pos; // [pend_n]
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1822,6 +1858,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // each verify round runs the encoder, the injection and the draft graph on ctx_dft: keep all three
         llama_set_graph_slots(ctx_dft, 3);
+
+        inject_merge = is_dflash2 && !is_dspark && !prompt_lookup && features_on_device && n_seq == 1 &&
+                       block_size == 16 && this->params.n_max == block_size - 1 &&
+                       llama_n_seq_max(ctx_dft) > (uint32_t) DFLASH2_PAD_SEQ && dflash2_inject_merge_enabled();
+        if (inject_merge) {
+            // encoder, merged draft (with and without padding rows), plain draft, prefill encoder/inject
+            llama_set_graph_slots(ctx_dft, 6);
+        }
+        LOG_INF("%s: - DFlash2 merged K/V inject: %s\n", __func__, inject_merge ? "on" : "off");
     }
 
     ~common_speculative_impl_draft_dflash() override {
@@ -1849,6 +1894,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (prompt_lookup) {
             lookup_prompts[seq_id] = prompt;
         }
+        pend_n = 0;
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1879,6 +1925,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
+
+        // staged rows no draft consumed: only a re-verify from the same anchor (partial rollback)
+        // or a new request can get here, and both re-encode what they need
+        if (pend_n > 0) {
+            if (batch_in.pos[0] > pend_pos[0]) {
+                LOG_WRN("%s: dropping %d staged verify rows no draft injected\n", __func__, (int) pend_n);
+            }
+            pend_n = 0;
+        }
+
+        // a verify batch requests every row; only those are staged for the merged inject
+        bool all_rows_out = batch_in.logits != nullptr;
+        for (int32_t k = 0; all_rows_out && k < n_tokens; ++k) {
+            all_rows_out = batch_in.logits[k] != 0;
+        }
 
         // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
         std::vector<int32_t> i_batch_beg(n_seq, -1);
@@ -1960,6 +2021,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     return false;
                 }
 
+                // merged inject: a full verify block's encoder rows stay on the device for the next
+                // draft graph, which projects them with the block through each layer's own wk/wv
+                if (inject_merge && all_rows_out && n_rows == block_size && n_chunk == n_rows) {
+                    const bool imported = llama_set_embd_import_nextn(ctx_dft);
+                    GGML_ASSERT(imported && "DFlash encoder produced no output.");
+                    const llama_pos * pos_chunk = batch_in.pos + i_batch_beg[seq_id] + offset;
+                    pend_pos.assign(pos_chunk, pos_chunk + n_chunk);
+                    pend_n   = n_chunk;
+                    pend_seq = seq_id;
+                    continue;
+                }
+
                 // inject the DFlash decoder K/V cache at the tokens' target positions (on the device,
                 // from the encoder output, and batch_inject.embd only sizes the batch)
                 batch_inject.n_tokens = n_chunk;
@@ -2005,6 +2078,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        bool merged_now = false;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
@@ -2029,6 +2103,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n_draft = params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+
+            // merged inject: the staged verify rows lead the ubatch; the accepted ones (below the
+            // anchor) join this sequence, the rejected ones the padding sequence the block cannot see
+            if (pend_n > 0) {
+                const bool can_merge = inject_merge && pend_seq == seq_id && pend_n == block_size &&
+                                       n_block_tokens == block_size && batch.n_tokens == 0 && n > pend_pos[0] &&
+                                       n <= pend_pos[0] + pend_n;
+                if (can_merge) {
+                    for (int32_t i = 0; i < pend_n; ++i) {
+                        common_batch_add(batch, mask_token_id, pend_pos[i],
+                                { pend_pos[i] < n ? seq_id : DFLASH2_PAD_SEQ }, false);
+                    }
+                    merged_now = true;
+                } else {
+                    LOG_WRN("%s: dropping %d staged verify rows (draft at %d)\n", __func__, (int) pend_n, (int) n);
+                    pend_n = 0;
+                }
+            }
+
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -2041,7 +2134,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        if (merged_now) {
+            llama_set_dflash_ctx_rows(ctx_dft, (uint32_t) pend_n);
+        }
         int ret = llama_decode(ctx_dft, batch);
+        if (merged_now) {
+            llama_set_dflash_ctx_rows(ctx_dft, 0);
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), DFLASH2_PAD_SEQ, -1, -1);
+            pend_n = 0;
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
@@ -3596,6 +3697,15 @@ common_speculative_init_result::common_speculative_init_result(
                 cparams.n_outputs_max_per_seq = meta.block_size;
                 cparams.n_outputs_max         = cparams.n_seq_max * meta.block_size;
             }
+        }
+
+        // merged DFlash2 K/V inject: the rejected staged verify rows go to a padding sequence of a
+        // unified draft KV cache (one stream, same cell count), see common_speculative_impl_draft_dflash
+        const bool spec_dflash = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
+        if (spec_dflash && llama_model_dflash_selector_top_k(model_dft) > 0 && dflash2_inject_merge_enabled()) {
+            cparams.n_seq_max  = std::max<uint32_t>(cparams.n_seq_max, (uint32_t) DFLASH2_PAD_SEQ + 1);
+            cparams.kv_unified = true;
         }
 
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
