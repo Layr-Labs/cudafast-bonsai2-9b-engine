@@ -102,7 +102,8 @@ void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst, const ggml_tensor * gate,
         const ggml_tensor * norm_weight, const ggml_tensor * norm_scale,
-        void * external_q8, bool quantize_external, const float * external_norm_scale) {
+        void * external_q8, bool quantize_external, const float * external_norm_scale,
+        const float * add_res, float * add_dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -214,10 +215,11 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, add_res, add_dst};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
+    GGML_ASSERT(add_res == nullptr && add_dst == nullptr);
 
     GGML_ASSERT(ne13 == 1);
     GGML_ASSERT(nb12 % nb11 == 0);

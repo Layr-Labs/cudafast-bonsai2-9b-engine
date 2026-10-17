@@ -60,10 +60,24 @@ static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_
 // first W - r window tokens with the same per-column arithmetic as the main loop, which
 // reproduces the eager snapshot bit for bit. A record that does not match (magic, window,
 // per-warp checksum of the stored base) falls back to reading slot r as written by the eager
-// scheme.
+// scheme. A verify-sized ubatch (gated_delta_net_l8v_cuda, whose window is all its tokens) does
+// not store the final state either: its record says so (GDN_LAZY_NOFINAL) and it marks slot 0
+// (GDN_LAZY_SLOT0_MARK0/1 in the first two elements of each warp's first column, two finite values,
+// so that the zeroing SCALE of a fresh cell still gives zeros), and a next ubatch that reads slot 0
+// replays all W window tokens from slot 1 instead. Any other write of slot 0 (a final-state store,
+// the eager snapshots, a zeroing of the row) removes the mark.
 
-#define GDN_LAZY_MAGIC  0x4744314cu   // "GD1L"
-#define GDN_LAZY_HDR    8             // magic, W, reserved x2, per-warp base checksum x4
+#define GDN_LAZY_MAGIC   0x4744314cu  // "GD1L"
+#define GDN_LAZY_NOFINAL 0x4e4f4631u  // hdr[2]: slot 0 does not hold the final state ("NOF1")
+#define GDN_LAZY_SLOT0_MARK0 0x1e3d5b79u  // ~1.0e-20
+#define GDN_LAZY_SLOT0_MARK1 0x9c2b4f8du  // ~-5.7e-22
+
+// slot 0 (first column of the warp at col) carries the mark of a verify ubatch that did not store the final state
+static __device__ __forceinline__ bool gdn_lazy_slot0_marked(const float * slot0, const int col, const int S_v) {
+    return __float_as_uint(slot0[col * S_v + 0]) == GDN_LAZY_SLOT0_MARK0 &&
+           __float_as_uint(slot0[col * S_v + 1]) == GDN_LAZY_SLOT0_MARK1;
+}
+#define GDN_LAZY_HDR     8            // magic, W, final flag, reserved, per-warp base checksum x4
 #define GDN_LAZY_NWARPS 4
 
 template <int S_v, int cols_per_warp>
@@ -122,7 +136,8 @@ static __device__ __forceinline__ void gdn_lazy_store_inputs(
     }
 }
 
-static __device__ __forceinline__ void gdn_lazy_store_header(float * rec, const int W, const uint32_t cs, const int lane) {
+static __device__ __forceinline__ void gdn_lazy_store_header(float * rec, const int W, const uint32_t cs, const int lane,
+                                                             const bool final_in_slot0 = true) {
     uint32_t * hdr = (uint32_t *) rec;
     if (lane == 0) {
         hdr[4 + threadIdx.y] = cs;
@@ -130,6 +145,7 @@ static __device__ __forceinline__ void gdn_lazy_store_header(float * rec, const 
     __syncthreads();
     if (threadIdx.y == 0 && lane == 0) {
         hdr[1] = (uint32_t) W;
+        hdr[2] = final_in_slot0 ? 0u : GDN_LAZY_NOFINAL;
         __threadfence_block();
         hdr[0] = GDN_LAZY_MAGIC;
     }
@@ -143,14 +159,15 @@ static __device__ __forceinline__ bool gdn_lazy_replay(
         return false;
     }
     const int64_t diff = curr_state - state;  // input row relative to slot 0 of the same cache row
-    if (diff <= 0 || diff % slot_stride != 0) {
+    if (diff < 0 || diff % slot_stride != 0) {
         return false;
     }
     const int64_t rb = diff / slot_stride;  // rolled-back tokens
     const float * rec = state + (2 + blockIdx.z) * slot_stride;
     const uint32_t * hdr = (const uint32_t *) rec;
     const int W = (int) hdr[1];
-    if (hdr[0] != GDN_LAZY_MAGIC || W < 1 || W > K || rb > W || 2 + (int) gridDim.z > K) {
+    if (hdr[0] != GDN_LAZY_MAGIC || W < 1 || W > K || rb > W || 2 + (int) gridDim.z > K ||
+            (rb == 0 && (hdr[2] != GDN_LAZY_NOFINAL || !gdn_lazy_slot0_marked(curr_state, col, S_v)))) {
         return false;
     }
     const float * base = state + slot_stride;
@@ -474,6 +491,8 @@ gated_delta_net_cuda(const float * q,
 // and the old per-warp checksum) and snapshot is bit-identical to gated_delta_net_cuda. 6 shuffles per token.
 
 #define GDN_L8_ROWS 16  // rows per lane: 4 old lanes x 4 rows
+#define GDN_L8_HAS_ZERO_ROW 1  // gated_delta_net_l8_cuda takes zero_row, zero_scale, zero_bias
+#define GDN_L8_STAGE 4  // gated_delta_net_l8_cuda: tokens per shared-memory stage
 #define GDN_L8_MIN_TOKENS 17  // ubatches of at least this many tokens use it (prefill)
 #define GDN_L8_RAW_PRE_MIN_TOKENS 64  // raw gates are activated in a separate pass from this many tokens on
 #define GDN_L8V_MIN_TOKENS 8   // gated_delta_net_l8v_cuda: ubatches of GDN_L8V_MIN_TOKENS ..
@@ -510,7 +529,7 @@ gated_delta_net_l8_cuda(const float * q, const float * k, const float * v, const
                         int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
                         int64_t sb1, int64_t sb2, int64_t sb3, const uint3 neqk1_magic, const uint3 rq3_magic,
                         float scale, int64_t state_slot_stride, int K, const int32_t * s_ids, int64_t s_row_stride,
-                        int lazy) {
+                        int lazy, const float * zero_row, float zero_scale, float zero_bias) {
     constexpr int S_v = 128;
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
@@ -529,9 +548,11 @@ gated_delta_net_l8_cuda(const float * q, const float * k, const float * v, const
 
     ggml_cuda_pdl_sync();
 
-    const int64_t state_in_offset  = (s_ids ? (int64_t) s_ids[sequence] * s_row_stride : sequence * H * S_v * S_v)
-                                     + h_idx * S_v * S_v;
+    const int64_t state_row        = s_ids ? (int64_t) s_ids[sequence] * s_row_stride : sequence * H * S_v * S_v;
+    const int64_t state_in_offset  = state_row + h_idx * S_v * S_v;
     const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
+    // the row read is the one a deferred in-place SCALE (zero_row) would have rewritten: apply it on load
+    const bool zeroed = zero_row != nullptr && curr_state + state_row == zero_row;
     state      += state_out_offset;
     curr_state += state_in_offset;
     attn_data  += (sequence * n_tokens * H + h_idx) * S_v;
@@ -540,16 +561,17 @@ gated_delta_net_l8_cuda(const float * q, const float * k, const float * v, const
 
     lazy = lazy && state_slot_stride > 0 && 2 + (int) gridDim.z <= K;
     bool replayed = false;
-    if (lazy) {
+    if (lazy && !zeroed) {
         // gdn_lazy_replay in this layout
         const int64_t diff = curr_state - state;
-        if (state_slot_stride > 0 && diff > 0 && diff % state_slot_stride == 0) {
+        if (state_slot_stride > 0 && diff >= 0 && diff % state_slot_stride == 0) {
             const int64_t rb  = diff / state_slot_stride;
             const float * rec = state + (2 + blockIdx.z) * state_slot_stride;
             const uint32_t * hdr = (const uint32_t *) rec;
             const int W = (int) hdr[1];
             const float * base = state + state_slot_stride;
             if (hdr[0] == GDN_LAZY_MAGIC && W >= 1 && W <= K && rb <= W && 2 + (int) gridDim.z <= K &&
+                    (rb > 0 || (hdr[2] == GDN_LAZY_NOFINAL && gdn_lazy_slot0_marked(curr_state, col, S_v))) &&
                     gdn_l8_base_checksum(base, col, lane) == hdr[4 + threadIdx.y]) {
 #pragma unroll
                 for (int m = 0; m < 4; ++m) {
@@ -590,7 +612,8 @@ gated_delta_net_l8_cuda(const float * q, const float * k, const float * v, const
         for (int m = 0; m < 4; ++m) {
 #pragma unroll
             for (int r = 0; r < 4; ++r) {
-                s[m*4 + r] = curr_state[my_col * S_v + r * 32 + n + 8 * m];
+                const float x = curr_state[my_col * S_v + r * 32 + n + 8 * m];
+                s[m*4 + r] = zeroed ? zero_scale * x + zero_bias : x;  // scale_f32's expression
             }
         }
     }
@@ -602,30 +625,70 @@ gated_delta_net_l8_cuda(const float * q, const float * k, const float * v, const
     const int lazy_t0 = (int) n_tokens - lazy_W;
     uint32_t  lazy_cs = 0;
 
-    for (int t = 0; t < n_tokens; t++) {
-        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+    // The token inputs are staged in shared memory, GDN_L8_STAGE tokens per stage, the next stage copied (cp.async)
+    // while this one is used: the head's k and q rows (in the order lane n reads them: [r][n][m]), the block's 16 v
+    // columns, g and beta. Each thread copies the same elements of every token.
+    constexpr int CH     = GDN_L8_STAGE;
+    constexpr int TOK_SM = 2 * S_v + 16 + 4;
+    __shared__ __align__(16) float stage[2][CH][TOK_SM];
+    {
+        const int tid = threadIdx.y * 32 + lane;
+        const int pos = ((tid / 32) * 8 + tid % 8) * 4 + (tid % 32) / 8;  // where row tid of k/q goes
+        const float * k_src = k + iq3 * sq3 + iq1 * sq1 + tid;
+        const float * q_src = q + iq3 * sq3 + iq1 * sq1 + tid;
+        const float * x_src = tid < 16 ? v + sequence * sv3 + h_idx * sv1 + blockIdx.z * 16 + tid :
+                              (tid == 16 ? g : beta) + sequence * sb3 + h_idx * sb1;
+        const int64_t x_t   = tid < 16 ? sv2 : sb2;
+        const int     n_ch  = (int) ((n_tokens + CH - 1) / CH);
+        const auto stage_tokens = [&](const int c) {
+            float * buf = &stage[c & 1][0][0];
+#pragma unroll
+            for (int tt = 0; tt < CH; ++tt) {
+                const int64_t t = (int64_t) c * CH + tt;
+                if (t < n_tokens) {
+                    const unsigned int dk = (unsigned int) __cvta_generic_to_shared(&buf[tt * TOK_SM + pos]);
+                    const unsigned int dq = (unsigned int) __cvta_generic_to_shared(&buf[tt * TOK_SM + S_v + pos]);
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(dk), "l"(k_src + t * sq2));
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(dq), "l"(q_src + t * sq2));
+                    if (tid < 18) {
+                        const unsigned int dx = (unsigned int) __cvta_generic_to_shared(&buf[tt * TOK_SM + 2 * S_v + tid]);
+                        asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(dx), "l"(x_src + t * x_t));
+                    }
+                }
+            }
+            asm volatile("cp.async.commit_group;");
+        };
+        stage_tokens(0);
 
-        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
-        float beta_val = beta[gb_offset];
+    for (int t = 0; t < n_tokens; t++) {
+        const int tt = t % CH;
+        if (tt == 0) {
+            // stage t / CH is complete, and every warp is done with the previous one, whose buffer the next takes
+            asm volatile("cp.async.wait_group 0;");
+            __syncthreads();
+            if (t / CH + 1 < n_ch) {
+                stage_tokens(t / CH + 1);
+            }
+        }
+        const float * tok_sm = stage[(t / CH) & 1][tt];
+
+        float beta_val = tok_sm[2 * S_v + 17];
         if constexpr (RAW) {
             beta_val = 1.0f / (1.0f + expf(-beta_val));
         }
         float kr[GDN_L8_ROWS];
         float qr[GDN_L8_ROWS];
 #pragma unroll
-        for (int m = 0; m < 4; ++m) {
-#pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                kr[m*4 + r] = k_t[r * 32 + n + 8 * m];
-                qr[m*4 + r] = q_t[r * 32 + n + 8 * m];
-            }
+        for (int r = 0; r < 4; ++r) {
+            const float4 k4 = *(const float4 *) &tok_sm[(r * 8 + n) * 4];
+            const float4 q4 = *(const float4 *) &tok_sm[S_v + (r * 8 + n) * 4];
+            kr[0*4 + r] = k4.x; kr[1*4 + r] = k4.y; kr[2*4 + r] = k4.z; kr[3*4 + r] = k4.w;
+            qr[0*4 + r] = q4.x; qr[1*4 + r] = q4.y; qr[2*4 + r] = q4.z; qr[3*4 + r] = q4.w;
         }
-        const float v_col = v_t[my_col];
+        const float v_col = tok_sm[2 * S_v + threadIdx.y * 4 + grp];
 
         static_assert(!(RAW && G_PRECOMPUTED), "exp(g) precompute is only defined for activated gates");
-        float g0 = g[gb_offset];
+        float g0 = tok_sm[2 * S_v + 16];
         if constexpr (RAW) {
             const float x = g0 + raw_dt_bias[h_idx];
             g0 = raw_a[h_idx] * ((x > 20.0f) ? x : logf(1.0f + expf(x)));
@@ -707,6 +770,7 @@ gated_delta_net_l8_cuda(const float * q, const float * k, const float * v, const
                 }
             }
         }
+    }
     }
 
     if (lazy) {
@@ -798,13 +862,14 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
     if (LAZY) {
         // gdn_lazy_replay in this layout
         const int64_t diff = curr_state - state;
-        if (state_slot_stride > 0 && diff > 0 && diff % state_slot_stride == 0) {
+        if (state_slot_stride > 0 && diff >= 0 && diff % state_slot_stride == 0) {
             const int64_t rb  = diff / state_slot_stride;
             const float * rec = state + (2 + blockIdx.z) * state_slot_stride;
             const uint32_t * hdr = (const uint32_t *) rec;
             const int W = (int) hdr[1];
             const float * base = state + state_slot_stride;
             if (hdr[0] == GDN_LAZY_MAGIC && W >= 1 && W <= K && rb <= W && 2 + (int) gridDim.z <= K &&
+                    (rb > 0 || (hdr[2] == GDN_LAZY_NOFINAL && gdn_lazy_slot0_marked(curr_state, col, S_v))) &&
                     gdn_l8_base_checksum(base, col, lane) == hdr[4 + threadIdx.y]) {
 #pragma unroll
                 for (int m = 0; m < 4; ++m) {
@@ -974,13 +1039,12 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
     }
 
     if (lazy) {
-#pragma unroll
-        for (int m = 0; m < 4; ++m) {
-#pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                state[my_col * S_v + r * 32 + n + 8 * m] = s[m*4 + r];
-            }
+        // the window is every token (n_tokens <= K): slot 0 is rebuilt from slot 1 by a replay when read
+        if (lane == 0) {
+            ((uint32_t *) state)[col * S_v + 0] = GDN_LAZY_SLOT0_MARK0;
+            ((uint32_t *) state)[col * S_v + 1] = GDN_LAZY_SLOT0_MARK1;
         }
-        gdn_lazy_store_header(state + (2 + blockIdx.z) * state_slot_stride, lazy_W, lazy_cs, lane);
+        gdn_lazy_store_header(state + (2 + blockIdx.z) * state_slot_stride, lazy_W, lazy_cs, lane,
+                              /*final_in_slot0 =*/ false);
     }
 }

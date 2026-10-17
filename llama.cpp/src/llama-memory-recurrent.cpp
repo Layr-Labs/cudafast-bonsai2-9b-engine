@@ -5,6 +5,7 @@
 #include "llama-io.h"
 #include "llama-batch.h"
 #include "llama-model.h"
+#include "llama-state-clear.h"
 
 #include <algorithm>
 #include <cassert>
@@ -116,6 +117,18 @@ llama_memory_recurrent::llama_memory_recurrent(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    // C68: the S tensors (the large recurrent states and their rollback snapshots) are zero now; let the
+    // backend record what is written into them, so that clear() zeroes only that (llama-state-clear.h)
+    s_tracked.assign(s_l.size(), false);
+    {
+        const llama_state_clear_api & api = llama_state_clear_api::get();
+        if (api.enabled && api.track_writes && api.dirty_ranges) {
+            for (size_t il = 0; il < s_l.size(); ++il) {
+                s_tracked[il] = s_l[il] != nullptr && api.track_writes(s_l[il]);
+            }
+        }
+    }
+
     {
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
@@ -139,8 +152,38 @@ void llama_memory_recurrent::clear(bool data) {
     used = 0;
 
     if (data) {
+        // C68: zero the R tensors in full and of each S tensor what the backend recorded as written since the
+        // last clear (llama-state-clear.h); an untracked tensor, or one whose ranges do not fit, in full
+        const llama_state_clear_api & api = llama_state_clear_api::get();
         for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+            ggml_backend_buffer_t b    = buf.get();
+            const char *          base = (const char *) ggml_backend_buffer_get_base(b);
+            const size_t          size = ggml_backend_buffer_get_size(b);
+            std::vector<size_t>   ranges;
+            auto in_buf = [&](const ggml_tensor * t) {
+                return t != nullptr && (const char *) t->data >= base && (const char *) t->data < base + size;
+            };
+            for (size_t il = 0; il < r_l.size(); ++il) {
+                if (in_buf(r_l[il])) {
+                    ranges.insert(ranges.end(), { (size_t) ((const char *) r_l[il]->data - base), ggml_nbytes(r_l[il]), 0, 1 });
+                }
+                const ggml_tensor * t = s_l[il];
+                if (!in_buf(t)) {
+                    continue;
+                }
+                const size_t off = (const char *) t->data - base;
+                constexpr int max_r = 64;
+                size_t tr[4*max_r];
+                const int n = s_tracked[il] ? api.dirty_ranges(t, tr, max_r, /*reset =*/ true) : -1;
+                if (n < 0) {
+                    ranges.insert(ranges.end(), { off, ggml_nbytes(t), 0, 1 });
+                    continue;
+                }
+                for (int i = 0; i < n; ++i) {
+                    ranges.insert(ranges.end(), { off + tr[4*i + 0], tr[4*i + 1], tr[4*i + 2], tr[4*i + 3] });
+                }
+            }
+            llama_state_clear_buffer(b, ranges, true, "rs");
         }
     }
 

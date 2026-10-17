@@ -4,6 +4,8 @@
 #include "common.cuh"
 #include "convert.cuh"
 
+#include <cooperative_groups.h>
+
 using namespace ggml_cuda_mma;
 
 #define MMF_ROWS_PER_BLOCK 32
@@ -42,6 +44,11 @@ struct mmf_ids_data {
 };
 
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
+// GB10: dst_a = src0_a * src1 and dst_b = src0_b * src1 in one launch when both take mul_mat_f's k-split route (same
+// bits); false (nothing launched) otherwise
+bool ggml_cuda_mul_mat_f_ksplit_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * src0a, const ggml_tensor * src0b,
+        const ggml_tensor * src1, ggml_tensor * dsta, ggml_tensor * dstb);
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
 
@@ -302,46 +309,33 @@ static __global__ void mul_mat_f(
 static constexpr int mmf_ksplit_cols   = 16;
 static constexpr int mmf_ksplit_nwarps = 8;
 
-static __global__ void mul_mat_f_ksplit_partial(
-        const float * x, const float * y, float * part,
-        const int ncols, const int stride_row, const int stride_col_y) {
 #if defined(AMPERE_MMA_AVAILABLE) && !defined(VOLTA_MMA_AVAILABLE)
+// L2 hints for the x (weight) segments one (warp w, row tile) chain of the k-split reads; no architectural effect, so
+// they may precede the wait for the kernel that wrote y
+static __device__ __forceinline__ void mul_mat_f_ksplit_prefetch_x(const float * x, const int ncols, const int stride_row,
+                                                                   const int w) {
     typedef tile<16, 8, float> tile_A;
-    typedef tile<8,  8, float> tile_B;
-    typedef tile<16, 8, float> tile_C;
-
-    constexpr int rows_per_block = MMF_ROWS_PER_BLOCK;
-    constexpr int nwarps         = mmf_ksplit_nwarps;
-    constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
-    constexpr int tile_k_padded  = warp_size + mmf_get_padding();
-    constexpr int ntA            = rows_per_block / tile_A::I;
-    constexpr int ntB            = (mmf_ksplit_cols + tile_B::I - 1) / tile_B::I;
-
-    int b = blockIdx.x;
-    const int itB = b % ntB;    b /= ntB;
-    const int itA = b % ntA;    b /= ntA;
-    const int w   = b % nwarps;
-    const int rb  = b / nwarps;
-
-    x += (int64_t(rb)*rows_per_block + itA*tile_A::I)*stride_row;
-    y += int64_t(itB)*tile_B::I*stride_col_y;
-
-    // Launched with programmatic stream serialization (ggml_cuda_mul_mat_f_ksplit): x is weight data, so hint
-    // this block's x segments into L2 (no architectural effect) before waiting for the kernel that wrote y.
-    // The pointer arguments are not __restrict__, so no load moves above the wait.
+    constexpr int nwarps    = mmf_ksplit_nwarps;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     for (int c = w*warp_size + (threadIdx.x / tile_A::I)*nwarps*warp_size; c < ncols;
             c += (warp_size / tile_A::I)*nwarps*warp_size) {
         const float * p = x + (threadIdx.x % tile_A::I)*stride_row + c;
         asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(p)));
         asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(p + min(warp_size, ncols - c) - 1)));
     }
-    ggml_cuda_pdl_sync();
-    ggml_cuda_pdl_lc();
+}
 
-    extern __shared__ char data_mmf_ksplit[];
-    float * tile_xy = (float *) data_mmf_ksplit;
+// the (warp w, row tile, column tile itB) accumulator of the k-split: x and y point at the tiles' first row and column,
+// tile_xy is the warp's shared staging tile; the K columns w*32 + n*nwarps*32 in order, one mma sequence per step
+static __device__ __forceinline__ void mul_mat_f_ksplit_chain(const float * x, const float * y, float * tile_xy,
+        const int ncols, const int stride_row, const int stride_col_y, const int w, const int itB,
+        tile<16, 8, float> & C) {
+    typedef tile<16, 8, float> tile_A;
+    typedef tile<8,  8, float> tile_B;
 
-    tile_C C;
+    constexpr int nwarps        = mmf_ksplit_nwarps;
+    constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
+    constexpr int tile_k_padded = warp_size + mmf_get_padding();
 
     float xr[tile_A::I];
     float yr[tile_B::I];
@@ -384,6 +378,43 @@ static __global__ void mul_mat_f_ksplit_partial(
             mma(C, A[k0/tile_B::J], B);
         }
     }
+}
+#endif // defined(AMPERE_MMA_AVAILABLE) && !defined(VOLTA_MMA_AVAILABLE)
+
+static __global__ void mul_mat_f_ksplit_partial(
+        const float * x, const float * y, float * part,
+        const int ncols, const int stride_row, const int stride_col_y) {
+#if defined(AMPERE_MMA_AVAILABLE) && !defined(VOLTA_MMA_AVAILABLE)
+    typedef tile<16, 8, float> tile_A;
+    typedef tile<8,  8, float> tile_B;
+    typedef tile<16, 8, float> tile_C;
+
+    constexpr int rows_per_block = MMF_ROWS_PER_BLOCK;
+    constexpr int nwarps         = mmf_ksplit_nwarps;
+    constexpr int ntA            = rows_per_block / tile_A::I;
+    constexpr int ntB            = (mmf_ksplit_cols + tile_B::I - 1) / tile_B::I;
+
+    int b = blockIdx.x;
+    const int itB = b % ntB;    b /= ntB;
+    const int itA = b % ntA;    b /= ntA;
+    const int w   = b % nwarps;
+    const int rb  = b / nwarps;
+
+    x += (int64_t(rb)*rows_per_block + itA*tile_A::I)*stride_row;
+    y += int64_t(itB)*tile_B::I*stride_col_y;
+
+    // Launched with programmatic stream serialization (ggml_cuda_mul_mat_f_ksplit): x is weight data, so hint
+    // this block's x segments into L2 (no architectural effect) before waiting for the kernel that wrote y.
+    // The pointer arguments are not __restrict__, so no load moves above the wait.
+    mul_mat_f_ksplit_prefetch_x(x, ncols, stride_row, w);
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+
+    extern __shared__ char data_mmf_ksplit[];
+    float * tile_xy = (float *) data_mmf_ksplit;
+
+    tile_C C;
+    mul_mat_f_ksplit_chain(x, y, tile_xy, ncols, stride_row, stride_col_y, w, itB, C);
 
     constexpr int ldj = ntB*tile_C::J;
     part += int64_t(rb)*ldj*nwarps*rows_per_block;
@@ -397,6 +428,78 @@ static __global__ void mul_mat_f_ksplit_partial(
     GGML_UNUSED_VARS(x, y, part, ncols, stride_row, stride_col_y);
     NO_DEVICE_CODE;
 #endif // defined(AMPERE_MMA_AVAILABLE) && !defined(VOLTA_MMA_AVAILABLE)
+}
+
+// GB10: two k-split matmuls with the same y (the GDN alpha and beta projections) in one launch, partials and reduce
+// included. The blocks are mul_mat_f_ksplit_partial's (w, row tile, column tile) chains of both matrices, in clusters
+// of the nwarps chains of one tile (cluster rank = w). Rank 0 adds the cluster's accumulators from distributed shared
+// memory in rank order starting from zero, as mul_mat_f_ksplit_reduce adds the partials: the same bits.
+static __global__ void mul_mat_f_ksplit_pair(
+        const float * x0, const float * x1, const float * y, float * dst0, float * dst1,
+        const int ncols, const int nrb, const int stride_row0, const int stride_row1, const int stride_col_y,
+        const int stride_col_dst0, const int stride_col_dst1) {
+#if defined(AMPERE_MMA_AVAILABLE) && !defined(VOLTA_MMA_AVAILABLE) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    typedef tile<16, 8, float> tile_A;
+    typedef tile<8,  8, float> tile_B;
+    typedef tile<16, 8, float> tile_C;
+
+    constexpr int rows_per_block = MMF_ROWS_PER_BLOCK;
+    constexpr int nwarps         = mmf_ksplit_nwarps;
+    constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
+    constexpr int ntA            = rows_per_block / tile_A::I;
+    constexpr int ntB            = (mmf_ksplit_cols + tile_B::I - 1) / tile_B::I;
+
+    int b = blockIdx.x;
+    const int w   = b % nwarps;  b /= nwarps;
+    const int itB = b % ntB;     b /= ntB;
+    const int itA = b % ntA;     b /= ntA;
+    const int rb  = b % nrb;
+    const int m   = b / nrb;
+
+    const float * x              = m ? x1 : x0;
+    float *       dst            = m ? dst1 : dst0;
+    const int     stride_row     = m ? stride_row1 : stride_row0;
+    const int     stride_col_dst = m ? stride_col_dst1 : stride_col_dst0;
+
+    x += (int64_t(rb)*rows_per_block + itA*tile_A::I)*stride_row;
+    y += int64_t(itB)*tile_B::I*stride_col_y;
+
+    mul_mat_f_ksplit_prefetch_x(x, ncols, stride_row, w);
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+
+    extern __shared__ char data_mmf_ksplit[];
+    float * tile_xy = (float *) data_mmf_ksplit;
+    __shared__ float acc[tile_C::ne][warp_size];
+
+    tile_C C;
+    mul_mat_f_ksplit_chain(x, y, tile_xy, ncols, stride_row, stride_col_y, w, itB, C);
+
+#pragma unroll
+    for (int l = 0; l < tile_C::ne; ++l) {
+        acc[l][threadIdx.x] = C.x[l];
+    }
+    cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
+    cluster.sync();
+    if (w == 0) {
+#pragma unroll
+        for (int l = 0; l < tile_C::ne; ++l) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int r = 0; r < nwarps; ++r) {
+                sum += *cluster.map_shared_rank(&acc[l][threadIdx.x], r);
+            }
+            const int i = itA*tile_C::I + tile_C::get_i(l);
+            const int j = itB*tile_C::J + tile_C::get_j(l);
+            dst[j*stride_col_dst + rb*rows_per_block + i] = sum;
+        }
+    }
+    cluster.sync(); // the other ranks' shared memory stays valid until rank 0 has read it
+#else
+    GGML_UNUSED_VARS(x0, x1, y, dst0, dst1, ncols, nrb, stride_row0, stride_row1, stride_col_y, stride_col_dst0,
+        stride_col_dst1);
+    NO_DEVICE_CODE;
+#endif
 }
 
 static __global__ void mul_mat_f_ksplit_reduce(const float * part, float * dst, const int stride_col_dst) {

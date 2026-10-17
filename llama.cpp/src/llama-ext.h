@@ -133,6 +133,10 @@ LLAMA_API bool llama_get_logits_topk_ith(struct llama_context * ctx, int32_t i, 
 // context that alternates graph types reuses each graph instead of rebuilding it every call.
 LLAMA_API void llama_set_graph_slots(struct llama_context * ctx, uint32_t n);
 
+// Reserve the scheduler for the context's current settings now (input-independent) instead of at
+// the next decode; an extraction setting reserved this way is kept for switching back to it.
+LLAMA_API void llama_sched_reserve_now(struct llama_context * ctx);
+
 // Keep the layer inputs llama_set_embeddings_layer_inp extracts on the device only, for
 // llama_set_embd_import_layer_inp (llama_get_embeddings_layer_inp has no rows then).
 LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);

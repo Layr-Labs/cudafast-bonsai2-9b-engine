@@ -1554,6 +1554,10 @@ struct ggml_cuda_gated_delta_net_gather {
     const float *   base       = nullptr; // cache rows [row_stride floats each]
     const int32_t * ids        = nullptr; // per-seq row index
     int64_t         row_stride = 0;       // in floats
+    // GB10: an in-place SCALE of a cache row (build_rs zeroing a fresh cell) that the graph evaluator deferred to
+    // this op: the kernel applies it on load (to the row it reads, when it is that row) and overwrites the row, or the
+    // op runs the SCALE first
+    const ggml_tensor * zero_node  = nullptr;
 };
 
 // Owned by the backend context that evaluates the graph: registrations are keyed by node pointer,

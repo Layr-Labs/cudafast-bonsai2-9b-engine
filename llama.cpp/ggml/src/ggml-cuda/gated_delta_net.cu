@@ -1,5 +1,7 @@
 #include "gated_delta_net.cuh"
 #include "gated_delta_net_kernel.cuh"
+#include "scale.cuh"
+#include "state-clear.cuh"
 
 #include <cstdlib>
 
@@ -14,7 +16,7 @@ static void launch_gated_delta_net(
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K,
-        const int32_t * s_ids, int64_t s_row_stride, int lazy, cudaStream_t stream) {
+        const int32_t * s_ids, int64_t s_row_stride, int lazy, const float * const zero[3], cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -75,10 +77,12 @@ static void launch_gated_delta_net(
                     ggml_cuda_kernel_launch(gated_delta_net_l8_cuda<RAW, G_PRECOMPUTED>, launch_params,
                         q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                         n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, lazy);
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride, lazy,
+                        zero[0], zero[0] ? *zero[1] : 0.0f, zero[0] ? *zero[2] : 0.0f);
                     break;
                 }
             }
+            GGML_ASSERT(zero[0] == nullptr);
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
@@ -132,10 +136,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // fused state gather, registered for this node by this context's graph evaluator (ggml_cuda_try_gdn_gather_skip)
     const int32_t * s_ids        = nullptr;
     int64_t         s_row_stride = 0;
+    const ggml_tensor * zero_node = nullptr;
     if (const ggml_cuda_gated_delta_net_gather * gather = ctx.gdn_gathers().find(dst)) {
         s_d          = gather->base;
         s_ids        = gather->ids;
         s_row_stride = gather->row_stride;
+        zero_node    = gather->zero_node;
     }
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
@@ -181,6 +187,35 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
+    // GB10 per-request state clear (C68): the cache bytes this launch writes (state-clear.cuh), from the same
+    // predicates as the kernels. Per (seq, head) row of S_v*S_v floats: lazy: rollback slots 0 (final state) and 1
+    // (window base) in full, slots 2 .. 1 + grid_z the record (header + W tokens); eager: slots 0 .. min(T, K) - 1
+    // in full; K == 1: slot 0.
+    if (cache != nullptr && ggml_cuda_dirty_tracking()) {
+        const int     cc_fp      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const int     cpw        = GGML_CUDA_CC_IS_NVIDIA(cc_fp) ? gdn_cols_per_warp(ggml_cuda_highest_compiled_arch(cc_fp), S_v, kda) : 1;
+        const int64_t grid_z     = (S_v + 4*cpw - 1) / (4*cpw);
+        const size_t  row_bytes  = (size_t) (S_v*S_v)*sizeof(float);
+        const size_t  slot_bytes = row_bytes*(size_t) (H*n_seqs);
+        const float * base       = cache->data;
+        const int64_t ss         = cache->slot_stride;
+        if (!keep_rs || ss == 0) {
+            ggml_cuda_dirty_mark(base, slot_bytes, stream);
+        } else if (lazy && 2 + grid_z <= K) {
+            ggml_cuda_dirty_mark(base, slot_bytes, stream);
+            ggml_cuda_dirty_mark(base + ss, slot_bytes, stream);
+            const int64_t W   = std::min<int64_t>(n_tokens, K);
+            const size_t  rec = (size_t) (GDN_LAZY_HDR + W*(S_v + GDN_LAZY_NWARPS*cpw + 2))*sizeof(float);
+            for (int64_t z = 0; z < grid_z; ++z) {
+                ggml_cuda_dirty_mark_2d(base + (2 + z)*ss, std::min(rec, row_bytes), row_bytes, (size_t) (H*n_seqs), stream);
+            }
+        } else {
+            for (int64_t t = 0; t < std::min<int64_t>(n_tokens, K); ++t) {
+                ggml_cuda_dirty_mark(base + t*ss, slot_bytes, stream);
+            }
+        }
+    }
+
     const bool    raw  = ggml_get_op_params_i32(dst, 1) != 0;
     const float * rb_d = raw ? (const float *) dst->src[7]->data : nullptr;
     const float * ra_d = raw ? (const float *) dst->src[8]->data : nullptr;
@@ -224,10 +259,33 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
     }
 
+    // a deferred zeroing SCALE of a cache row: gated_delta_net_l8_cuda applies it on load when it also overwrites that
+    // row (slot 0 of the cell it writes, n_seqs == 1); otherwise the SCALE runs now, before the kernel reads the row
+    const float * zero[3] = { nullptr, nullptr, nullptr };
+    float         zero_sb[2];
+    if (zero_node != nullptr) {
+        static const bool l8_on = getenv("GGML_CUDA_GDN_L8") == nullptr || atoi(getenv("GGML_CUDA_GDN_L8")) != 0;
+        const int  cc_z  = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const bool l8    = l8_on && !kda && keep_rs && S_v == 128 && cc_z == GGML_CUDA_CC_DGX_SPARK &&
+                           ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32 &&
+                           gdn_cols_per_warp(ggml_cuda_highest_compiled_arch(cc_z), S_v, false) == 4 &&
+                           n_tokens >= GDN_L8_MIN_TOKENS && n_tokens > GDN_L8V_MAX_TOKENS;
+        if (l8 && cache != nullptr && n_seqs == 1 && (const float *) zero_node->data == state_d &&
+                ggml_nbytes(zero_node) == (size_t) S_v * S_v * H * sizeof(float)) {
+            memcpy(&zero_sb[0], (const float *) zero_node->op_params + 0, sizeof(float));
+            memcpy(&zero_sb[1], (const float *) zero_node->op_params + 1, sizeof(float));
+            zero[0] = (const float *) zero_node->data;
+            zero[1] = &zero_sb[0];
+            zero[2] = &zero_sb[1];
+        } else {
+            ggml_cuda_op_scale(ctx, const_cast<ggml_tensor *>(zero_node));
+        }
+    }
+
 #define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_)                                                       \
     launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, \
         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                    \
-        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, lazy, stream)
+        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, lazy, zero, stream)
 
     if (kda) {
         if (keep_rs) { GDN_LAUNCH(true,  true,  false, false); } else { GDN_LAUNCH(true,  false, false, false); }

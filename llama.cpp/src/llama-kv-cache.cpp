@@ -5,6 +5,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-state-clear.h"
 
 #include <algorithm>
 #include <cassert>
@@ -136,6 +137,7 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
 
     v_heads.resize(n_stream);
+    v_dirty.assign(n_stream, 0);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_heads[s] = 0;
     }
@@ -374,9 +376,39 @@ void llama_kv_cache::clear(bool data) {
     }
 
     if (data) {
+        // C68: zero the cells written since the last clear (llama-state-clear.h). Only for a cache that owns its
+        // cells and layers (no shared source cache) and has no extra tensors in its buffers.
+        const bool ranged = other == nullptr && k_bar.empty();
         for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+            ggml_backend_buffer_t b    = buf.get();
+            const char *          base = (const char *) ggml_backend_buffer_get_base(b);
+            const size_t          size = ggml_backend_buffer_get_size(b);
+            std::vector<size_t>   ranges;
+            auto in_buf = [&](const ggml_tensor * t) {
+                return t != nullptr && (const char *) t->data >= base && (const char *) t->data < base + size;
+            };
+            for (const auto & layer : layers) {
+                for (const ggml_tensor * t : { layer.k, layer.v }) {
+                    if (!in_buf(t)) {
+                        continue;
+                    }
+                    const size_t off = (const char *) t->data - base;
+                    if (t == layer.v && v_trans) {
+                        ranges.insert(ranges.end(), { off, ggml_nbytes(t), 0, 1 }); // cells are columns: whole tensor
+                        continue;
+                    }
+                    // [n_embd, kv_size, n_stream]: cell i of stream s is row i of plane s
+                    for (uint32_t s = 0; s < n_stream; ++s) {
+                        const size_t width = (size_t) v_dirty[s]*t->nb[1];
+                        if (width > 0) {
+                            ranges.insert(ranges.end(), { off + s*t->nb[2], width, 0, 1 });
+                        }
+                    }
+                }
+            }
+            llama_state_clear_buffer(b, ranges, ranged, "kv");
         }
+        std::fill(v_dirty.begin(), v_dirty.end(), 0);
     }
 }
 
@@ -843,6 +875,8 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
             assert(ssrc != sdst);
 
+            v_dirty[sdst] = std::max(v_dirty[sdst], v_dirty[ssrc]);
+
             for (uint32_t il = 0; il < layers.size(); ++il) {
                 const auto & layer = layers[il];
 
@@ -861,6 +895,9 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         }
 
         LLAMA_LOG_DEBUG("%s: applying K-shift\n", __func__);
+
+        // the shift graph rewrites K of the whole cache
+        std::fill(v_dirty.begin(), v_dirty.end(), get_size());
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
@@ -1117,6 +1154,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             auto & cells = v_cells[sinfo.strm[s]];
 
             const auto idx = sinfo.idxs[s][ii];
+
+            // the graph writes K/V of this ubatch at exactly these cells (set_input_k_idxs/v_idxs)
+            v_dirty[sinfo.strm[s]] = std::max(v_dirty[sinfo.strm[s]], (uint32_t) idx + 1);
 
             if (!cells.is_empty(idx)) {
                 assert(cells.seq_count(idx) == 1);
@@ -2535,6 +2575,9 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
     auto & cells = v_cells[strm];
+
+    // restored data may land in any cell of the stream
+    v_dirty[strm] = get_size();
 
     uint32_t v_trans;
     uint32_t n_layer;

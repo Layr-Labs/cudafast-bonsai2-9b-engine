@@ -580,6 +580,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DFLASH2_CONV,
 
         GGML_OP_UNARY,
 
@@ -2678,6 +2679,20 @@ extern "C" {
     //   result[i, dst, t] = x[i, t]*post[dst, t]
     //                       + sum_src residual[i, src, t]*comb[dst, src, t]
     //
+    // DFlash2 block conv: out[h,t] = sum_k (dynamic[g(h),k,side,t] + base[h,k,side]) * x[h,t-k] within each
+    // block of block_size tokens (zero before the block start); g(h) = h / group_size. The same per-element
+    // operations, in the same order, as the unfused view/repeat/add/fill/concat/mul/add chain (and the add of
+    // the residual after it).
+    GGML_API struct ggml_tensor * ggml_dflash2_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,        // [n_embd, n_tokens] f32, contiguous
+            struct ggml_tensor  * dynamic,  // [n_groups * kernel * 2, n_tokens] f32
+            struct ggml_tensor  * base,     // [n_embd, kernel, 2] f32
+            int                   side,
+            int                   block_size,
+            int                   group_size,
+            struct ggml_tensor  * residual); // optional [n_embd, n_tokens] f32 contiguous: out = conv + residual
+
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,

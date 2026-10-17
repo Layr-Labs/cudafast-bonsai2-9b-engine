@@ -444,6 +444,27 @@ private:
 
     bool sched_need_reserve = true;
 
+    // The scheduler, compute buffers and graph results reserved for one target-layer extraction setting
+    // (set_embeddings_layer_inp), parked while another setting is active. Switching back restores them
+    // instead of reserving again, so the graphs keep their nodes and buffers (and their CUDA graphs).
+    struct sched_state {
+        std::vector<bool>       layer_inp;
+        bool                    layer_inp_dev = false;
+        ggml_backend_sched_ptr  sched;
+        llm_graph_result_ptr    gf_res_prev;
+        llm_graph_result_ptr    gf_res_reserve;
+        std::vector<graph_slot> graph_slots;
+        std::vector<size_t>     backend_buf_exp_size;
+    };
+    std::vector<sched_state> sched_parked;
+    std::vector<bool>        sched_layer_inp;              // the setting the active scheduler was reserved for
+    bool                     sched_layer_inp_dev   = false;
+    bool                     sched_layer_inp_dirty = false;
+
+    // park the active scheduler state and restore the one reserved for the current extraction setting;
+    // false: none is parked, reserve one
+    bool sched_switch_layer_inp();
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 

@@ -1099,6 +1099,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DFLASH2_CONV",
 
     "UNARY",
 
@@ -1116,7 +1117,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,6 +1215,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dflash2_conv(x, dynamic, base)",
 
     "unary(x)",
 
@@ -1231,7 +1233,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6553,6 +6555,46 @@ struct ggml_tensor * ggml_dsv4_hc_pre(
     result->op     = GGML_OP_DSV4_HC_PRE;
     result->src[0] = x;
     result->src[1] = weights;
+
+    return result;
+}
+
+// ggml_dflash2_conv
+
+struct ggml_tensor * ggml_dflash2_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * dynamic,
+        struct ggml_tensor  * base,
+        int                   side,
+        int                   block_size,
+        int                   group_size,
+        struct ggml_tensor  * residual) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && dynamic->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual == NULL || (residual->type == GGML_TYPE_F32 && ggml_is_contiguous(residual) && ggml_are_same_shape(residual, x)));
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(base) && ggml_is_contiguous_rows(dynamic));
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1 && dynamic->ne[2] == 1 && dynamic->ne[3] == 1);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t kernel   = base->ne[1];
+
+    GGML_ASSERT(side == 0 || side == 1);
+    GGML_ASSERT(group_size > 0 && n_embd % group_size == 0);
+    GGML_ASSERT(block_size > 0 && n_tokens % block_size == 0);
+    GGML_ASSERT(base->ne[0] == n_embd && base->ne[2] == 2 && base->ne[3] == 1 && kernel >= 1);
+    GGML_ASSERT(dynamic->ne[0] == (n_embd / group_size) * kernel * 2 && dynamic->ne[1] == n_tokens);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+
+    const int32_t params[3] = { side, block_size, group_size };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DFLASH2_CONV;
+    result->src[0] = x;
+    result->src[1] = dynamic;
+    result->src[2] = base;
+    result->src[3] = residual;
 
     return result;
 }

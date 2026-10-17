@@ -107,8 +107,18 @@ void fwht_quantize_mmq_d4_glu_perm_cuda(const float * x, const float * g, const 
 void fwht_quantize_mmq_d4_rms_cuda(const float * x, int64_t stride_row, const float * w, float eps,
     const float * signs, float * norm, void * y, int64_t k, int64_t rows, cudaStream_t stream);
 
+// The same with RMS_NORM(a + b, eps) * w as the input, formed as add_rms_norm_f32<1024> forms it (one 1024-thread
+// block per 4096-wide contiguous row); sum receives a + b, norm (when set) the normalized product.
+void fwht_quantize_mmq_d4_add_rms_cuda(const float * a, const float * b, float * sum, const float * w, float eps,
+    const float * signs, float * norm, void * y, int64_t k, int64_t rows, cudaStream_t stream);
+
 // GDN output projection input (fwht_quantize_mmq_d4_gnorm): x and z hold contiguous 128-wide head rows (z rows
 // z_stride floats apart), w the 128 norm weights; feature a0 + 128*(a1 + ne1*a2) of transform row r is head row
 // r*g3 + a1*g1 + a2*g2, column a0, of SWIGLU(z, RMS_NORM(x, eps) * w).
 void fwht_quantize_mmq_d4_gnorm_cuda(const float * x, const float * z, int64_t z_stride, const float * w, float eps,
     int64_t ne1, int64_t g1, int64_t g2, int64_t g3, const float * signs, void * y, int64_t rows, cudaStream_t stream);
+
+// C62: the transform of MUL(attn, SIGMOID(gate)) with the gate read through a strided view: transform column
+// i0 + n0*i1 of row r reads gate[r*gt + i1*g1 + i0] and attn[r*at + i0 + n0*i1] (strides in elements).
+void fwht_quantize_mmq_d4_sigmoid_gate_cuda(const float * gate, const float * attn, const float * signs, void * y,
+    int64_t k, int64_t kp, int64_t rows, int n0, int64_t g1, int64_t gt, int64_t at, cudaStream_t stream);

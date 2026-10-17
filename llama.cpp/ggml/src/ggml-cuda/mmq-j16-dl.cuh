@@ -614,6 +614,240 @@ static void ggml_cuda_dl_repack(const char * src, char * dst, const int nrows, c
 }
 
 // ---------------------------------------------------------------------------------------------
+// Bulk-copy ring (C64, TM layout). One thread streams the CTA's step regions (the 128 rows x GB bytes of one K step,
+// contiguous in TM) and the step's activations (ncols_y q8_1 blocks, contiguous) into a ring of S shared-memory
+// stages with cp.async.bulk, completing on one mbarrier per stage; the warps read their operands from the stage
+// with the same load expressions as the DL kernels. Same work partition, segments, per-element accumulation (the
+// same compute calls in increasing K) and stores: the results are bit-identical. The weight copies carry an L2
+// evict-first policy (C73; a cache hint only, no effect on values).
+
+#define GGML_CUDA_DL_FMT_PQ2  0
+#define GGML_CUDA_DL_FMT_PTQ1 1
+#define GGML_CUDA_DL_FMT_Q8   2
+
+template <int FMT> struct ggml_cuda_dl_fmt;
+template <> struct ggml_cuda_dl_fmt<GGML_CUDA_DL_FMT_PQ2>  { static constexpr int GB = sizeof(block_pq2_0);   static constexpr int G = 1; static constexpr int BPI = MMQ_ITER_K / QK_PQ2_0; };
+template <> struct ggml_cuda_dl_fmt<GGML_CUDA_DL_FMT_PTQ1> { static constexpr int GB = sizeof(block_ptq1_0);  static constexpr int G = 1; static constexpr int BPI = MMQ_ITER_K / QK_PQ2_0; };
+template <> struct ggml_cuda_dl_fmt<GGML_CUDA_DL_FMT_Q8>   { static constexpr int GB = 4*sizeof(block_q8_0);  static constexpr int G = 4; static constexpr int BPI = MMQ_ITER_K / QK8_0;   };
+
+static __device__ __forceinline__ uint32_t ggml_cuda_dl_smem_u32(const void * p) {
+    return (uint32_t) __cvta_generic_to_shared(p);
+}
+
+static __device__ __forceinline__ void ggml_cuda_dl_mbar_init(uint64_t * bar, const uint32_t count) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(ggml_cuda_dl_smem_u32(bar)), "r"(count) : "memory");
+#else
+    GGML_UNUSED_VARS(bar, count);
+#endif
+}
+
+static __device__ __forceinline__ void ggml_cuda_dl_mbar_init_fence() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+#endif
+}
+
+static __device__ __forceinline__ void ggml_cuda_dl_mbar_expect_tx(uint64_t * bar, const uint32_t bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(ggml_cuda_dl_smem_u32(bar)), "r"(bytes) : "memory");
+#else
+    GGML_UNUSED_VARS(bar, bytes);
+#endif
+}
+
+static __device__ __forceinline__ void ggml_cuda_dl_mbar_wait(uint64_t * bar, const uint32_t parity) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
+    uint32_t done = 0;
+    do {
+        asm volatile("{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n\tselp.u32 %0, 1, 0, p;\n\t}"
+                     : "=r"(done) : "r"(ggml_cuda_dl_smem_u32(bar)), "r"(parity) : "memory");
+    } while (!done);
+#else
+    GGML_UNUSED_VARS(bar, parity);
+#endif
+}
+
+// bytes (multiple of 16) from global src (16-byte aligned) to shared dst (16-byte aligned), completing on bar
+static __device__ __forceinline__ void ggml_cuda_dl_bulk_g2s(void * dst, const void * src, const uint32_t bytes, uint64_t * bar) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                 :: "r"(ggml_cuda_dl_smem_u32(dst)), "l"(__cvta_generic_to_global(src)), "r"(bytes), "r"(ggml_cuda_dl_smem_u32(bar))
+                 : "memory");
+#else
+    GGML_UNUSED_VARS(dst, src, bytes, bar);
+#endif
+}
+
+// The same copy with an L2 cache policy (createpolicy): the ring streams every weight byte exactly once per launch,
+// so its lines are allocated evict-first (C73). The L2 then keeps the data the other kernels reuse (activations, KV,
+// recurrent state, outputs and partials) instead of filling with weights that are never read again.
+static __device__ __forceinline__ void ggml_cuda_dl_bulk_g2s_hint(void * dst, const void * src, const uint32_t bytes, uint64_t * bar,
+                                                                  const uint64_t policy) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+                 :: "r"(ggml_cuda_dl_smem_u32(dst)), "l"(__cvta_generic_to_global(src)), "r"(bytes), "r"(ggml_cuda_dl_smem_u32(bar)),
+                    "l"(policy)
+                 : "memory");
+#else
+    GGML_UNUSED_VARS(dst, src, bytes, bar, policy);
+#endif
+}
+
+static __device__ __forceinline__ uint64_t ggml_cuda_dl_policy_evict_first() {
+    uint64_t policy = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+#endif
+    return policy;
+}
+
+// One stage = SPS consecutive K steps of the CTA: their weights (one contiguous TM run) and their activations.
+template <int FMT, int SPS>
+static __host__ __device__ constexpr int ggml_cuda_dl_ring_stage_bytes() {
+    return SPS*(128*ggml_cuda_dl_fmt<FMT>::GB + 16*(int) sizeof(block_q8_1_mmq));
+}
+
+template <int FMT, int SPS>
+static __host__ __device__ constexpr size_t ggml_cuda_dl_ring_smem(const int S) {
+    return (size_t) S*ggml_cuda_dl_ring_stage_bytes<FMT, SPS>() + (size_t) S*sizeof(uint64_t);
+}
+
+// Operands of one step of lane (g, c) of warp w from a stage, accumulated into sum (the DL kernels' calls).
+template <int FMT>
+static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4], const char * sx, const char * sy, const int c) {
+    if constexpr (FMT == GGML_CUDA_DL_FMT_PQ2) {
+        ggml_cuda_pq2_j16_stage<1> st;
+        ggml_cuda_pq2_j16_load<1>(st, sx, (int) sizeof(block_pq2_0), sy, c);
+        ggml_cuda_pq2_j16_compute<1>(sum, st, c);
+    } else if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1) {
+        ggml_cuda_ptq1_j16_stage st;
+        ggml_cuda_ptq1_j16_load(st, sx, sy, c);
+        ggml_cuda_ptq1_j16_compute(sum, st, c);
+    } else {
+        ggml_cuda_dl_q8_xstage xs;
+        ggml_cuda_dl_q8_ystage ys;
+        ggml_cuda_dl_q8_load_x(xs, sx, c);
+        ggml_cuda_dl_q8_load_y(ys, sy, c);
+        ggml_cuda_dl_q8_compute(sum[0], xs, ys, c);
+    }
+}
+
+// Same arguments as mul_mat_q_*_j16_dl (TM copy; mode 0 stream-k or mode 1 contiguous whole tiles), dynamic
+// shared memory ggml_cuda_dl_ring_smem<FMT, SPS>(S). Stage layout: weights of the SPS steps, then SPS x 16
+// activation blocks.
+template <int FMT, int S, int SPS>
+__launch_bounds__(16*32, 1)
+static __global__ void mul_mat_q_j16_dl_ring(
+        const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
+        const int nrows_x, const int nkb, const int ncols_y, const int stride_col_dst, const int ncols_dst,
+        const int mode, float * dst_hi, const int nrows_lo) {
+    using F = ggml_cuda_dl_fmt<FMT>;
+    constexpr int GB = F::GB;
+    constexpr int G  = F::G;
+    constexpr int I  = 128;
+    constexpr int J  = 16;
+    constexpr int XB = I*GB;                                       // weights of one CTA step
+    constexpr int YB = J*(int) sizeof(block_q8_1_mmq);             // activation slot of one step
+    constexpr int SB = ggml_cuda_dl_ring_stage_bytes<FMT, SPS>();
+    extern __shared__ __align__(128) char ggml_cuda_dl_ring_smem_buf[];
+    char     * smem = ggml_cuda_dl_ring_smem_buf;
+    uint64_t * full = (uint64_t *) (smem + S*SB);
+
+    const int nst = nkb / G;
+    const int nty = nrows_x / I;
+    int it, st, rem, tile_inc;
+    ggml_cuda_dl_work<G, F::BPI>(it, st, rem, tile_inc, nty, nkb, mode);
+    const int total   = rem;
+    const int nstages = (total + SPS - 1) / SPS;
+    const int gs0     = it*nst + st;
+    const int tid     = threadIdx.y*32 + threadIdx.x;
+    const uint32_t yb_bytes = (uint32_t) (ncols_y*(int) sizeof(block_q8_1_mmq));
+
+    if (tid == 0) {
+#pragma unroll
+        for (int k = 0; k < S; ++k) {
+            ggml_cuda_dl_mbar_init(&full[k], 1);
+        }
+        ggml_cuda_dl_mbar_init_fence();
+    }
+    __syncthreads();
+    // Weights of the first S stages before the grid dependency wait (they do not depend on the previous kernel).
+    // Weights are read once: evict-first in L2; the activations keep the default policy (every CTA reads them).
+    const uint64_t wpol = ggml_cuda_dl_policy_evict_first();
+    if (tid == 0) {
+        for (int k = 0; k < S && k < nstages; ++k) {
+            const int n = min(SPS, total - k*SPS);
+            ggml_cuda_dl_mbar_expect_tx(&full[k], (uint32_t) n*(XB + yb_bytes));
+            ggml_cuda_dl_bulk_g2s_hint(smem + k*SB, x + (int64_t) (gs0 + k*SPS)*XB, (uint32_t) n*XB, &full[k], wpol);
+        }
+    }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+#endif
+    if (tid == 0) {
+        for (int k = 0; k < S && k < nstages; ++k) {
+            const int n = min(SPS, total - k*SPS);
+            for (int j = 0; j < n; ++j) {
+                const int stj = (gs0 + k*SPS + j) % nst;
+                ggml_cuda_dl_bulk_g2s(smem + k*SB + SPS*XB + j*YB, (const char *) y + (int64_t) stj*yb_bytes, yb_bytes, &full[k]);
+            }
+        }
+    }
+
+    const int w = threadIdx.y;
+    const int g = threadIdx.x / 4;
+    const int c = threadIdx.x % 4;
+    float sum[1][4] = {{0.0f}};
+#pragma unroll 1
+    for (int k = 0; k < nstages; ++k) {
+        const int s = k % S;
+        const int n = min(SPS, total - k*SPS);
+        ggml_cuda_dl_mbar_wait(&full[s], (uint32_t) ((k / S) & 1));
+#pragma unroll
+        for (int j = 0; j < SPS; ++j) {
+            if (j < n) {
+                const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
+                const char * sy = smem + s*SB + SPS*XB + j*YB + g*(int) sizeof(block_q8_1_mmq);
+                ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
+                ++st;
+                const bool last = k*SPS + j == total - 1;
+                if (st == nst || last) { // end of a segment: the stores of the DL kernels
+                    if (st == nst) {
+                        const int row = it*I + w*8;
+                        if (row < nrows_lo) {
+                            ggml_cuda_pq2_j16_store<1>(sum, dst, row, stride_col_dst, ncols_dst - 1);
+                        } else {
+                            ggml_cuda_pq2_j16_store<1>(sum, dst_hi, row - nrows_lo, stride_col_dst, ncols_dst - 1);
+                        }
+                        st = 0;
+                        it += tile_inc;
+                    } else {
+                        ggml_cuda_pq2_j16_store<1>(sum, tmp_fixup + (int64_t) blockIdx.x*(J*I), w*8, I, J - 1);
+                    }
+#pragma unroll
+                    for (int l = 0; l < 4; ++l) {
+                        sum[0][l] = 0.0f;
+                    }
+                }
+            }
+        }
+        __syncthreads(); // every warp is done with stage s
+        if (tid == 0 && k + S < nstages) {
+            const int kk = k + S;
+            const int nn = min(SPS, total - kk*SPS);
+            const int gsk = gs0 + kk*SPS;
+            ggml_cuda_dl_mbar_expect_tx(&full[s], (uint32_t) nn*(XB + yb_bytes));
+            ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + (int64_t) gsk*XB, (uint32_t) nn*XB, &full[s], wpol);
+            for (int j = 0; j < nn; ++j) {
+                ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB, (const char *) y + (int64_t) ((gsk + j) % nst)*yb_bytes, yb_bytes, &full[s]);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Host side (included by mmq.cuh after mmq_args and mmq-pq2-j16.cuh). GB10 only.
 //
 // The decode layout copies are made once at model load (ggml_backend_cuda_register_decode_layout,
@@ -664,6 +898,28 @@ static void ggml_cuda_mmq_dl_launch(Kernel kernel, bool * attr_set, const mmq_ar
         (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
 }
 
+template <int FMT, int S, int SPS>
+static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
+                                         const int nkb, float * tmp_fixup, cudaStream_t stream) {
+    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS>;
+    constexpr size_t smem = ggml_cuda_dl_ring_smem<FMT, SPS>(S);
+    static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
+    const int device = ggml_cuda_get_device();
+    if (!attr[device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
+        attr[device] = true;
+    }
+    ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, 16, 1), smem, stream),
+        (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
+        (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
+}
+
+static int ggml_cuda_dl_env_int(const char * name, const int dflt) {
+    const char * v = getenv(name);
+    return v ? atoi(v) : dflt;
+}
+
 // grid: the mul_mat_q grid rule (ggml_cuda_mmq_pq2_j16_grid). Stream-k shapes keep that partition and the
 // unchanged mul_mat_q_stream_k_fixup; pure-tiling shapes compute every tile in one CTA (mode 1, one tile
 // per CTA). Prefetch per shape class from the microbenchmark (c44 NOTES): PQ2_0 pure tiling: CTA bulk
@@ -679,7 +935,16 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
     const bool tiling = grid == ntiles;
     if constexpr (type == GGML_TYPE_PQ2_0) {
         const int64_t bytes = args.nrows_x*nkb*(int64_t) sizeof(block_pq2_0);
-        if (e.dl_type == GGML_TYPE_PTQ1_0) {
+        // PTQ1_0 matrices of at least 2048 rows: bulk-copy ring of 2-step stages (c64); GGML_CUDA_DL_RING_PT=0 off.
+        static const bool ring_pt = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_PT", 1) != 0;
+        if (e.dl_type == GGML_TYPE_PTQ1_0 && ring_pt && args.nrows_x >= 2048) {
+            constexpr int FMT = GGML_CUDA_DL_FMT_PTQ1;
+            if (tiling && ntiles > 4*nsm) {
+                ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);
+            } else {
+                ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+            }
+        } else if (e.dl_type == GGML_TYPE_PTQ1_0) {
             // PTQ1_0 groups (C51). Prefetch from the c51 microbenchmark: CTA bulk prefetch, 16 steps in chunks
             // of 8 for many waves of pure tiling (the LM head), 3 steps ahead for every other shape.
             if (tiling && ntiles > 4*nsm) {
@@ -700,8 +965,16 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
             ggml_cuda_mmq_dl_launch(mul_mat_q_pq2_j16_dl<TM, GGML_CUDA_DL_H_SECTOR, 2, 1>, attr, args, e, grid, 0, nkb, tmp_fixup, stream);
         }
     } else {
-        static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
-        ggml_cuda_mmq_dl_launch(mul_mat_q_q8_0_j16_dl<TM, GGML_CUDA_DL_H_SECTOR, 2, 1>, attr, args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+        // Q8_0 matrices of at least 4096 rows: bulk-copy ring, 2 stages of one step (c64 microbenchmark);
+        // GGML_CUDA_DL_RING=0 keeps the warp-load kernel.
+        static const bool ring     = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING", 1) != 0;
+        static const int  ring_min = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_MIN_ROWS", 4096);
+        if (ring && args.nrows_x >= ring_min) {
+            ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_Q8, 2, 1>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+        } else {
+            static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
+            ggml_cuda_mmq_dl_launch(mul_mat_q_q8_0_j16_dl<TM, GGML_CUDA_DL_H_SECTOR, 2, 1>, attr, args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+        }
     }
     if (!tiling) {
         const uint3 blocks_per_ne00_fd = init_fastdiv_values(nkb);

@@ -112,6 +112,9 @@ public:
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
 
+    // C68: s_l[il] is registered with the backend for write tracking (llama-state-clear.h)
+    std::vector<bool> s_tracked;
+
 private:
     //const llama_model & model;
     const llama_hparams & hparams;

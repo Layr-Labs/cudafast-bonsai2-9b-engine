@@ -1856,16 +1856,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, false); // DFlash needs non-causal attention
 
-        // each verify round runs the encoder, the injection and the draft graph on ctx_dft: keep all three
-        llama_set_graph_slots(ctx_dft, 3);
-
         inject_merge = is_dflash2 && !is_dspark && !prompt_lookup && features_on_device && n_seq == 1 &&
                        block_size == 16 && this->params.n_max == block_size - 1 &&
                        llama_n_seq_max(ctx_dft) > (uint32_t) DFLASH2_PAD_SEQ && dflash2_inject_merge_enabled();
-        if (inject_merge) {
-            // encoder, merged draft (with and without padding rows), plain draft, prefill encoder/inject
-            llama_set_graph_slots(ctx_dft, 6);
-        }
+        // each verify round runs the encoder, the injection and the draft graph on ctx_dft: keep all three;
+        // merged inject: encoder, merged draft (with and without padding rows), plain draft, prefill encoder/inject.
+        // One call with the final count: a changed count drops the parked graphs, and this state is re-created
+        // for every request.
+        llama_set_graph_slots(ctx_dft, inject_merge ? 6 : 3);
         LOG_INF("%s: - DFlash2 merged K/V inject: %s\n", __func__, inject_merge ? "on" : "off");
     }
 

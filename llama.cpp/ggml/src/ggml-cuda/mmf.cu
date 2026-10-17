@@ -46,6 +46,77 @@ static bool ggml_cuda_mul_mat_f_ksplit(ggml_backend_cuda_context & ctx, const fl
     return true;
 }
 
+// the k-split route mul_mat_f takes for this (src0, src1, dst) without ids: x, y, dst strides in elements
+struct mmf_ksplit_args {
+    const float * x;
+    const float * y;
+    float *       dst;
+    int64_t       ncols_x, nrows_x, stride_row, stride_col_y, stride_col_dst;
+};
+
+static bool mmf_ksplit_route(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int cc,
+                             const int warp_size, mmf_ksplit_args & a) {
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1 || src1->ne[2] != 1 ||
+        src1->ne[3] != dst->ne[3]) {
+        return false;
+    }
+    a.x              = (const float *) src0->data;
+    a.y              = (const float *) src1->data;
+    a.dst            = (float *) dst->data;
+    a.ncols_x        = src0->ne[0];
+    a.nrows_x        = src0->ne[1];
+    a.stride_row     = src0->nb[1] / sizeof(float);
+    a.stride_col_y   = src1->nb[1] / sizeof(float);
+    a.stride_col_dst = dst->nb[1] / sizeof(float);
+    return cc == GGML_CUDA_CC_DGX_SPARK && warp_size == 32 && dst->ne[1] == mmf_ksplit_cols &&
+           a.nrows_x % MMF_ROWS_PER_BLOCK == 0 && a.nrows_x <= 4*MMF_ROWS_PER_BLOCK &&
+           mmf_nwarps_best(a.ncols_x, warp_size, cc) == mmf_ksplit_nwarps;
+}
+
+bool ggml_cuda_mul_mat_f_ksplit_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * src0a, const ggml_tensor * src0b,
+        const ggml_tensor * src1, ggml_tensor * dsta, ggml_tensor * dstb) {
+    static const bool disabled = getenv("GGML_CUDA_MMF_PAIR") != nullptr && atoi(getenv("GGML_CUDA_MMF_PAIR")) == 0;
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    mmf_ksplit_args a, b;
+    if (disabled || !mmf_ksplit_route(src0a, src1, dsta, cc, warp_size, a) || !mmf_ksplit_route(src0b, src1, dstb, cc, warp_size, b) ||
+        a.ncols_x != b.ncols_x || a.nrows_x != b.nrows_x) {
+        return false;
+    }
+    const int64_t nrb           = a.nrows_x / MMF_ROWS_PER_BLOCK;
+    const int     nbytes_shared = 16 * (warp_size + mmf_get_padding(cc)) * (int) sizeof(float);
+
+    cudaLaunchAttribute attrs[2];
+    attrs[0].id               = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim.x = mmf_ksplit_nwarps;
+    attrs[0].val.clusterDim.y = 1;
+    attrs[0].val.clusterDim.z = 1;
+    int n_attrs = 1;
+#if defined(GGML_CUDA_USE_PDL)
+    static const bool pdl_enabled = [] {
+        const char * env = getenv("GGML_CUDA_PDL");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    if (pdl_enabled) {
+        attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[1].val.programmaticStreamSerializationAllowed = 1;
+        n_attrs = 2;
+    }
+#endif // defined(GGML_CUDA_USE_PDL)
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim          = dim3(2*nrb*(MMF_ROWS_PER_BLOCK/16)*(mmf_ksplit_cols/8)*mmf_ksplit_nwarps);
+    cfg.blockDim         = dim3(warp_size, 1, 1);
+    cfg.dynamicSmemBytes = nbytes_shared;
+    cfg.stream           = ctx.stream();
+    cfg.attrs            = attrs;
+    cfg.numAttrs         = n_attrs;
+    CUDA_CHECK(cudaLaunchKernelEx(&cfg, mul_mat_f_ksplit_pair, a.x, b.x, a.y, a.dst, b.dst, (int) a.ncols_x, (int) nrb,
+        (int) a.stride_row, (int) b.stride_row, (int) a.stride_col_y, (int) a.stride_col_dst, (int) b.stride_col_dst));
+    return true;
+}
+
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);

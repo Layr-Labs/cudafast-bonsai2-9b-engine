@@ -288,6 +288,9 @@ private:
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
 
+    // per stream: cells [0, v_dirty[s]) may have been written since the last data clear (C68, llama-state-clear.h)
+    std::vector<uint32_t> v_dirty;
+
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
 

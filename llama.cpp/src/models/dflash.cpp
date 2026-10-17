@@ -781,7 +781,8 @@ static ggml_tensor * build_dflash2_conv(
         ggml_tensor * dynamic,
         ggml_tensor * base,
         int side,
-        int64_t n_blocks_override = 0) {
+        int64_t n_blocks_override = 0,
+        ggml_tensor * residual = nullptr) { // != nullptr: returns conv + residual
     const auto & hparams = g.hparams;
     const int64_t hidden_size = hidden->ne[0];
     const int64_t n_tokens    = hidden->ne[1];
@@ -801,6 +802,20 @@ static ggml_tensor * build_dflash2_conv(
     }
     if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
         dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
+    }
+
+    // one fused op instead of the repeat/add/fill/concat/mul/add chain below: the same per-element
+    // operations in the same order (LLAMA_DFLASH2_CONV_FUSED=0 keeps the chain)
+    static const bool fused_env = [] {
+        const char * env = getenv("LLAMA_DFLASH2_CONV_FUSED");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (fused_env && hidden->type == GGML_TYPE_F32 && dynamic->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(base) && base->ne[0] == hidden_size && base->ne[1] == kernel_size && base->ne[2] == 2 &&
+        dynamic->ne[0] == n_groups * kernel_size * 2 &&
+        (residual == nullptr || (residual->type == GGML_TYPE_F32 && ggml_is_contiguous(residual) &&
+                                 ggml_are_same_shape(residual, hidden)))) {
+        return ggml_dflash2_conv(ctx0, hidden, dynamic, base, side, (int) block_size, (int) group_size, residual);
     }
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
@@ -841,7 +856,7 @@ static ggml_tensor * build_dflash2_conv(
         ggml_tensor * term = ggml_mul(ctx0, weight, values);
         result = result ? ggml_add(ctx0, result, term) : term;
     }
-    return result;
+    return residual ? ggml_add(ctx0, result, residual) : result;
 }
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
@@ -908,13 +923,14 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
                 rank, n_pred, n_pos, n_blocks);
 
         ggml_tensor * gate_bcast = ggml_reshape_4d(ctx0, gate_run, rank, 1, n_pos, n_blocks);
-        ggml_tensor * cond  = ggml_mul(ctx0, predecessor, ggml_repeat(ctx0, gate_bcast, predecessor));
+        // broadcast in the binary op (same values as the materialized repeat, one kernel less)
+        ggml_tensor * cond  = ggml_mul(ctx0, predecessor, gate_bcast);
         ggml_tensor * score = ggml_mul_mat(ctx0, successor, cond);
         if (n_pred == 1) {
             score = ggml_repeat_4d(ctx0, score, top_k, top_k, n_pos, n_blocks);
         }
         ggml_tensor * unary_bcast = ggml_reshape_4d(ctx0, unary_run, top_k, 1, n_pos, n_blocks);
-        score = ggml_add(ctx0, score, ggml_repeat(ctx0, unary_bcast, score));
+        score = ggml_add(ctx0, score, unary_bcast);
 
         ggml_tensor * row = ggml_concat(ctx0,
                 ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
@@ -1250,12 +1266,13 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
         }
 
+        // the residual add rides in the output conv when there is one
+        ggml_tensor * ffn_inp = nullptr;
         if (attn_dynamic) {
-            cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1, merged ? 1 : 0);
-            cb(cur, "attn_conv_out", il);
+            ffn_inp = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1, merged ? 1 : 0, inpL);
+        } else {
+            ffn_inp = ggml_add(ctx0, cur, inpL);
         }
-
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
         cb(ffn_inp, "ffn_inp", il);
 
         cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
@@ -1277,11 +1294,10 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(cur, "ffn_out", il);
 
         if (ffn_dynamic) {
-            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 1, merged ? 1 : 0);
-            cb(cur, "ffn_conv_out", il);
+            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 1, merged ? 1 : 0, ffn_inp);
+        } else {
+            cur = ggml_add(ctx0, cur, ffn_inp);
         }
-
-        cur = ggml_add(ctx0, cur, ffn_inp);
         cb(cur, "l_out", il);
 
         inpL = cur;

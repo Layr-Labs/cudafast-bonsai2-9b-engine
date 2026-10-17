@@ -696,12 +696,75 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
+bool llama_context::sched_switch_layer_inp() {
+    if (cparams.embeddings_layer_inp == sched_layer_inp && cparams.embeddings_layer_inp_dev == sched_layer_inp_dev) {
+        return true;
+    }
+
+    logits_materialize();
+    synchronize();
+
+    sched_state cur;
+    cur.layer_inp            = sched_layer_inp;
+    cur.layer_inp_dev        = sched_layer_inp_dev;
+    cur.sched                = std::move(sched);
+    cur.gf_res_prev          = std::move(gf_res_prev);
+    cur.gf_res_reserve       = std::move(gf_res_reserve);
+    cur.graph_slots          = std::move(graph_slots);
+    cur.backend_buf_exp_size = backend_buf_exp_size;
+    graph_slots.clear();
+
+    bool restored = false;
+    for (auto it = sched_parked.begin(); it != sched_parked.end(); ++it) {
+        if (it->layer_inp == cparams.embeddings_layer_inp && it->layer_inp_dev == cparams.embeddings_layer_inp_dev) {
+            sched                = std::move(it->sched);
+            gf_res_prev          = std::move(it->gf_res_prev);
+            gf_res_reserve       = std::move(it->gf_res_reserve);
+            graph_slots          = std::move(it->graph_slots);
+            backend_buf_exp_size = it->backend_buf_exp_size;
+            sched_layer_inp      = it->layer_inp;
+            sched_layer_inp_dev  = it->layer_inp_dev;
+            sched_parked.erase(it);
+            restored = true;
+            break;
+        }
+    }
+
+    sched_parked.push_back(std::move(cur));
+    while (sched_parked.size() > 2) {
+        sched_parked.erase(sched_parked.begin());
+    }
+
+    if (restored) {
+        LLAMA_LOG_INFO("%s: restored the scheduler reserved for this extraction setting\n", __func__);
+    }
+    return restored;
+}
+
 void llama_context::sched_reserve() {
+    // an extraction setting change alone switches to the scheduler state parked for the new setting
+    bool layer_inp_only = false;
+    if (sched_layer_inp_dirty) {
+        sched_layer_inp_dirty = false;
+        if (!sched_need_reserve) {
+            if (sched_switch_layer_inp()) {
+                return;
+            }
+            layer_inp_only     = true;
+            sched_need_reserve = true;
+        }
+    }
+
     if (!sched_need_reserve) {
         return;
     }
 
     sched_need_reserve = false;
+
+    // any other change makes the parked states stale
+    if (!layer_inp_only) {
+        sched_parked.clear();
+    }
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -821,6 +884,9 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    sched_layer_inp     = cparams.embeddings_layer_inp;
+    sched_layer_inp_dev = cparams.embeddings_layer_inp_dev;
 }
 
 void llama_context::synchronize() {
@@ -1501,7 +1567,8 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
-    sched_need_reserve = true;
+    // (sched_reserve restores the state parked for this setting when there is one, else reserves)
+    sched_layer_inp_dirty = true;
 }
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
@@ -4452,6 +4519,10 @@ bool llama_set_logits_topk(llama_context * ctx, int32_t k) {
 
 void llama_set_graph_slots(llama_context * ctx, uint32_t n) {
     ctx->set_graph_slots(n);
+}
+
+void llama_sched_reserve_now(llama_context * ctx) {
+    ctx->sched_reserve();
 }
 
 bool llama_get_logits_topk_ith(llama_context * ctx, int32_t i, const int32_t ** ids, const float ** logits,

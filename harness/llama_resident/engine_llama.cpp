@@ -267,6 +267,17 @@ LlamaEngine::LlamaEngine(const std::string &model_path, const std::string &spec_
         seq_rm_dft_ = common_context_can_seq_rm(ctx_dft_);
         use_ckpt_tgt_ = seq_rm_tgt_ == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
         use_ckpt_dft_ = seq_rm_dft_ == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+        if (dflash_layer_inp_on_) {
+            // Reserve the target scheduler at boot for both target-layer extraction settings (input-independent):
+            // the decode setting the speculative state turned on, then the serial one a timed prefill uses.
+            // A later switch between them restores the reserved state instead of reserving again.
+            llama_sched_reserve_now(ctx_tgt_);
+            for (const uint32_t lid : dflash_target_layers_) {
+                llama_set_embeddings_layer_inp(ctx_tgt_, lid, false);
+            }
+            llama_sched_reserve_now(ctx_tgt_);
+            dflash_layer_inp_on_ = false;
+        }
     }
 
     common_params_sampling sp = base_params_.sampling;
@@ -417,6 +428,16 @@ std::vector<Emit> LlamaEngine::start(const std::vector<int32_t> &tokens) {
     n_past_ = n;
     tokens_ = inp;
     common_speculative_begin(spec_.get(), seq_id_, prompt_tgt_);
+
+    // The drafter's pass over the prompt, queued by common_speculative_process above (DFlash: the
+    // encoder over the prompt rows' target-layer inputs and the drafter K/V of those rows), runs on
+    // the draft context's own stream, which the target synchronize in emit_logits does not wait
+    // for. It is part of this sync's prompt processing, so the reply waits for it: the request
+    // returns with the prompt fully processed. No token is drafted here; the first draft runs in
+    // the first decode cycle.
+    if (ctx_dft_) {
+        llama_synchronize(ctx_dft_);
+    }
 
     Emit first = emit_logits(logits_batch_idx_);
     id_last_ = first.token;

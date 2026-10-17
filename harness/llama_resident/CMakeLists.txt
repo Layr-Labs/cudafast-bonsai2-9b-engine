@@ -71,6 +71,11 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
         target_link_libraries(logits-topk-equivalence PRIVATE ggml)
         add_test(NAME logits-topk-equivalence COMMAND logits-topk-equivalence)
 
+        add_executable(dflash2-conv-equivalence test/dflash2_conv_equivalence.cpp)
+        target_compile_features(dflash2-conv-equivalence PRIVATE cxx_std_17)
+        target_link_libraries(dflash2-conv-equivalence PRIVATE ggml)
+        add_test(NAME dflash2-conv-equivalence COMMAND dflash2-conv-equivalence)
+
         add_executable(conv-front-equivalence test/conv_front_equivalence.cpp)
         target_compile_features(conv-front-equivalence PRIVATE cxx_std_17)
         target_link_libraries(conv-front-equivalence PRIVATE ggml)
@@ -81,6 +86,14 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
         target_link_libraries(token-embd-equivalence PRIVATE ggml)
         add_test(NAME token-embd-equivalence COMMAND token-embd-equivalence
             ${CMAKE_CURRENT_SOURCE_DIR}/../../reference_weights/Ternary-Bonsai-2-9B-gguf/Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf)
+        add_executable(mmf-pair-equivalence test/mmf_pair_equivalence.cu)
+        target_include_directories(mmf-pair-equivalence PRIVATE
+            ${LLAMA_CPP_DIR}/ggml/src
+            ${LLAMA_CPP_DIR}/ggml/src/ggml-cuda)
+        target_compile_definitions(mmf-pair-equivalence PRIVATE
+            $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
+        target_link_libraries(mmf-pair-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        add_test(NAME mmf-pair-equivalence COMMAND mmf-pair-equivalence)
         add_executable(swiglu-fwht-equivalence test/swiglu_fwht_equivalence.cu)
         target_include_directories(swiglu-fwht-equivalence PRIVATE
             ${LLAMA_CPP_DIR}/ggml/src
@@ -89,6 +102,14 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
             $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
         target_link_libraries(swiglu-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
         add_test(NAME swiglu-fwht-equivalence COMMAND swiglu-fwht-equivalence)
+        add_executable(add-rms-fwht-equivalence test/add_rms_fwht_equivalence.cu)
+        target_include_directories(add-rms-fwht-equivalence PRIVATE
+            ${LLAMA_CPP_DIR}/ggml/src
+            ${LLAMA_CPP_DIR}/ggml/src/ggml-cuda)
+        target_compile_definitions(add-rms-fwht-equivalence PRIVATE
+            $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
+        target_link_libraries(add-rms-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        add_test(NAME add-rms-fwht-equivalence COMMAND add-rms-fwht-equivalence)
         add_executable(rms-fwht-equivalence test/rms_fwht_equivalence.cu)
         target_include_directories(rms-fwht-equivalence PRIVATE
             ${LLAMA_CPP_DIR}/ggml/src
@@ -105,6 +126,14 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
             $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
         target_link_libraries(gnorm-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
         add_test(NAME gnorm-fwht-equivalence COMMAND gnorm-fwht-equivalence)
+        add_executable(attn-glue-equivalence test/attn_glue_equivalence.cu)
+        target_include_directories(attn-glue-equivalence PRIVATE
+            ${LLAMA_CPP_DIR}/ggml/src
+            ${LLAMA_CPP_DIR}/ggml/src/ggml-cuda)
+        target_compile_definitions(attn-glue-equivalence PRIVATE
+            $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
+        target_link_libraries(attn-glue-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        add_test(NAME attn-glue-equivalence COMMAND attn-glue-equivalence)
         add_executable(glu-perm-fwht-equivalence test/glu_perm_fwht_equivalence.cu)
         target_include_directories(glu-perm-fwht-equivalence PRIVATE
             ${LLAMA_CPP_DIR}/ggml/src

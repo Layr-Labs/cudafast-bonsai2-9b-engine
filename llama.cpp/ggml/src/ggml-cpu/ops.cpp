@@ -12243,3 +12243,43 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_dflash2_conv
+
+void ggml_compute_forward_dflash2_conv(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * dynamic = dst->src[1];
+    const ggml_tensor * base    = dst->src[2];
+    const ggml_tensor * resid   = dst->src[3];
+
+    const int32_t side       = ggml_get_op_params_i32(dst, 0);
+    const int32_t block_size = ggml_get_op_params_i32(dst, 1);
+    const int32_t group_size = ggml_get_op_params_i32(dst, 2);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t kernel   = base->ne[1];
+    const int64_t n_groups = n_embd / group_size;
+
+    const float * xd = (const float *) x->data;
+    const float * bd = (const float *) base->data + (size_t) side * kernel * n_embd;
+    float       * od = (float *) dst->data;
+
+    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
+        const float * dyn = (const float *) ((const char *) dynamic->data + t * dynamic->nb[1]) + (size_t) side * kernel * n_groups;
+        const int64_t tb  = t % block_size;
+        for (int64_t h = 0; h < n_embd; ++h) {
+            const int64_t g = h / group_size;
+            float acc = 0.0f;
+            for (int64_t k = 0; k < kernel; ++k) {
+                const float w    = dyn[k * n_groups + g] + bd[k * n_embd + h];
+                const float v    = tb >= k ? xd[(t - k) * n_embd + h] : 0.0f;
+                const float term = w * v;
+                acc = k == 0 ? term : acc + term;
+            }
+            od[t * n_embd + h] = resid ? acc + ((const float *) resid->data)[t * n_embd + h] : acc;
+        }
+    }
+}

@@ -1589,7 +1589,21 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    // C74: residual ADD folded into the matmul: add_dst = dst + add_res (same layout as dst), where dst is the
+    // matmul's own output; nullptr = no ADD. Only the GB10 J=128 PQ2_0 kernel folds it (launch_mul_mat_q).
+    const float * add_res = nullptr;
+    float       * add_dst = nullptr;
 };
+
+// C74: the residual ADD after a matmul whose kernel does not fold it, with k_bin_bcast's op_add expression.
+static __global__ void ggml_cuda_mmq_add_residual(const float * dst, const float * res, float * add_dst,
+        const int nrows, const int ncols, const int stride_col) {
+    const int64_t n = (int64_t) nrows*ncols;
+    for (int64_t k = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; k < n; k += (int64_t) gridDim.x*blockDim.x) {
+        const int64_t e = (k / nrows)*stride_col + k % nrows;
+        add_dst[e] = dst[e] + res[e];
+    }
+}
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
@@ -1626,6 +1640,26 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int cc = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
+
+    // C74: a residual ADD is folded only by the GB10 J=128 PQ2_0 kernel; otherwise the plain matmul, then the ADD.
+    if (args.add_res != nullptr) {
+        bool folded = false;
+        if constexpr (type == GGML_TYPE_PQ2_0 && J == 128 && !fallback) {
+            folded = cc == GGML_CUDA_CC_DGX_SPARK && ggml_cuda_mmq_pq2_j128_use(args, nsm);
+        }
+        if (!folded) {
+            mmq_args plain = args;
+            plain.add_res = nullptr;
+            plain.add_dst = nullptr;
+            launch_mul_mat_q<type, J, fallback>(ctx, plain, stream);
+            GGML_ASSERT(args.ids_dst == nullptr && args.nchannels_y == 1 && args.nsamples_y == 1);
+            const int64_t n = args.nrows_x*args.ncols_dst;
+            ggml_cuda_mmq_add_residual<<<(int) std::min<int64_t>((n + 255)/256, 4*1024), 256, 0, stream>>>(
+                args.dst, args.add_res, args.add_dst, (int) args.nrows_x, (int) args.ncols_dst, (int) args.nrows_dst);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
 
     // GB10 J=16 PQ2_0 / Q8_0 weight with a decode layout copy (made at model load, mmq-j16-dl.cuh):
     // bit-exact streaming kernels on the copy.
@@ -1879,7 +1913,8 @@ void ggml_cuda_mul_mat_q(
         ggml_tensor * dst, const ggml_tensor * gate = nullptr,
         const ggml_tensor * norm_weight = nullptr, const ggml_tensor * norm_scale = nullptr,
         void * external_q8 = nullptr, bool quantize_external = true,
-        const float * external_norm_scale = nullptr);
+        const float * external_norm_scale = nullptr,
+        const float * add_res = nullptr, float * add_dst = nullptr);
 
 size_t ggml_cuda_mul_mat_q_q8_size(const ggml_tensor * src0, const ggml_tensor * src1);
 
