@@ -11,14 +11,14 @@
 // strict "largest value below the previous winner" block reductions.
 //
 // Pass 1 splits every row into chunks and writes the k best packed values of
-// each chunk. Pass 2 merges the sorted chunk lists when they fit in one warp,
-// or selects from all candidates otherwise, and writes descending column IDs.
+// each chunk. Pass 2 selects the k best of those candidates per row and writes
+// the column indices in descending order.
 
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define TOPK_SELECT_NT          512
-#define TOPK_SELECT_PER_THREAD  16
+#define TOPK_SELECT_NT          256
+#define TOPK_SELECT_PER_THREAD  32
 #define TOPK_SELECT_CHUNK       (TOPK_SELECT_NT * TOPK_SELECT_PER_THREAD)
 #define TOPK_SELECT_MAX_K       32
 #define TOPK_SELECT_MAX_ROWS    65535
@@ -30,29 +30,14 @@ static __device__ __forceinline__ uint64_t topk_select_pack(const float v, const
     return ((uint64_t) ord << 32) | (uint64_t) (~(uint32_t) col);     // ties: lower column first
 }
 
-// Exact unsigned 64-bit warp maximum using two native 32-bit reductions on
-// Ampere and newer. The low word participates only for lanes matching max_hi.
-static __device__ __forceinline__ uint64_t topk_select_warp_max(uint64_t v) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    const uint32_t hi = (uint32_t) (v >> 32);
-    const uint32_t max_hi = __reduce_max_sync(0xffffffffu, hi);
-    const uint32_t max_lo = __reduce_max_sync(0xffffffffu, hi == max_hi ? (uint32_t) v : 0u);
-    return ((uint64_t) max_hi << 32) | max_lo;
-#else
+// Block-wide maximum. `red` needs TOPK_SELECT_NT/32 + 1 entries; every thread
+// returns the same value and `red` is reusable after return.
+static __device__ __forceinline__ uint64_t topk_select_block_max(uint64_t v, uint64_t * red) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         const uint64_t w = __shfl_xor_sync(0xffffffff, v, offset);
         v = w > v ? w : v;
     }
-    return v;
-#endif
-}
-
-// Block-wide maximum. `red` needs TOPK_SELECT_NT/32 + 1 entries; every thread
-// returns the same value. Repeated uniform calls may immediately reuse `red`:
-// the next call's first barrier protects this call's final result read.
-static __device__ __forceinline__ uint64_t topk_select_block_max(uint64_t v, uint64_t * red) {
-    v = topk_select_warp_max(v);
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     if (lane == 0) {
@@ -61,16 +46,19 @@ static __device__ __forceinline__ uint64_t topk_select_block_max(uint64_t v, uin
     __syncthreads();
     if (warp == 0) {
         v = lane < TOPK_SELECT_NT / 32 ? red[lane] : 0;
-        v = topk_select_warp_max(v);
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const uint64_t w = __shfl_xor_sync(0xffffffff, v, offset);
+            v = w > v ? w : v;
+        }
         if (lane == 0) {
             red[TOPK_SELECT_NT / 32] = v;
         }
     }
     __syncthreads();
-    // Next invocation writes only the disjoint per-warp slots before its
-    // first barrier. That barrier waits for every thread to read this result
-    // before warp 0 can overwrite the result slot in the next invocation.
-    return red[TOPK_SELECT_NT / 32];
+    v = red[TOPK_SELECT_NT / 32];
+    __syncthreads();
+    return v;
 }
 
 // grid (nchunks, nrows); part holds nrows * nchunks * k packed values.
@@ -79,8 +67,6 @@ static __device__ __forceinline__ uint64_t topk_select_block_max(uint64_t v, uin
 static __global__ void __launch_bounds__(TOPK_SELECT_NT)
 topk_select_partial(const float * __restrict__ src, uint64_t * __restrict__ part, const int ncols, const int k) {
     __shared__ uint64_t red[TOPK_SELECT_NT / 32 + 1];
-    __shared__ uint64_t compact[256];
-    __shared__ int compact_count;
 
     const int     row = blockIdx.y;
     const int     beg = blockIdx.x * TOPK_SELECT_CHUNK;
@@ -93,137 +79,24 @@ topk_select_partial(const float * __restrict__ src, uint64_t * __restrict__ part
         v[j] = col < ncols ? topk_select_pack(x[col], col) : 0;
     }
 
-    uint64_t * out = part + ((int64_t) row * gridDim.x + blockIdx.x) * k;
-    uint64_t best = 0;
-#pragma unroll
-    for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
-        best = v[j] > best ? v[j] : best;
-    }
-    // The minimum of NW disjoint warp maxima certifies at least NW keys
-    // at or above that threshold. When k <= NW, lower keys cannot be top-k.
-    // A zero threshold retains every real key. Buffer overflow falls back to
-    // the unchanged exact block selector, with the original registers intact.
-    if (k <= TOPK_SELECT_NT / 32) {
-        const int lane = threadIdx.x % 32;
-        const int warp = threadIdx.x / 32;
-        const uint64_t wmax = topk_select_warp_max(best);
-        if (lane == 0) {
-            red[warp] = wmax;
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            uint64_t threshold = red[0];
-            for (int w = 1; w < TOPK_SELECT_NT / 32; ++w) {
-                threshold = red[w] < threshold ? red[w] : threshold;
-            }
-            red[TOPK_SELECT_NT / 32] = threshold;
-            compact_count = 0;
-        }
-        __syncthreads();
-        const uint64_t threshold = red[TOPK_SELECT_NT / 32];
-        int count = 0;
-#pragma unroll
-        for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
-            count += v[j] != 0 && v[j] >= threshold;
-        }
-        int prefix = count;
-#pragma unroll
-        for (int d = 1; d < 32; d *= 2) {
-            const int prev = __shfl_up_sync(0xffffffff, prefix, d);
-            if (lane >= d) {
-                prefix += prev;
-            }
-        }
-        const int total = __shfl_sync(0xffffffff, prefix, 31);
-        int base = lane == 0 ? atomicAdd(&compact_count, total) : 0;
-        base = __shfl_sync(0xffffffff, base, 0) + prefix - count;
-#pragma unroll
-        for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
-            if (v[j] != 0 && v[j] >= threshold) {
-                if (base < 256) {
-                    compact[base] = v[j];
-                }
-                ++base;
-            }
-        }
-        __syncthreads();
-        if (compact_count <= 256) {
-            if (warp == 0) {
-                best = 0;
-#pragma unroll
-                for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
-                    const int i = j * 32 + lane;
-                    v[j] = i < compact_count ? compact[i] : 0;
-                    best = v[j] > best ? v[j] : best;
-                }
-                for (int r = 0; r < k; ++r) {
-                    const uint64_t winner = topk_select_warp_max(best);
-                    if (lane == 0) {
-                        out[r] = winner;
-                    }
-                    if (r + 1 < k && best == winner) {
-                        best = 0;
-#pragma unroll
-                        for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
-                            const uint64_t c = v[j];
-                            if (c < winner && c > best) {
-                                best = c;
-                            }
-                        }
-                    }
-                }
-            }
-            return;
-        }
-    }
-
+    uint64_t * out  = part + ((int64_t) row * gridDim.x + blockIdx.x) * k;
+    uint64_t   prev = 0;
     for (int r = 0; r < k; ++r) {
-        const uint64_t winner = topk_select_block_max(best, red);
-        if (threadIdx.x == 0) {
-            out[r] = winner;
-        }
-        // Every non-padding key contains a unique column ID. Only the owner
-        // of the winner needs a new local maximum. Other maxima remain valid.
-        // Multiple owners of zero padding all correctly remain zero.
-        if (r + 1 < k && best == winner) {
-            best = 0;
+        uint64_t best = 0;
 #pragma unroll
-            for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
-                const uint64_t c = v[j];
-                if (c < winner && c > best) {
-                    best = c;
-                }
+        for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
+            const uint64_t c = v[j];
+            if ((r == 0 || c < prev) && c > best) {
+                best = c;
             }
+        }
+        prev = topk_select_block_max(best, red);
+        if (threadIdx.x == 0) {
+            out[r] = prev;
         }
     }
 }
 
-// Up to 32 sorted chunk lists: one lane owns each list and only its current
-// head can win. Advancing the winning lane preserves the exact k-way merge.
-// All lanes participate in every reduction, including zero-padding lanes.
-static __global__ void __launch_bounds__(32)
-topk_select_merge_warp(const uint64_t * __restrict__ part, int * __restrict__ dst, const int nchunks, const int k) {
-    const int lane = threadIdx.x;
-    const int row  = blockIdx.x;
-    const uint64_t * p = part + (int64_t) row * nchunks * k;
-
-    int pos = 0;
-    uint64_t head = lane < nchunks ? p[lane * k] : 0;
-    for (int r = 0; r < k; ++r) {
-        const uint64_t winner = topk_select_warp_max(head);
-        if (lane == 0) {
-            dst[(int64_t) row * k + r] = (int) ~(uint32_t) winner;
-        }
-        // Packed real keys are unique and nonzero; only the winning list
-        // advances. Never read beyond its k entries, including the last rank.
-        if (r + 1 < k && head == winner) {
-            ++pos;
-            head = pos < k ? p[lane * k + pos] : 0;
-        }
-    }
-}
-
-// General fallback for more than 32 chunk lists.
 // grid (nrows); writes k column indices per row in descending key order.
 static __global__ void __launch_bounds__(TOPK_SELECT_NT)
 topk_select_merge(const uint64_t * __restrict__ part, int * __restrict__ dst, const int nchunks, const int k) {
@@ -264,9 +137,5 @@ static inline void topk_select_launch(const float * src, int * dst, uint64_t * s
                                       const int nrows, const int k, cudaStream_t stream) {
     const int nchunks = (ncols + TOPK_SELECT_CHUNK - 1) / TOPK_SELECT_CHUNK;
     topk_select_partial<<<dim3(nchunks, nrows, 1), TOPK_SELECT_NT, 0, stream>>>(src, scratch, ncols, k);
-    if (nchunks <= 32) {
-        topk_select_merge_warp<<<dim3(nrows, 1, 1), 32, 0, stream>>>(scratch, dst, nchunks, k);
-    } else {
-        topk_select_merge<<<dim3(nrows, 1, 1), TOPK_SELECT_NT, 0, stream>>>(scratch, dst, nchunks, k);
-    }
+    topk_select_merge<<<dim3(nrows, 1, 1), TOPK_SELECT_NT, 0, stream>>>(scratch, dst, nchunks, k);
 }
