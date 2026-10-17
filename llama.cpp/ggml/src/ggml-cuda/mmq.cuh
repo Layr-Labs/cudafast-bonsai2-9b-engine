@@ -1438,13 +1438,36 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
+// Exact floor(b * total / grid), with a bounded remainder multiply on common grids.
+struct ggml_cuda_mmq_partition {
+    uint3 grid_fd;
+    uint32_t quotient;
+    uint32_t remainder;
+};
+
+static __host__ ggml_cuda_mmq_partition ggml_cuda_mmq_partition_init(const uint64_t total, const uint32_t grid) {
+    // b <= grid and remainder < grid, so the numerator is below 2^30.
+    if (grid > 0 && grid <= 32768 && total < (uint64_t{1} << 30)) {
+        return {init_fastdiv_values(grid), (uint32_t) (total/grid), (uint32_t) (total%grid)};
+    }
+    return {};
+}
+
+static __device__ __forceinline__ int ggml_cuda_mmq_partition_start(
+        const uint32_t b, const uint32_t total, const uint32_t grid, const ggml_cuda_mmq_partition part) {
+    if (part.grid_fd.z != 0) {
+        return b*part.quotient + fastdiv(b*part.remainder, part.grid_fd);
+    }
+    return (int) ((int64_t) b*total/grid);
+}
+
 template <ggml_type type, int J, bool fallback>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
         float * tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
-        const int stride_sample_dst, const uint3 ntx) {
+        const int stride_sample_dst, const uint3 ntx, const ggml_cuda_mmq_partition partition) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     // Programmatic stream serialization on GB10 (launch_mul_mat_q): the partial sums in tmp_last_tile and
     // dst are written by the mul_mat_q kernel this launch follows.
@@ -1466,8 +1489,9 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int bidx0 = blockIdx.x;
 
     // kbc == k block continuous, current index in continuous ijk space.
-    int kbc0      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
-    int kbc0_stop = int64_t(blockIdx.x + 1)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+    const uint32_t total_kbc = nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z;
+    int kbc0      = ggml_cuda_mmq_partition_start(blockIdx.x,     total_kbc, gridDim.x, partition);
+    int kbc0_stop = ggml_cuda_mmq_partition_start(blockIdx.x + 1, total_kbc, gridDim.x, partition);
 
     kbc0      -= fastmodulo(kbc0,      blocks_per_ne00) % blocks_per_iter;
     kbc0_stop -= fastmodulo(kbc0_stop, blocks_per_ne00) % blocks_per_iter;
@@ -1486,7 +1510,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     int bidx = bidx0 - 1;
     int kbc_stop = kbc0;
     while(true) {
-        int kbc = int64_t(bidx)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+        int kbc = ggml_cuda_mmq_partition_start(bidx, total_kbc, gridDim.x, partition);
         kbc -= fastmodulo(kbc, blocks_per_ne00) % blocks_per_iter;
 
         if (kbc == kbc_stop) { // Did not have any data.
@@ -1776,7 +1800,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     mmq_launch_kernel(cc, mul_mat_q_stream_k_fixup<type, J, fallback>, block_nums_fixup, block_dims_fixup, 0, stream,
          args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd,
+            ggml_cuda_mmq_partition_init((uint64_t) ntiles_dst*blocks_per_ne00_fd.z, block_nums_stream_k.x));
 }
 
 template <ggml_type type, bool fallback>
