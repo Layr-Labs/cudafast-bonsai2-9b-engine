@@ -842,6 +842,25 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
     // 16 v columns, g and beta are copied to shared memory up front (cp.async, overlapping the state load).
     constexpr int TOK_SM = S_v + 16 + 4;
     __shared__ __align__(16) float stage[GDN_L8V_MAX_TOKENS][TOK_SM];
+    // Query rows are consumed only by the recurrence, never the lazy record. Stage half
+    // the verification block at a time to keep six resident CTAs per Spark SM.
+    constexpr int Q_CH = 8;
+    __shared__ __align__(16) float q_stage[Q_CH][S_v];
+    const auto stage_queries = [&](const int t0) {
+        const int tid = threadIdx.y * 32 + lane;
+        const int pos = ((tid / 32) * 8 + tid % 8) * 4 + (tid % 32) / 8;
+        const float * q_src = q + iq3 * sq3 + iq1 * sq1 + tid;
+#pragma unroll
+        for (int tt = 0; tt < Q_CH; ++tt) {
+            if (t0 + tt < n_tokens) {
+                const unsigned int dst_q = (unsigned int) __cvta_generic_to_shared(&q_stage[tt][pos]);
+                const float * src_q = q_src + (t0 + tt) * sq2;
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(dst_q), "l"(src_q));
+            }
+        }
+        asm volatile("cp.async.commit_group;");
+    };
+    stage_queries(0);
     {
         const int tid = threadIdx.y * 32 + lane;
         const float * k_base  = k + iq3 * sq3 + iq1 * sq1;
@@ -985,7 +1004,13 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
         if (t >= n_tokens) {
             break;
         }
-        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        if (t == Q_CH) {
+            // Every warp is done with the first chunk before its storage is reused.
+            __syncthreads();
+            stage_queries(Q_CH);
+            asm volatile("cp.async.wait_all;");
+            __syncthreads();
+        }
         const float * tok_sm = stage[t];
 
         const float beta_val = __shfl_sync(0xffffffff, beta_lane, t, 32);
@@ -998,11 +1023,9 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
             kr[0*4 + r] = k4.x; kr[1*4 + r] = k4.y; kr[2*4 + r] = k4.z; kr[3*4 + r] = k4.w;
         }
 #pragma unroll
-        for (int m = 0; m < 4; ++m) {
-#pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                qr[m*4 + r] = q_t[r * 32 + n + 8 * m];
-            }
+        for (int r = 0; r < 4; ++r) {
+            const float4 q4 = *(const float4 *) &q_stage[t % Q_CH][(r * 8 + n) * 4];
+            qr[0*4 + r] = q4.x; qr[1*4 + r] = q4.y; qr[2*4 + r] = q4.z; qr[3*4 + r] = q4.w;
         }
         const float v_col = tok_sm[S_v + threadIdx.y * 4 + grp];
 
