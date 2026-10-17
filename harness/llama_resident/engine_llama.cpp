@@ -19,7 +19,11 @@ static void sampler_unique_free(common_sampler *p) {
 
 class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
   public:
-    explicit LlamaSpeculativeRoundBackend(LlamaEngine *eng) : eng_(eng) {}
+    explicit LlamaSpeculativeRoundBackend(LlamaEngine *eng) : eng_(eng) {
+        verify_batch_ = llama_batch_init(eng_->depth_ + 1, 0, 1);
+    }
+
+    ~LlamaSpeculativeRoundBackend() override { llama_batch_free(verify_batch_); }
 
     int depth() const override { return eng_->depth_; }
 
@@ -79,21 +83,18 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
     }
 
     void verify_decode(SpeculativeRoundState &st) override {
-        llama_batch batch_tgt = llama_batch_init(llama_n_batch(eng_->ctx_tgt_), 0, 1);
-        common_batch_clear(batch_tgt);
-        common_batch_add(batch_tgt, *st.id_last, (*st.n_past)++, {eng_->seq_id_}, true);
+        common_batch_clear(verify_batch_);
+        common_batch_add(verify_batch_, *st.id_last, (*st.n_past)++, {eng_->seq_id_}, true);
         for (size_t i = 0; i < st.draft->size(); ++i) {
-            common_batch_add(batch_tgt, (*st.draft)[i], *st.n_past + static_cast<int>(i), {eng_->seq_id_}, true);
+            common_batch_add(verify_batch_, (*st.draft)[i], *st.n_past + static_cast<int>(i), {eng_->seq_id_}, true);
         }
         const bool on_device = draft_on_device_ && !st.draft->empty();
         draft_on_device_ = false;
         if (on_device && !llama_set_token_import_dflash_walk(eng_->ctx_tgt_, eng_->ctx_dft_, 1,
                                                              static_cast<int32_t>(st.draft->size()))) {
-            llama_batch_free(batch_tgt);
             throw std::runtime_error("DFlash2 device walk import failed");
         }
-        if (llama_decode(eng_->ctx_tgt_, batch_tgt) != 0) {
-            llama_batch_free(batch_tgt);
+        if (llama_decode(eng_->ctx_tgt_, verify_batch_) != 0) {
             throw std::runtime_error("speculative verify decode failed");
         }
         if (on_device) {
@@ -102,19 +103,18 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
             std::vector<int32_t> walk(static_cast<size_t>(eng_->depth_) + 1);
             const int32_t n_walk = llama_get_dflash_walk(eng_->ctx_dft_, walk.data(), static_cast<int32_t>(walk.size()));
             if (n_walk < static_cast<int32_t>(st.draft->size())) {
-                llama_batch_free(batch_tgt);
                 throw std::runtime_error("DFlash2 device walk returned too few ids");
             }
             for (size_t i = 0; i < st.draft->size(); ++i) {
                 (*st.draft)[i] = walk[i];
-                batch_tgt.token[i + 1] = walk[i];
+                verify_batch_.token[i + 1] = walk[i];
             }
         }
-        if (!common_speculative_process(eng_->spec_.get(), batch_tgt)) {
-            llama_batch_free(batch_tgt);
+        // Defer DFlash feature injection until the committed prefix is known.
+        // A checkpoint retry does not consume features from its failed attempt.
+        if (eng_->spec_mode_ != "dflash" && !common_speculative_process(eng_->spec_.get(), verify_batch_)) {
             throw std::runtime_error("speculative process failed");
         }
-        llama_batch_free(batch_tgt);
     }
 
   private:
@@ -163,6 +163,16 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
     }
 
     void accept_spec_prefix(size_t n_draft_accepted) override {
+        if (eng_->spec_mode_ == "dflash") {
+            // The correction/bonus is next round's anchor, not a verified input.
+            if (n_draft_accepted + 1 > static_cast<size_t>(verify_batch_.n_tokens)) {
+                throw std::runtime_error("accepted DFlash prefix exceeds verify batch");
+            }
+            verify_batch_.n_tokens = static_cast<int32_t>(n_draft_accepted + 1);
+            if (!common_speculative_process(eng_->spec_.get(), verify_batch_)) {
+                throw std::runtime_error("accepted DFlash prefix process failed");
+            }
+        }
         common_speculative_accept(eng_->spec_.get(), eng_->seq_id_, n_draft_accepted);
     }
 
@@ -182,6 +192,7 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
     static void sampler_ptr_free(void *p) { sampler_unique_free(static_cast<common_sampler *>(p)); }
 
     LlamaEngine *eng_;
+    llama_batch verify_batch_{};
     llama_tokens greedy_accept_ids_;
     std::vector<Emit> verify_emits_;
 };
