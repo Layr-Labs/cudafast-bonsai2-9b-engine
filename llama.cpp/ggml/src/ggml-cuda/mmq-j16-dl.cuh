@@ -22,8 +22,16 @@
 // partition and tmp_fixup layout, and the same per-element accumulation (sum += cf*dA*dB for every
 // 32-value sub-block in increasing K). Only the weight addresses and the L2 prefetch pattern differ,
 // so the results are bit-identical to mul_mat_q<type, 16, false> (+ mul_mat_q_stream_k_fixup).
+//
+// PTQ1_0 groups (C51): a PQ2_0 weight whose 2-bit codes are all in {0, 1, 2} gets, in the same TM order,
+// 28-byte PTQ1_0 groups instead of its 34-byte PQ2_0 blocks: each block is re-encoded at load with the
+// fork's PTQ1_0 trit codec from the same codes and the same fp16 d bits, which preserves every value
+// exactly (mmq-ptq1-j16.cuh), and verified by decoding it back. mul_mat_q_ptq1_j16_dl reads them with the
+// PTQ1_0 operand code of mmq-ptq1-j16.cuh (same int32 dot products, same epilogue and order) and the
+// work partition, stores and prefetch of mul_mat_q_pq2_j16_dl. A tensor with a code 3 keeps PQ2_0 groups.
 
 #include "mmq-pq2-j16.cuh"
+#include "mmq-ptq1-j16.cuh"
 
 #define GGML_CUDA_DL_TM 0
 #define GGML_CUDA_DL_WM 1
@@ -273,6 +281,88 @@ static __global__ void mul_mat_q_pq2_j16_dl(
 }
 
 // ---------------------------------------------------------------------------------------------
+// PTQ1_0 groups of a PQ2_0 weight (C51)
+
+template <int LAYOUT, int HMODE, int CH>
+static __device__ __forceinline__ void ggml_cuda_dl_ptq1_segment(
+        float (&sum)[1][4], const char * __restrict__ xr, const char * yb, const int y_step_bytes, const int ns,
+        ggml_cuda_dl_hint<LAYOUT, HMODE, (int) sizeof(block_ptq1_0), CH> & hs, const int c) {
+    constexpr int GB = sizeof(block_ptq1_0);
+    constexpr int xs = LAYOUT == GGML_CUDA_DL_TM ? 128*GB : 8*GB;
+    ggml_cuda_ptq1_j16_stage st0;
+    ggml_cuda_ptq1_j16_stage st1;
+    if (ns > 0) {
+        ggml_cuda_ptq1_j16_load(st0, xr, yb, c);
+    }
+    for (int k = 0; k < ns; k += 2) {
+        hs.step();
+        if (k + 1 < ns) {
+            ggml_cuda_ptq1_j16_load(st1, xr + xs, yb + y_step_bytes, c);
+        }
+        ggml_cuda_ptq1_j16_compute(sum, st0, c);
+        if (k + 1 >= ns) {
+            break;
+        }
+        hs.step();
+        if (k + 2 < ns) {
+            ggml_cuda_ptq1_j16_load(st0, xr + 2*xs, yb + 2*y_step_bytes, c);
+        }
+        ggml_cuda_ptq1_j16_compute(sum, st1, c);
+        xr += 2*xs;
+        yb += 2*y_step_bytes;
+    }
+}
+
+// mul_mat_q_pq2_j16_dl for a copy with PTQ1_0 groups: same arguments, partition, stacking and PDL.
+template <int LAYOUT, int HMODE, int HD, int CH>
+__launch_bounds__(16*32, 1)
+static __global__ void mul_mat_q_ptq1_j16_dl(
+        const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
+        const int nrows_x, const int nkb, const int ncols_y, const int stride_col_dst, const int ncols_dst,
+        const int mode, float * dst_hi, const int nrows_lo) {
+    constexpr int GB = sizeof(block_ptq1_0);
+    constexpr int I  = 128;
+    constexpr int J  = 16;
+    const int nst = nkb;
+    const int nty = nrows_x / I;
+    int it, st, rem, tile_inc;
+    ggml_cuda_dl_work<1, MMQ_ITER_K / QK_PQ2_0>(it, st, rem, tile_inc, nty, nkb, mode);
+
+    const int w = threadIdx.y;
+    const int g = threadIdx.x / 4;
+    const int c = threadIdx.x % 4;
+
+    ggml_cuda_dl_hint<LAYOUT, HMODE, GB, CH> hs;
+    hs.init(x, it, st, rem, nst, w, tile_inc);
+    hs.template prologue<HD>();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+#endif
+    const int y_step_bytes = ncols_y*(int) sizeof(block_q8_1_mmq);
+    while (rem > 0) {
+        const int ns = min(nst - st, rem);
+        const char * xr = ggml_cuda_dl_group<LAYOUT, GB>(x, it, st, nst, w, g);
+        const char * yb = (const char *) y + (int64_t) st*y_step_bytes + g*(int) sizeof(block_q8_1_mmq);
+        float sum[1][4] = {{0.0f}};
+        ggml_cuda_dl_ptq1_segment<LAYOUT, HMODE, CH>(sum, xr, yb, y_step_bytes, ns, hs, c);
+        if (st + ns == nst) {
+            const int row = it*I + w*8;
+            if (row < nrows_lo) {
+                ggml_cuda_pq2_j16_store<1>(sum, dst, row, stride_col_dst, ncols_dst - 1);
+            } else {
+                ggml_cuda_pq2_j16_store<1>(sum, dst_hi, row - nrows_lo, stride_col_dst, ncols_dst - 1);
+            }
+        } else {
+            ggml_cuda_pq2_j16_store<1>(sum, tmp_fixup + (int64_t) blockIdx.x*(J*I), w*8, I, J - 1);
+        }
+        rem -= ns;
+        st = 0;
+        it += tile_inc;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Q8_0 (the C39 operand code: one step = 4 Q8_0 blocks of the warp's 8 rows, lane row g, ints 2c, 2c+1)
 
 struct ggml_cuda_dl_q8_xstage {
@@ -438,14 +528,9 @@ static __global__ void mul_mat_q_q8_0_j16_dl(
 // Repack: dst[decode index] = src[original index], one thread per block of BB bytes (BB even), copied as
 // halfwords. G = blocks per group (PQ2_0: 1 x 34 B, Q8_0: 4 x 34 B, PTQ1_0: 1 x 28 B). The source is a
 // contiguous [row][block] matrix with nkb blocks per row (nkb % G == 0, nrows % 128 == 0).
-template <int LAYOUT, int G, int BB>
-static __global__ void ggml_cuda_dl_repack_kernel(const char * __restrict__ src, char * __restrict__ dst, const int nrows, const int nkb) {
-    static_assert(BB % 2 == 0, "block size");
-    const int64_t d    = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    const int64_t nblk = (int64_t) nrows*nkb;
-    if (d >= nblk) {
-        return;
-    }
+// Original [row][block] index of the block at decode layout index d.
+template <int LAYOUT, int G>
+static __device__ __forceinline__ int64_t ggml_cuda_dl_src_index(const int64_t d, const int nkb) {
     const int nst = nkb / G;
     const int s   = (int) (d % G);
     int64_t   q   = d / G;
@@ -463,12 +548,57 @@ static __global__ void ggml_cuda_dl_repack_kernel(const char * __restrict__ src,
         const int64_t it = q / 16;
         row = it*128 + w*8 + r8;
     }
-    const int64_t sidx = (row*nst + st)*G + s;
+    return (row*nst + st)*G + s;
+}
+
+template <int LAYOUT, int G, int BB>
+static __global__ void ggml_cuda_dl_repack_kernel(const char * __restrict__ src, char * __restrict__ dst, const int nrows, const int nkb) {
+    static_assert(BB % 2 == 0, "block size");
+    const int64_t d    = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t nblk = (int64_t) nrows*nkb;
+    if (d >= nblk) {
+        return;
+    }
+    const int64_t sidx = ggml_cuda_dl_src_index<LAYOUT, G>(d, nkb);
     const uint16_t * ps = (const uint16_t *) (src + sidx*BB);
     uint16_t       * pd = (uint16_t       *) (dst + d*BB);
 #pragma unroll
     for (int k = 0; k < BB/2; ++k) {
         pd[k] = ps[k];
+    }
+}
+
+// Repack of a PQ2_0 matrix into PTQ1_0 groups (C51): group d = the PTQ1_0 encoding of the original block
+// (ggml_cuda_ptq1_encode_block: fork codec, same codes, same d bits, decoded back and compared). *fail != 0
+// if any block has a code 3 or does not round-trip; the caller then keeps PQ2_0 groups.
+template <int LAYOUT>
+static __global__ void ggml_cuda_dl_repack_ptq1_kernel(const char * __restrict__ src, char * __restrict__ dst, const int nrows,
+                                                       const int nkb, unsigned int * fail) {
+    const int64_t d    = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t nblk = (int64_t) nrows*nkb;
+    if (d >= nblk) {
+        return;
+    }
+    const int64_t sidx = ggml_cuda_dl_src_index<LAYOUT, 1>(d, nkb);
+    uint32_t o[7];
+    if (!ggml_cuda_ptq1_encode_block((const uint16_t *) (src + sidx*(int64_t) sizeof(block_pq2_0)), o)) {
+        atomicOr(fail, 1u);
+    }
+    uint32_t * pd = (uint32_t *) (dst + d*(int64_t) sizeof(block_ptq1_0));
+#pragma unroll
+    for (int k = 0; k < 7; ++k) {
+        pd[k] = o[k];
+    }
+}
+
+static void ggml_cuda_dl_repack_ptq1(const char * src, char * dst, const int nrows, const int nkb, const int layout,
+                                     unsigned int * fail, cudaStream_t stream) {
+    const int64_t nblk = (int64_t) nrows*nkb;
+    const dim3 grid((unsigned) ((nblk + 255) / 256));
+    if (layout == GGML_CUDA_DL_TM) {
+        ggml_cuda_dl_repack_ptq1_kernel<GGML_CUDA_DL_TM><<<grid, 256, 0, stream>>>(src, dst, nrows, nkb, fail);
+    } else {
+        ggml_cuda_dl_repack_ptq1_kernel<GGML_CUDA_DL_WM><<<grid, 256, 0, stream>>>(src, dst, nrows, nkb, fail);
     }
 }
 
@@ -490,14 +620,17 @@ static void ggml_cuda_dl_repack(const char * src, char * dst, const int nrows, c
 // ggml-cuda.cu -> ggml_cuda_dl_register, mmq.cu) for every eligible PQ2_0 / Q8_0 weight; the original
 // tensors stay in place and every other path (prefill MMQ, MMVQ, get_rows, ...) keeps reading them.
 // launch_mul_mat_q<type, 16, false> looks the weight up by its data pointer and, when the call is the
-// full matrix (no views, channels, ids), runs the streaming kernel on the copy.
+// full matrix or a view of its leading rows (no channels, ids), runs the streaming kernel on the copy.
+// TM keeps the tiles in row order, so the first nrows_x/128 tiles of the copy are exactly the view's
+// rows: a leading-row view (e.g. the DFlash2 drafter's range of the LM head) reads a prefix of the copy.
 
 struct ggml_cuda_dl_entry {
-    const char * src;   // original weight data (lookup key)
-    char       * dl;    // decode layout (TM) copy
+    const char * src;     // original weight data (lookup key)
+    char       * dl;      // decode layout (TM) copy
     int64_t      nrows;
     int64_t      ncols;
     ggml_type    type;
+    ggml_type    dl_type; // group format of the copy: type, or GGML_TYPE_PTQ1_0 for a PQ2_0 weight (C51)
 };
 
 // mmq.cu
@@ -509,7 +642,7 @@ static bool ggml_cuda_mmq_dl_supported(const mmq_args & args, const ggml_cuda_dl
     const int64_t qk = e.type == GGML_TYPE_PQ2_0 ? QK_PQ2_0 : QK8_0;
     return args.type_x == e.type && args.ids_dst == nullptr && args.expert_bounds == nullptr && args.y_scale == nullptr &&
         args.nchannels_x == 1 && args.nchannels_y == 1 && args.nsamples_x == 1 && args.nsamples_y == 1 &&
-        args.nrows_x == e.nrows && args.ncols_x == e.ncols && args.stride_row_x == e.ncols/qk &&
+        args.nrows_x <= e.nrows && args.ncols_x == e.ncols && args.stride_row_x == e.ncols/qk &&
         args.nrows_x % 128 == 0 && args.ncols_x % MMQ_ITER_K == 0 &&
         args.ncols_dst >= 1 && args.ncols_dst <= 16 && args.ncols_max == args.ncols_dst &&
         args.nrows_dst % 2 == 0 && (uintptr_t) args.dst % 8 == 0 && (uintptr_t) args.y % 16 == 0 &&
@@ -546,7 +679,17 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
     const bool tiling = grid == ntiles;
     if constexpr (type == GGML_TYPE_PQ2_0) {
         const int64_t bytes = args.nrows_x*nkb*(int64_t) sizeof(block_pq2_0);
-        if (tiling && ntiles > 4*nsm) {
+        if (e.dl_type == GGML_TYPE_PTQ1_0) {
+            // PTQ1_0 groups (C51). Prefetch from the c51 microbenchmark: CTA bulk prefetch, 16 steps in chunks
+            // of 8 for many waves of pure tiling (the LM head), 3 steps ahead for every other shape.
+            if (tiling && ntiles > 4*nsm) {
+                static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
+                ggml_cuda_mmq_dl_launch(mul_mat_q_ptq1_j16_dl<TM, GGML_CUDA_DL_H_CBULK, 16, 8>, attr, args, e, grid, 1, nkb, tmp_fixup, stream);
+            } else {
+                static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
+                ggml_cuda_mmq_dl_launch(mul_mat_q_ptq1_j16_dl<TM, GGML_CUDA_DL_H_CBULK, 3, 1>, attr, args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+            }
+        } else if (tiling && ntiles > 4*nsm) {
             static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
             ggml_cuda_mmq_dl_launch(mul_mat_q_pq2_j16_dl<TM, GGML_CUDA_DL_H_CBULK, 16, 8>, attr, args, e, grid, 1, nkb, tmp_fixup, stream);
         } else if (tiling || bytes >= (int64_t(8) << 20)) {
