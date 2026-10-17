@@ -715,6 +715,44 @@ static __host__ __device__ constexpr size_t ggml_cuda_dl_ring_smem(const int S) 
     return (size_t) S*ggml_cuda_dl_ring_stage_bytes<FMT, SPS>() + (size_t) S*sizeof(uint64_t);
 }
 
+// Signed PTQ ring step with the same decoded words, MMA and float update order.
+// Keep activation operands local to a sub-block instead of loading all 32 ints
+// into a stage object before computing the first sub-block.
+static __device__ __forceinline__ void ggml_cuda_dl_ptq1_step_live(
+        float (&sum)[1][4], const char * sx, const char * sy, const int c) {
+    const uint32_t * xw = (const uint32_t *) sx;
+    ggml_cuda_ptq1_j16_stage st;
+    st.wa = xw[c]; st.wb = xw[4 + (c & 1)]; st.w6 = xw[6];
+    const int xd = (int) (st.w6 >> 16);
+    const float dA[2] = {
+        __half2float(__ushort_as_half((unsigned short) __shfl_sync(0xFFFFFFFF, xd, 8*c))),
+        __half2float(__ushort_as_half((unsigned short) __shfl_sync(0xFFFFFFFF, xd, 8*c+4))),
+    };
+    const float4 yd0 = *(const float4 *) sy;
+    const float4 yd1 = *(const float4 *) (sy + 8*sizeof(block_q8_1_mmq));
+    const float dB[2][4] = {{yd0.x,yd0.y,yd0.z,yd0.w},{yd1.x,yd1.y,yd1.z,yd1.w}};
+    uint32_t b[4][2]; ggml_cuda_ptq1_j16_decode(b,st,c);
+#pragma unroll
+    for (int sub=0; sub<4; ++sub) {
+        int ya[2][2];
+#pragma unroll
+        for (int h=0; h<2; ++h) {
+            const char * p = sy + h*8*sizeof(block_q8_1_mmq) + 4*sizeof(float) + 32*sub + 4*c;
+            ya[h][0] = *(const volatile int *) p;
+            ya[h][1] = *(const volatile int *) (p+16);
+        }
+        const int b0=(int) ((b[sub][0]+0x7F7F7F7Fu)^0x80808080u);
+        const int b1=(int) ((b[sub][1]+0x7F7F7F7Fu)^0x80808080u);
+        int C[4]={GGML_CUDA_PQ2_J16_MAGIC,GGML_CUDA_PQ2_J16_MAGIC,GGML_CUDA_PQ2_J16_MAGIC,GGML_CUDA_PQ2_J16_MAGIC};
+        ggml_cuda_pq2_j16_mma(C,ya[0][0],ya[1][0],ya[0][1],ya[1][1],b0,b1);
+#pragma unroll
+        for(int l=0;l<4;++l) {
+            const float cf=__int_as_float(C[l])-12582912.0f;
+            sum[0][l]+=cf*dA[l%2]*dB[l/2][sub];
+        }
+    }
+}
+
 // Operands of one step of lane (g, c) of warp w from a stage, accumulated into sum (the DL kernels' calls).
 template <int FMT>
 static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4], const char * sx, const char * sy, const int c) {
@@ -722,7 +760,9 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
         ggml_cuda_pq2_j16_stage<1> st;
         ggml_cuda_pq2_j16_load<1>(st, sx, (int) sizeof(block_pq2_0), sy, c);
         ggml_cuda_pq2_j16_compute<1>(sum, st, c);
-    } else if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1 || FMT == GGML_CUDA_DL_FMT_PTQ1S) {
+    } else if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1S) {
+        ggml_cuda_dl_ptq1_step_live(sum, sx, sy, c);
+    } else if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1) {
         ggml_cuda_ptq1_j16_stage st;
         ggml_cuda_ptq1_j16_load(st, sx, sy, c);
         ggml_cuda_ptq1_j16_compute<FMT == GGML_CUDA_DL_FMT_PTQ1S>(sum, st, c);
