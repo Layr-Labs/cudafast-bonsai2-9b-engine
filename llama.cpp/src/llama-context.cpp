@@ -705,6 +705,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
+    logits_materialize();
     synchronize();
 
     const int64_t t_start_us = ggml_time_us();
@@ -923,6 +924,8 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
+        logits_materialize();
+
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
@@ -960,6 +963,7 @@ enum llama_pooling_type llama_context::pooling_type() const {
 
 float * llama_context::get_logits() {
     output_reorder();
+    logits_materialize();
 
     return logits.data;
 }
@@ -995,6 +999,7 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
 
 float * llama_context::get_logits_ith(int32_t i) {
     output_reorder();
+    logits_materialize();
 
     try {
         if (logits.data == nullptr) {
@@ -1011,6 +1016,58 @@ float * llama_context::get_logits_ith(int32_t i) {
         return nullptr;
 #endif
     }
+}
+
+bool llama_context::set_logits_topk(int32_t k) {
+    LLAMA_LOG_DEBUG("%s: k = %d\n", __func__, k);
+
+    // the ordering contract is that of the CUDA streaming selection (ggml_cuda_op_top_k takes it
+    // for k <= 32 on rows wider than 1024)
+    ggml_backend_dev_t dev = model.dev_output();
+    const bool on_cuda = dev && std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0;
+    if (k < 0 || k > 32 || (k > 0 && (!on_cuda || model.vocab.n_tokens() <= 1024))) {
+        return false;
+    }
+
+    cparams.logits_topk = (uint32_t) k;
+
+    sched_need_reserve = true;
+
+    return true;
+}
+
+bool llama_context::get_logits_topk_ith(int32_t i, const int32_t ** ids, const float ** vals, const float ** head) {
+    output_reorder();
+
+    if (!logits_topk_ready) {
+        return false;
+    }
+
+    try {
+        const int64_t j = output_resolve_row(i);
+        const int64_t k = cparams.logits_topk;
+
+        *ids  = logits_topk_ids.data  + j*k;
+        *vals = logits_topk_vals.data + j*k;
+        *head = logits_topk_head.data + j*k;
+
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
+        return false;
+    }
+}
+
+void llama_context::logits_materialize() {
+    if (logits_dev == nullptr) {
+        return;
+    }
+
+    ggml_tensor * t = logits_dev;
+    logits_dev = nullptr;
+
+    ggml_backend_sched_synchronize(sched.get());
+    ggml_backend_tensor_get(t, logits.data + logits_dev_row*model.vocab.n_tokens(), 0, ggml_nbytes(t));
 }
 
 float * llama_context::get_embeddings() {
@@ -1545,6 +1602,9 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // the previous ubatch's raw logits must leave the device before its graph is replaced
+    logits_materialize();
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2126,7 +2186,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                if (res->t_logits_topk_ids) {
+                    // copy the top-k and the first k logits of every row; the rows stay on the device
+                    const int64_t k = cparams.logits_topk;
+                    const int64_t o = n_outputs_prev*k;
+
+                    ggml_backend_t backend_topk = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_logits_topk_vals);
+                    GGML_ASSERT(backend_topk != nullptr);
+
+                    ggml_backend_tensor_get_async(backend_topk, res->t_logits_topk_ids,  logits_topk_ids.data  + o, 0, n_outputs*k*sizeof(int32_t));
+                    ggml_backend_tensor_get_async(backend_topk, res->t_logits_topk_vals, logits_topk_vals.data + o, 0, n_outputs*k*sizeof(float));
+                    ggml_backend_tensor_get_2d_async(backend_res, t_logits, logits_topk_head.data + o, 0, k*sizeof(float), n_outputs,
+                            n_vocab*sizeof(float), k*sizeof(float));
+
+                    // ready while every ubatch with outputs has its top-k
+                    logits_topk_ready = logits_topk_ready || n_outputs_prev == 0;
+                    logits_dev        = t_logits;
+                    logits_dev_row    = n_outputs_prev;
+                } else {
+                    logits_topk_ready = false;
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
             }
         }
 
@@ -2339,12 +2419,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         output_ids.resize(n_batch);
     }
 
+    // logits top-k: ids, logits and the first logits of every output row
+    const size_t logits_topk_size = has_logits ? (size_t) cparams.logits_topk*n_outputs_max : 0;
+
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     embd_capture.size      = has_embd_capture ? (size_t) cparams.n_capture_layers * hparams.n_embd * n_outputs_max : 0;
     const size_t new_size  = (logits.size + embd.size + embd_nextn.size + embd_capture.size +
-                              embd_layer_inp_float_count + backend_float_count) *
+                              embd_layer_inp_float_count + backend_float_count + 2*logits_topk_size) *
                                  sizeof(float) +
-                             (backend_token_count) * sizeof(llama_token);
+                             (backend_token_count + logits_topk_size) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2408,6 +2491,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd_capture = has_embd_capture ? buffer_view<float>{ (float *) (base + offset), embd_capture.size } :
                                       buffer_view<float>{ nullptr, 0 };
     offset += embd_capture.size * sizeof(float);
+
+    logits_topk_ids = {(int32_t *) (base + offset), logits_topk_size};
+    offset += logits_topk_size * sizeof(int32_t);
+
+    logits_topk_vals = {(float *) (base + offset), logits_topk_size};
+    offset += logits_topk_size * sizeof(float);
+
+    logits_topk_head = {(float *) (base + offset), logits_topk_size};
+    offset += logits_topk_size * sizeof(float);
+
+    logits_topk_ready = false;
+    logits_dev        = nullptr;
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -2487,6 +2582,11 @@ void llama_context::output_reorder() {
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
+    const uint64_t n_topk      = cparams.logits_topk;
+
+    if (!output_swaps.empty()) {
+        logits_materialize();
+    }
 
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
@@ -2495,6 +2595,14 @@ void llama_context::output_reorder() {
         if (logits.size > 0) {
             for (uint64_t k = 0; k < n_vocab; k++) {
                 std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
+            }
+        }
+
+        if (logits_topk_ids.size > 0) {
+            for (uint64_t k = 0; k < n_topk; k++) {
+                std::swap(logits_topk_ids.data [i0*n_topk + k], logits_topk_ids.data [i1*n_topk + k]);
+                std::swap(logits_topk_vals.data[i0*n_topk + k], logits_topk_vals.data[i1*n_topk + k]);
+                std::swap(logits_topk_head.data[i0*n_topk + k], logits_topk_head.data[i1*n_topk + k]);
             }
         }
 
@@ -4101,6 +4209,17 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
     return ctx->get_embeddings_layer_inp(lid);
+}
+
+bool llama_set_logits_topk(llama_context * ctx, int32_t k) {
+    return ctx->set_logits_topk(k);
+}
+
+bool llama_get_logits_topk_ith(llama_context * ctx, int32_t i, const int32_t ** ids, const float ** logits,
+                               const float ** head) {
+    ctx->synchronize();
+
+    return ctx->get_logits_topk_ith(i, ids, logits, head);
 }
 
 // multi-layer hidden-state tap C API (staging) -------------------------------

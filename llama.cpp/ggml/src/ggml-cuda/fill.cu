@@ -9,6 +9,9 @@ static __global__ void fill_kernel(T * dst, const int64_t k, const T value) {
     if (i >= k) {
         return;
     }
+    // programmatic stream serialization on GB10: an earlier kernel may still read the old dst
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
     dst[i] = value;
 }
 
@@ -23,13 +26,15 @@ void ggml_cuda_op_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int64_t k = ggml_nelements(dst);
     const int64_t num_blocks = (k + CUDA_FILL_BLOCK_SIZE - 1) / CUDA_FILL_BLOCK_SIZE;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const ggml_cuda_kernel_launch_params launch_params((dim3) num_blocks, (dim3) CUDA_FILL_BLOCK_SIZE, 0, stream);
 
     switch (dst->type) {
         case GGML_TYPE_F32:
-            fill_kernel<<<num_blocks, CUDA_FILL_BLOCK_SIZE, 0, stream>>>((float *)dst_d, k, value);
+            ggml_cuda_kernel_launch_gb10(cc, fill_kernel<float>, launch_params, (float *)dst_d, k, value);
             break;
         case GGML_TYPE_F16:
-            fill_kernel<<<num_blocks, CUDA_FILL_BLOCK_SIZE, 0, stream>>>((half *)dst_d, k, ggml_cuda_cast<half>(value));
+            ggml_cuda_kernel_launch_gb10(cc, fill_kernel<half>, launch_params, (half *)dst_d, k, ggml_cuda_cast<half>(value));
             break;
         default:
             GGML_ABORT("unsupported type");

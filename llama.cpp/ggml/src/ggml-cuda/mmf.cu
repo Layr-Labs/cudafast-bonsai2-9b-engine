@@ -35,10 +35,14 @@ static bool ggml_cuda_mul_mat_f_ksplit(ggml_backend_cuda_context & ctx, const fl
     const int64_t nrb = nrows_x / MMF_ROWS_PER_BLOCK;
     ggml_cuda_pool_alloc<float> part(ctx.pool(), nrb*GGML_PAD(mmf_ksplit_cols, 8)*mmf_ksplit_nwarps*MMF_ROWS_PER_BLOCK);
     const int nbytes_shared = 16 * (warp_size + mmf_get_padding(cc)) * (int) sizeof(float);
-    mul_mat_f_ksplit_partial<<<nrb*mmf_ksplit_nwarps*(MMF_ROWS_PER_BLOCK/16)*(mmf_ksplit_cols/8), dim3(warp_size, 1, 1), nbytes_shared, ctx.stream()>>>
-        (x, y, part.get(), (int) ncols_x, (int) stride_row, (int) stride_col_y);
-    mul_mat_f_ksplit_reduce<<<nrb, dim3(MMF_ROWS_PER_BLOCK, mmf_ksplit_cols, 1), 0, ctx.stream()>>>
-        (part.get(), dst, (int) stride_col_dst);
+    // GB10 only (checked above): both kernels wait for their predecessor (ggml_cuda_pdl_sync)
+    ggml_cuda_kernel_launch(mul_mat_f_ksplit_partial,
+        ggml_cuda_kernel_launch_params(dim3(nrb*mmf_ksplit_nwarps*(MMF_ROWS_PER_BLOCK/16)*(mmf_ksplit_cols/8)),
+                                       dim3(warp_size, 1, 1), nbytes_shared, ctx.stream()),
+        x, y, part.get(), (int) ncols_x, (int) stride_row, (int) stride_col_y);
+    ggml_cuda_kernel_launch(mul_mat_f_ksplit_reduce,
+        ggml_cuda_kernel_launch_params(dim3(nrb), dim3(MMF_ROWS_PER_BLOCK, mmf_ksplit_cols, 1), 0, ctx.stream()),
+        part.get(), dst, (int) stride_col_dst);
     return true;
 }
 
