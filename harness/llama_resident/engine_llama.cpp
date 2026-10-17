@@ -76,7 +76,12 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
     }
 
     void verify_decode(SpeculativeRoundState &st) override {
-        llama_batch batch_tgt = llama_batch_init(llama_n_batch(eng_->ctx_tgt_), 0, 1);
+        // Only the anchor and actual drafts need host storage. llama_batch_init
+        // allocates a sequence-id array for every capacity row, so using the
+        // context's full prompt-batch capacity wastes thousands of allocations
+        // per verify round. The configured decode batch/ubatch stays unchanged.
+        const int32_t n_verify = static_cast<int32_t>(st.draft->size() + 1);
+        llama_batch batch_tgt = llama_batch_init(n_verify, 0, 1);
         common_batch_clear(batch_tgt);
         common_batch_add(batch_tgt, *st.id_last, (*st.n_past)++, {eng_->seq_id_}, true);
         for (size_t i = 0; i < st.draft->size(); ++i) {
