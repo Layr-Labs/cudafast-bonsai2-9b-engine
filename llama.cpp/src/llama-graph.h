@@ -957,6 +957,9 @@ struct llm_graph_params {
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
             return false;
         }
+        if (cparams.logits_topk != other.cparams.logits_topk) {
+            return false;
+        }
 
         return
             cparams.embeddings              == other.cparams.embeddings              &&
@@ -1030,6 +1033,10 @@ public:
     // by the per-model graph builder when cparams.n_capture_layers > 0.
     ggml_tensor * t_h_capture   = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+
+    // cparams.logits_topk > 0: [k, n_outputs] ids and [1, k, n_outputs] values of the best logits
+    ggml_tensor * t_logits_topk_ids  = nullptr;
+    ggml_tensor * t_logits_topk_vals = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1493,6 +1500,8 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    void build_logits_topk() const;
 
     //
     // dense (out)
