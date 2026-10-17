@@ -714,6 +714,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (side_fork != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(side_fork));
+    }
+    if (side_join != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(side_join));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -3829,6 +3835,108 @@ static int ggml_cuda_try_prefill_glu(ggml_backend_cuda_context & ctx, const ggml
     return 2;
 }
 
+// GB10 decode: a later PQ2_0 MUL_MAT that reads the same D4 activation as the MUL_MAT at i (the GDN z projection
+// after attn_qkv) and nothing else of the graph, with at least 4 nodes between them, can run on stream 1 from right
+// after the one at i (fork): it writes a stream-1 scratch buffer that the main stream copies into its output at its
+// own position (join), so it overlaps the latency-bound recurrence chain in between while its output memory, which
+// the allocator may share with tensors of that chain, is written where it was. Returns its index, or -1.
+// GGML_CUDA_D4_SIDE_STREAM=0 disables it.
+static int ggml_cuda_d4_side_plan(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = getenv("GGML_CUDA_D4_SIDE_STREAM") == nullptr || atoi(getenv("GGML_CUDA_D4_SIDE_STREAM")) != 0;
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (!enabled || a->src[1] == nullptr || a->src[1]->ne[1] > 16 || ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_DGX_SPARK) {
+        return -1;
+    }
+    const int kmax = std::min(cgraph->n_nodes - 1, i + 512);
+    int j = -1;
+    for (int k = i + 1; k <= kmax; ++k) {
+        // the first later PQ2_0 MUL_MAT of the activation (the f32 alpha/beta projections in between are skipped)
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (t->op == GGML_OP_MUL_MAT && t->src[1] == a->src[1] && t->src[0] != nullptr && t->src[0]->type == GGML_TYPE_PQ2_0) {
+            j = k;
+            break;
+        }
+    }
+    if (j < i + 5) {
+        return -1;
+    }
+    const ggml_tensor * m = cgraph->nodes[j];
+    if ((m->flags & GGML_TENSOR_FLAG_OUTPUT) || (m->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || m->view_src != nullptr ||
+            m->src[0] == nullptr || m->src[0]->type != GGML_TYPE_PQ2_0 || m->type != GGML_TYPE_F32 || !ggml_is_contiguous(m) ||
+            (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_ADD)) {
+        return -1;
+    }
+    for (int k = i + 1; k < j; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s] == m) {
+                return -1;
+            }
+        }
+    }
+    return j;
+}
+
+// GB10 decode (verify batches of at most 16 rows): the ffn_gate/ffn_up MUL_MAT pair of one D4 activation feeding a
+// SWIGLU as one stacked launch over the pair's back-to-back PTQ1_0 decode-layout copy (ggml_cuda_glu_pair::dl_stacked):
+// the gate matmul runs its own path (ggml_cuda_mul_mat) with a stacking request that launch_mul_mat_q takes only for
+// a pure-tiling decode-layout launch, writing rows [F, 2F) to the up output. Without it the up matmul runs alone.
+// The GLU node runs as before. GGML_CUDA_DECODE_GU_STACK=0 disables it.
+static int ggml_cuda_try_decode_gu_stack(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = getenv("GGML_CUDA_DECODE_GU_STACK") == nullptr || atoi(getenv("GGML_CUDA_DECODE_GU_STACK")) != 0;
+    if (!enabled || i + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * a   = cgraph->nodes[i];
+    ggml_tensor * b   = cgraph->nodes[i + 1];
+    ggml_tensor * glu = cgraph->nodes[i + 2];
+    if (a->op != GGML_OP_MUL_MAT || b->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU ||
+            ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->src[1] == nullptr) {
+        return 0;
+    }
+    ggml_tensor * gate = glu->src[0];
+    ggml_tensor * up   = glu->src[1];
+    if (!((gate == a && up == b) || (gate == b && up == a))) {
+        return 0;
+    }
+    if (((a->flags | b->flags) & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_get_op_params_i32(a, 1) == GGML_HINT_SRC0_IS_HADAMARD || ggml_get_op_params_i32(b, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return 0;
+    }
+    const ggml_tensor * wg = gate->src[0];
+    const ggml_tensor * wu = up->src[0];
+    const ggml_tensor * xg = gate->src[1];
+    const ggml_tensor * xu = up->src[1];
+    if (!wg || !wu || !xg || !xu || wg->type != GGML_TYPE_PQ2_0 || wu->type != GGML_TYPE_PQ2_0 ||
+            !ggml_are_same_shape(wg, wu) || !ggml_are_same_shape(xg, xu) || !ggml_are_same_shape(gate, up) ||
+            gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 || gate->nb[1] != up->nb[1] ||
+            xg->ne[1] > 16 || xg->ne[2] != 1 || xg->ne[3] != 1) {
+        return 0;
+    }
+    const auto * pg = ctx.fwht_q8().find(xg);
+    const auto * pu = ctx.fwht_q8().find(xu);
+    if (!pg || !pu || !pg->mmq_d4 || !pu->mmq_d4 || pg->data != pu->data) {
+        return 0;
+    }
+    const ggml_cuda_glu_pair * pair = ggml_cuda_glu_pair_find(wg->data);
+    if (pair == nullptr || pair->dl_stacked == nullptr || pair->up != wu->data || pair->nrows != wg->ne[1] ||
+            pair->ncols != wg->ne[0]) {
+        return 0;
+    }
+    ctx.dl_stack_gate   = wg->data;
+    ctx.dl_stack_up_dst = (float *) up->data;
+    ctx.dl_stack_done   = false;
+    ggml_cuda_mul_mat(ctx, wg, gate->src[1], gate);
+    const bool done = ctx.dl_stack_done;
+    ctx.dl_stack_gate   = nullptr;
+    ctx.dl_stack_up_dst = nullptr;
+    ctx.dl_stack_done   = false;
+    if (!done) {
+        ggml_cuda_mul_mat(ctx, wu, up->src[1], up);
+    }
+    return 2;
+}
+
 static int ggml_cuda_try_fwht_q8(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
     static const bool disabled = getenv("GGML_CUDA_FWHT_FUSION") != nullptr &&
                                  atoi(getenv("GGML_CUDA_FWHT_FUSION")) == 0;
@@ -6609,6 +6717,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             std::vector<char> conv_front_skip;  // nodes computed by an earlier fused kernel
             std::vector<ggml_cuda_conv_gather> conv_gathers;  // skipped conv-state GET_ROWS, by CONCAT
             ggml_tensor * pending_zero = nullptr;  // a deferred zeroing SCALE of a recurrent-cache row
+            int side_node = -1;  // a D4 matmul planned on stream 1 (ggml_cuda_d4_side_plan), forked already
             const auto flush_zero = [&]() {
                 if (pending_zero != nullptr) {
                     ggml_cuda_op_scale(*cuda_ctx, pending_zero);
@@ -6618,6 +6727,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (side_node >= 0 && i > side_node) {
+                    side_node = -1; // its node was taken by another path: it ran on the main stream
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -6763,6 +6875,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         i += glu_consumed - 1;
                         continue;
                     }
+                    // decode gate/up pair as one stacked launch (the GLU then runs as before)
+                    const int gu_consumed = ggml_cuda_try_decode_gu_stack(*cuda_ctx, cgraph, i);
+                    if (gu_consumed > 0) {
+                        i += gu_consumed - 1;
+                        continue;
+                    }
                 }
                 // a prefused GLU that no FWHT quantizer took: its value is the gate operand
                 if (node->op == GGML_OP_GLU && !cuda_ctx->glu_prefused.empty()) {
@@ -6802,7 +6920,45 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             i = ia;
                             continue;
                         }
+                        if (side_node == i && ia < 0) {
+                            // the planned side matmul: stream 1 after the fork, the main stream joins it here
+                            cudaStream_t main_stream = cuda_ctx->stream();
+                            cuda_ctx->curr_stream_no = 1;
+                            {
+                                // the stream-1 pool block is reused by stream 1 only after a later fork, i.e. after
+                                // the copy below on the main stream
+                                ggml_cuda_pool_alloc<char> side_out(cuda_ctx->pool(), ggml_nbytes(node));
+                                ggml_tensor side_dst = *node;
+                                side_dst.data = side_out.ptr;
+                                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), cuda_ctx->side_fork));
+                                ggml_cuda_mul_mat(*cuda_ctx, node->src[0], node->src[1], &side_dst);
+                                CUDA_CHECK(cudaEventRecord(cuda_ctx->side_join, cuda_ctx->stream()));
+                                cuda_ctx->curr_stream_no = 0;
+                                CUDA_CHECK(cudaStreamWaitEvent(main_stream, cuda_ctx->side_join));
+                                CUDA_CHECK(cudaMemcpyAsync(node->data, side_out.ptr, ggml_nbytes(node), cudaMemcpyDeviceToDevice,
+                                                           main_stream));
+                            }
+                            side_node = -1;
+                            static int side_logged = 0;
+                            if (side_logged < 40) {
+                                GGML_LOG_INFO("%s: %s on a side stream\n", __func__, node->name);
+                                side_logged++;
+                            }
+                            continue;
+                        }
                         ggml_cuda_mul_mat(*cuda_ctx, node->src[0], node->src[1], node);
+                        if (side_node < 0 && !is_concurrent_event_active && stream_ctx.concurrent_events.empty() &&
+                                cuda_ctx->curr_stream_no == 0) {
+                            const int j = ggml_cuda_d4_side_plan(*cuda_ctx, cgraph, i);
+                            if (j > 0) {
+                                if (cuda_ctx->side_fork == nullptr) {
+                                    CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx->side_fork, cudaEventDisableTiming));
+                                    CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx->side_join, cudaEventDisableTiming));
+                                }
+                                CUDA_CHECK(cudaEventRecord(cuda_ctx->side_fork, cuda_ctx->stream()));
+                                side_node = j;
+                            }
+                        }
                         if (!is_concurrent_event_active) try_launch_concurrent_event(node);
                         continue;
                     }

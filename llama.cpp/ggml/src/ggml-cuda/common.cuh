@@ -1721,6 +1721,16 @@ struct ggml_backend_cuda_context {
     // the node is then not computed: its FWHT quantizer reads the gate operand, or it is a copy of it.
     std::vector<const ggml_tensor *> glu_prefused;
 
+    // GB10 decode: a stacked gate|up request for the next launch_mul_mat_q of this gate weight (the up output and
+    // whether the stacked launch ran), set and cleared by ggml_cuda_try_decode_gu_stack
+    const void * dl_stack_gate   = nullptr;
+    float      * dl_stack_up_dst = nullptr;
+    bool         dl_stack_done   = false;
+
+    // GB10 decode: fork/join events of a D4 matmul run on stream 1 beside the main stream (ggml_cuda_d4_side_plan)
+    cudaEvent_t side_fork = nullptr;
+    cudaEvent_t side_join = nullptr;
+
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);

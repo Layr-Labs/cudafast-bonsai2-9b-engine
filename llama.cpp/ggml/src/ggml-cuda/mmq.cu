@@ -709,7 +709,27 @@ size_t ggml_cuda_glu_pair_register(const void * gate, const void * up, const int
     CUDA_CHECK(cudaMemcpy2D(stacked,             16*row_bytes, gate, 8*row_bytes, 8*row_bytes, (size_t) nrows/8, cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy2D(stacked + 8*row_bytes, 16*row_bytes, up, 8*row_bytes, 8*row_bytes, (size_t) nrows/8, cudaMemcpyDeviceToDevice));
     m[gate] = { gate, up, stacked, nrows, ncols };
-    return bytes;
+    size_t total = bytes;
+
+    // GB10 decode: the PTQ1_0 decode-layout copies of the pair back to back, when both exist (registered before the
+    // pair): one 2F-row copy for the stacked 16-row launch (launch_mul_mat_q, ggml_cuda_try_decode_gu_stack)
+    const auto & dl = ggml_cuda_dl_map();
+    const auto ig = dl.find(gate);
+    const auto iu = dl.find(up);
+    if (ig != dl.end() && iu != dl.end() && ig->second.dl_type == GGML_TYPE_PTQ1_0 && iu->second.dl_type == GGML_TYPE_PTQ1_0 &&
+            ig->second.nrows == nrows && iu->second.nrows == nrows && ig->second.ncols == ncols && iu->second.ncols == ncols) {
+        const size_t dl_bytes = (size_t) nrows*(size_t) (ncols/QK_PQ2_0)*sizeof(block_ptq1_0);
+        char * dl_stacked = nullptr;
+        if (cudaMalloc(&dl_stacked, 2*dl_bytes) == cudaSuccess) {
+            CUDA_CHECK(cudaMemcpy(dl_stacked,            ig->second.dl, dl_bytes, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(dl_stacked + dl_bytes, iu->second.dl, dl_bytes, cudaMemcpyDeviceToDevice));
+            m[gate].dl_stacked = dl_stacked;
+            total += 2*dl_bytes;
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
+    return total;
 }
 
 void ggml_cuda_dl_unregister_range(const void * base, const size_t size) {
@@ -722,6 +742,9 @@ void ggml_cuda_dl_unregister_range(const void * base, const size_t size) {
         for (auto it = g.begin(); it != g.end();) {
             if (in_range(it->second.gate) || in_range(it->second.up)) {
                 CUDA_CHECK(cudaFree(it->second.stacked));
+                if (it->second.dl_stacked != nullptr) {
+                    CUDA_CHECK(cudaFree(it->second.dl_stacked));
+                }
                 it = g.erase(it);
             } else {
                 ++it;
