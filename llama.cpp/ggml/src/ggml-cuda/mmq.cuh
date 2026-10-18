@@ -1438,8 +1438,8 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
-template <ggml_type type, int J, bool fallback, int GRID = 0>
-__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
+template <ggml_type type, int J, bool fallback, int GRID = 0, int COL1_THREADS = 0>
+__launch_bounds__(COL1_THREADS > 0 ? COL1_THREADS : ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
         float * tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
@@ -1452,14 +1452,18 @@ static __global__ void mul_mat_q_stream_k_fixup(
     ggml_cuda_pdl_lc();
 #endif
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
-    constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback) / 2) / warp_size;
+    constexpr bool COL1_ROWS = COL1_THREADS > 0;
+    constexpr int nwarps          = COL1_ROWS ? 1 : (ggml_cuda_mmq_get_nthreads(type, J, fallback) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
     constexpr int qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
 
-    float sum[J / nwarps] = {0.0f};
-    const int i = blockIdx.y*warp_size + threadIdx.x;
+    // The single-column DL arm uses one CTA with a short per-lane row vector.
+    constexpr int C = COL1_ROWS ? 1 : J;
+    constexpr int R = COL1_ROWS ? I / COL1_THREADS : 1;
+    float sum[COL1_ROWS ? R : (C + nwarps - 1) / nwarps] = {0.0f};
+    const int i = COL1_ROWS ? threadIdx.x : blockIdx.y*warp_size + threadIdx.x;
 
     const int nty = (nrows_x + I - 1) / I;
 
@@ -1500,10 +1504,17 @@ static __global__ void mul_mat_q_stream_k_fixup(
 
 
 #pragma unroll
-        for (int j0 = 0; j0 < J; j0 += nwarps) {
+        for (int j0 = 0; j0 < C; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
 
-            sum[j0/nwarps] += tmp_last_tile[bidx*(J*I) + j*I + i];
+            if constexpr (COL1_ROWS) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    sum[r] += tmp_last_tile[bidx*(J*I) + i + r*COL1_THREADS];
+                }
+            } else {
+                sum[j0/nwarps] += tmp_last_tile[bidx*(J*I) + j*I + i];
+            }
         }
 
         // If this block started in a previous tile we are done and don't need to combine additional partial results.
@@ -1540,14 +1551,21 @@ static __global__ void mul_mat_q_stream_k_fixup(
         }
 
 #pragma unroll
-        for (int j0 = 0; j0 < J; j0 += nwarps) {
+        for (int j0 = 0; j0 < C; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
 
             if (j > j_max) {
                 return;
             }
 
-            dst[j*stride_col_dst + i] += sum[j0/nwarps];
+            if constexpr (COL1_ROWS) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    dst[i + r*COL1_THREADS] += sum[r];
+                }
+            } else {
+                dst[j*stride_col_dst + i] += sum[j0/nwarps];
+            }
         }
         return;
     }
@@ -1572,7 +1590,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += nwarps) {
+    for (int j0 = 0; j0 < C; j0 += nwarps) {
         const int j = j0 + threadIdx.y;
 
         if (j > j_max) {
