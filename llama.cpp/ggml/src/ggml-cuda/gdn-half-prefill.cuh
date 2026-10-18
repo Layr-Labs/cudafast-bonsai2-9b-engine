@@ -172,6 +172,57 @@ template<bool RAW,bool OPT_INVERSE=false> __global__ __launch_bounds__(128) void
     if(tid<C){float p=1,last=1;for(int i=0;i<=tid;++i)p*=gg[i];for(int i=tid+1;i<C;++i)last*=gg[i];c->p[tid]=p;c->last[tid]=last;}
 }
 
+// Value heads h and h+HK share exactly the same Q/K and Gram products.
+// Keep separate gate-dependent inverses and coefficients, but compute their
+// common TF32 products once per pair inside this invocation.
+template<bool RAW> __global__ __launch_bounds__(128) void prepare_paired(Frame f,Coeff*out,__half*packed) {
+    ggml_cuda_pdl_sync();
+    const int h=blockIdx.x,ch=blockIdx.y,warp=threadIdx.y,tid=warp*32+threadIdx.x,first=ch*C;
+    __shared__ float q[C*gdn_half_c16::QK_STRIDE],k[C*gdn_half_c16::QK_STRIDE],kk[C*C],qk[C*C],ai[2][C*C],gg[2][C],bb[2][C];
+    gdn_half_c16::stage_qk_async(f,first,h,tid,q,k);
+    if(tid<2*C)gdn_half_c16::gates<RAW>(f,first+tid%C,h+(tid/C)*HK,gg[tid/C][tid%C],bb[tid/C][tid%C]);
+    asm volatile("cp.async.wait_group 0;" ::: "memory");__syncthreads();
+    __half *pq=packed+(ch*HK+h)*2*C*D,*pk=pq+C*D;
+#pragma unroll
+    for(int i=2*tid;i<C*D;i+=256) {
+        const int a=(i/D)*gdn_half_c16::QK_STRIDE+i%D;
+        *reinterpret_cast<__half2*>(pq+i)=__floats2half2_rn(q[a],q[a+1]);
+        *reinterpret_cast<__half2*>(pk+i)=__floats2half2_rn(k[a],k[a+1]);
+    }
+    float z[4]={0,0,0,0};
+    gdn_half_c16::dot<false,D>(z,warp<2?k:q,gdn_half_c16::QK_STRIDE,1,k,1,gdn_half_c16::QK_STRIDE,0,(warp%2)*8);
+#pragma unroll
+    for(int j=0;j<4;++j) {
+        const int row=gdn_half_c16::cr(j),col=(warp%2)*8+gdn_half_c16::cc(j);
+        (warp<2?kk:qk)[row*C+col]=z[j];
+    }
+    __syncthreads();
+    if(warp<2&&threadIdx.x<C) {
+        const int j=threadIdx.x;float inv[C];
+#pragma unroll
+        for(int r=0;r<C;++r)inv[r]=r==j?1.0f:0.0f;
+#pragma unroll
+        for(int i=1;i<C;++i) {
+            float v=0;
+#pragma unroll
+            for(int r=0;r<C;++r)if(j<=r&&r<i)v=fmaf(-bb[warp][i]*kk[i*C+r],inv[r],v);
+            if(j<i)inv[i]=v;
+        }
+#pragma unroll
+        for(int r=0;r<C;++r)ai[warp][r*C+j]=inv[r];
+    }
+    __syncthreads();
+#pragma unroll
+    for(int vh=0;vh<2;++vh) {
+        Coeff*c=out+ch*H+h+vh*HK;
+        for(int e=tid;e<C*C;e+=128){const int i=e/C,j=e%C;float decay=1;
+            if(j<=i)for(int r=j+1;r<=i;++r)decay*=gg[vh][r];else decay=0;
+            c->a[e]=(ai[vh][e]*decay)*bb[vh][j];c->m[e]=qk[e]*decay;
+        }
+        if(tid<C){float p=1,last=1;for(int i=0;i<=tid;++i)p*=gg[vh][i];for(int i=tid+1;i<C;++i)last*=gg[vh][i];c->p[tid]=p;c->last[tid]=last;}
+    }
+}
+
 template<bool EARLY_V=false,bool WARP_R=false>
 __global__ __launch_bounds__(128) void carry_packed(Frame f,const Coeff*coef,const __half*packed,
         const float*initial,float*output,float*final_state,float*boundary,float scale) {
@@ -301,8 +352,8 @@ static void gdn_half_prefill_launch(
     ggml_cuda_kernel_launch(gdn_half_initial_state,mat,current,state,initial.ptr,slot_stride,
         ids,row_stride,lazy,zero_row,zero_scale,zero_bias);
     const gdn_half_c16::Frame frame{q,k,v,g,beta,bias,a,prefix,PACKED,sq1,sq2,sv1,sv2};
-    const ggml_cuda_kernel_launch_params prep(dim3(32,prefix/16),dim3(32,4),0,stream);
-    ggml_cuda_kernel_launch(gdn_half_prefill::prepare_packed<false>,prep,frame,coefficients.ptr,packed.ptr);
+    const ggml_cuda_kernel_launch_params prep(dim3(16,prefix/16),dim3(32,4),0,stream);
+    ggml_cuda_kernel_launch(gdn_half_prefill::prepare_paired<false>,prep,frame,coefficients.ptr,packed.ptr);
     const ggml_cuda_kernel_launch_params carry(dim3(32,8),dim3(32,4),0,stream);
     ggml_cuda_kernel_launch(gdn_half_prefill::carry_packed<true,false>,carry,frame,coefficients.ptr,packed.ptr,
         initial.ptr,output,state,(float *)nullptr,scale);
