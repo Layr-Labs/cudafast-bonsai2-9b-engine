@@ -53,8 +53,31 @@ struct ggml_cuda_ptq1_j16_stage {
     uint32_t wa, wb, w6;
 };
 
+template <bool MATRIX = false>
 static __device__ __forceinline__ void ggml_cuda_ptq1_j16_load(
         ggml_cuda_ptq1_j16_stage & st, const char * __restrict__ xr, const char * yb, const int c) {
+    if constexpr (MATRIX) {
+        // Ring-only shared operand transport. Each matrix supplies eight aligned
+        // 16-byte rows; output registers match the scalar MMA fragment exactly.
+        static_assert(sizeof(block_q8_1_mmq) == 144, "Q8 MMQ row layout");
+        static_assert(offsetof(block_q8_1_mmq, qs) == 16, "Q8 MMQ quant offset");
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE && !defined(GGML_USE_HIP)
+        const int lane = threadIdx.x;
+        const int m = lane / 8;
+        const char * y0 = yb - (lane / 4)*sizeof(block_q8_1_mmq);
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            const char * p = y0 + ((lane & 7) + 8*(m & 1))*sizeof(block_q8_1_mmq)
+                                   + offsetof(block_q8_1_mmq, qs) + 32*s + 16*(m / 2);
+            const uint32_t addr = (uint32_t) __cvta_generic_to_shared(p);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(st.ya[s][0][0]), "=r"(st.ya[s][1][0]),
+                  "=r"(st.ya[s][0][1]), "=r"(st.ya[s][1][1]) : "r"(addr));
+        }
+#else
+        NO_DEVICE_CODE;
+#endif
+    } else {
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
 #pragma unroll
@@ -63,6 +86,7 @@ static __device__ __forceinline__ void ggml_cuda_ptq1_j16_load(
             st.ya[s][h][0] = *(const int *) (p);
             st.ya[s][h][1] = *(const int *) (p + 16);
         }
+    }
     }
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
