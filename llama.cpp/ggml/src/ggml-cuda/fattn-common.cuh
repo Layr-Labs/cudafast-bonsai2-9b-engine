@@ -800,6 +800,97 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
     *dst = dst_val / rowsum;
 }
 
+// Four adjacent output components share exactly the same metadata recurrence.
+template<int D, int ncols1, int ncols2> // D == head size
+__launch_bounds__(D/4, 1)
+static __global__ void flash_attn_stream_k_fixup_uniform_v4(
+        float * dst_ptr,
+        const float2 * dst_fixup_ptr,
+        const int ne01, const int ne02,
+        const int ne12, const int nblocks_stream_k,
+        const int gqa_ratio,
+        const int blocks_per_tile,
+        const uint3 fd_iter_j_z_ne12,
+        const uint3 fd_iter_j_z,
+        const uint3 fd_iter_j) {
+    static_assert(D % 4 == 0, "float4 head alignment");
+    constexpr int ncols = ncols1*ncols2;
+    ggml_cuda_pdl_lc();
+    float        * GGML_CUDA_RESTRICT dst       = dst_ptr;
+    const float2 * GGML_CUDA_RESTRICT dst_fixup = dst_fixup_ptr;
+
+    const int tile_idx = blockIdx.x; // One block per output tile.
+    const int j        = blockIdx.y;
+    const int c        = blockIdx.z;
+    const int jc       = j*ncols2 + c;
+    const int tid      = threadIdx.x;
+
+    // nblocks_stream_k is a multiple of ntiles_dst (== gridDim.x), so each tile gets the same number of blocks.
+    const int b_first = tile_idx * blocks_per_tile;
+    const int b_last  = b_first + blocks_per_tile - 1;
+
+    const float * dst_fixup_data = ((const float *) dst_fixup) + nblocks_stream_k*(2*2*ncols);
+
+    // z_KV == K/V head index, zt_gqa = Q head start index per K/V head, jt = token position start index
+    const uint2 dm0 = fast_div_modulo(tile_idx, fd_iter_j_z_ne12);
+    const uint2 dm1 = fast_div_modulo(dm0.y,    fd_iter_j_z);
+    const uint2 dm2 = fast_div_modulo(dm1.y,    fd_iter_j);
+
+    const int sequence = dm0.x;
+    const int z_KV     = dm1.x;
+    const int zt_gqa   = dm2.x;
+    const int jt       = dm2.y;
+
+    const int zt_Q = z_KV*gqa_ratio + zt_gqa*ncols2; // Global Q head start index.
+
+    if (jt*ncols1 + j >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
+        return;
+    }
+
+    dst += sequence*ne02*ne01*D + jt*ne02*(ncols1*D) + zt_Q*D + (j*ne02 + c)*D + 4*tid;
+
+    ggml_cuda_pdl_sync();
+    // Load the partial result that needs a fixup
+    float4 dst_val = *(const float4 *) dst;
+    float max_val;
+    float rowsum;
+    {
+        const float2 tmp = dst_fixup[b_last*ncols + jc];
+        max_val = tmp.x;
+        rowsum  = tmp.y;
+    }
+
+    // Combine with all previous blocks in this tile.
+    for (int bidx = b_last - 1; bidx >= b_first; --bidx) {
+        const float4 dst_add = ((const float4 *) dst_fixup_data)[(bidx*ncols*D + jc*D)/4 + tid];
+
+        const float2 tmp = dst_fixup[(nblocks_stream_k + bidx)*ncols + jc];
+
+        const float max_val_new = fmaxf(max_val, tmp.x);
+
+        const float diff_val = max_val - max_val_new;
+        const float diff_add = tmp.x   - max_val_new;
+
+        const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
+        const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
+
+        dst_val.x = scale_val*dst_val.x + scale_add*dst_add.x;
+        dst_val.y = scale_val*dst_val.y + scale_add*dst_add.y;
+        dst_val.z = scale_val*dst_val.z + scale_add*dst_add.z;
+        dst_val.w = scale_val*dst_val.w + scale_add*dst_add.w;
+        rowsum  = scale_val*rowsum  + scale_add*tmp.y;
+
+        max_val = max_val_new;
+    }
+
+    // Write back final result:
+    dst_val.x = dst_val.x / rowsum;
+    dst_val.y = dst_val.y / rowsum;
+    dst_val.z = dst_val.z / rowsum;
+    dst_val.w = dst_val.w / rowsum;
+    *(float4 *) dst = dst_val;
+}
+
 // General fixup kernel for the case where the number of blocks per tile is not uniform across tiles
 // (blocks_num.x not a multiple of ntiles_dst)
 template <int D, int ncols1, int ncols2> // D == head size
@@ -1238,6 +1329,17 @@ void launch_fattn(
             const uint3 fd1 = init_fastdiv_values(ntiles_x * ntiles_z_gqa);
             const uint3 fd2 = init_fastdiv_values(ntiles_x);
 
+            // Keep all other devices/head sizes on the original scalar path.
+            if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK && (DV == 128 || DV == 256)) {
+            const dim3 block_dim_combine(DV/4, 1, 1);
+            const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
+
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform_v4<DV, ncols1, ncols2>, launch_params,
+                (float *) KQV->data, dst_tmp_meta.ptr,
+                 Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
+                 gqa_ratio, bpt, fd0, fd1, fd2);
+            } else {
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
@@ -1246,6 +1348,7 @@ void launch_fattn(
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2);
+            }
         } else if (ntiles_dst % blocks_num.x != 0) {
             // General fixup for the cases where nblocks_stream_k < ntiles_dst.
             const int total_work = ntiles_KV * ntiles_dst;
