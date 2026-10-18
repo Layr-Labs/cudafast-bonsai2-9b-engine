@@ -739,7 +739,7 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
 // shared memory ggml_cuda_dl_ring_smem<FMT, SPS>(S). Stage layout: weights of the SPS steps, then SPS x 16
 // activation blocks.
 template <int FMT, int S, int SPS>
-__launch_bounds__(16*32, 1)
+__launch_bounds__((FMT == GGML_CUDA_DL_FMT_PTQ1S ? 8 : 16)*32, 1)
 static __global__ void mul_mat_q_j16_dl_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
         const int nrows_x, const int nkb, const int ncols_y, const int stride_col_dst, const int ncols_dst,
@@ -802,6 +802,7 @@ static __global__ void mul_mat_q_j16_dl_ring(
     const int g = threadIdx.x / 4;
     const int c = threadIdx.x % 4;
     float sum[1][4] = {{0.0f}};
+    float sum_hi[1][4] = {{0.0f}};
 #pragma unroll 1
     for (int k = 0; k < nstages; ++k) {
         const int s = k % S;
@@ -812,7 +813,19 @@ static __global__ void mul_mat_q_j16_dl_ring(
             if (j < n) {
                 const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
                 const char * sy = smem + s*SB + SPS*XB + j*YB + g*(int) sizeof(block_q8_1_mmq);
-                ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
+                if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1S) {
+                    ggml_cuda_ptq1_j16_stage stg;
+                    ggml_cuda_ptq1_j16_load(stg, sx, sy, c);
+                    ggml_cuda_ptq1_j16_compute<true>(sum, stg, c);
+                    // Same activation fragments, second disjoint 64-row half.
+                    const uint32_t * xw = (const uint32_t *) (sx + 64*GB);
+                    stg.wa = xw[c];
+                    stg.wb = xw[4 + (c & 1)];
+                    stg.w6 = xw[6];
+                    ggml_cuda_ptq1_j16_compute<true>(sum_hi, stg, c);
+                } else {
+                    ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
+                }
                 ++st;
                 const bool last = k*SPS + j == total - 1;
                 if (st == nst || last) { // end of a segment: the stores of the DL kernels
@@ -823,14 +836,26 @@ static __global__ void mul_mat_q_j16_dl_ring(
                         } else {
                             ggml_cuda_pq2_j16_store<1>(sum, dst_hi, row - nrows_lo, stride_col_dst, ncols_dst - 1);
                         }
+                        if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1S) {
+                            const int row_hi = row + 64;
+                            if (row_hi < nrows_lo) {
+                                ggml_cuda_pq2_j16_store<1>(sum_hi, dst, row_hi, stride_col_dst, ncols_dst - 1);
+                            } else {
+                                ggml_cuda_pq2_j16_store<1>(sum_hi, dst_hi, row_hi - nrows_lo, stride_col_dst, ncols_dst - 1);
+                            }
+                        }
                         st = 0;
                         it += tile_inc;
                     } else {
                         ggml_cuda_pq2_j16_store<1>(sum, tmp_fixup + (int64_t) blockIdx.x*(J*I), w*8, I, J - 1);
+                        if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1S) {
+                            ggml_cuda_pq2_j16_store<1>(sum_hi, tmp_fixup + (int64_t) blockIdx.x*(J*I), w*8 + 64, I, J - 1);
+                        }
                     }
 #pragma unroll
                     for (int l = 0; l < 4; ++l) {
                         sum[0][l] = 0.0f;
+                        if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1S) { sum_hi[0][l] = 0.0f; }
                     }
                 }
             }
@@ -916,7 +941,7 @@ static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
         attr[device] = true;
     }
-    ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, 16, 1), smem, stream),
+    ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, FMT == GGML_CUDA_DL_FMT_PTQ1S ? 8 : 16, 1), smem, stream),
         (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
         (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
 }
