@@ -570,7 +570,7 @@ static __global__ void mul_mat_q_pq2_j128(
         GGML_UNUSED(res); GGML_UNUSED(dst_add);
     }
     uint32_t ph = 0; // stream-k: wait parity per Y buffer (bit b = buffer b)
-    if constexpr (!PURE) {
+    { // Both tile modes use the existing bulk-copy segment.
         const uint32_t bar = smem + (uint32_t) (2*128*4*ggml_cuda_pq2_j128_ys) + 136u;
         if (threadIdx.x == 0 && threadIdx.y == 0) {
             ggml_cuda_pq2_j128_mbar_init(bar);
@@ -586,7 +586,7 @@ static __global__ void mul_mat_q_pq2_j128(
         if constexpr (ADD) {
             ggml_cuda_pq2_j128_res_hint(res, stride_col_dst, it*I + q*ROWS, jt*J, ncols_dst);
         }
-        ggml_cuda_pq2_j128_segment<PURE>(acc, smem, x, y, it*I + q*ROWS, stride_row_x, ncols_y, jt*J, 0, nkb, ph);
+        ggml_cuda_pq2_j128_segment<false>(acc, smem, x, y, it*I + q*ROWS, stride_row_x, ncols_y, jt*J, 0, nkb, ph);
         if constexpr (ADD) {
             const int64_t off = (int64_t) jt*J*stride_col_dst + it*I;
             ggml_cuda_pq2_j128_store_add(acc, dst_add + off, res + off, stride_col_dst, row_in_tile, col_in_tile,
@@ -779,7 +779,7 @@ static bool ggml_cuda_mmq_pq2_j128_use(const mmq_args & args, const int nsm) {
 
 template <ggml_type type, bool PURE, bool ADD>
 static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid, float * tmp_fixup, cudaStream_t stream) {
-    constexpr size_t smem = ggml_cuda_pq2_j128_smem() + (PURE ? 0 : 4096); // stream-k: + 2 x 2 KB transposed D4 scales
+    constexpr size_t smem = ggml_cuda_pq2_j128_smem() + 4096; // stream-k: + 2 x 2 KB transposed D4 scales
     const int nkb = (int) (args.ncols_x / QK_PQ2_0);
     const int ntx = (int) ((args.ncols_max + 127) / 128);
     const auto kernel = mul_mat_q_pq2_j128<PURE, ADD>;
@@ -818,7 +818,7 @@ static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid,
 template <ggml_type type>
 static void ggml_cuda_mmq_pq2_j128_glu_launch(const mmq_args & args, cudaStream_t stream) {
     static_assert(type == GGML_TYPE_PQ2_0, "PQ2_0 only");
-    constexpr size_t smem = ggml_cuda_pq2_j128_smem();
+    constexpr size_t smem = ggml_cuda_pq2_j128_smem() + 4096;
     const int nkb = (int) (args.ncols_x / QK_PQ2_0);
     const int ntx = (int) ((args.ncols_max + 127) / 128);
     const int ntiles = (int) (args.nrows_x / 128) * ntx;
