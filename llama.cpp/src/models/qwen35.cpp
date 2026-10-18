@@ -1,8 +1,5 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
-#include "llama-prefill-gates.h"
-#include "llama-decode-gates.h"
-#include "llama-last-attn.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -159,7 +156,6 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
         const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
                             ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
-        gdn_mmf_side_dev_ok = model.devices.size() == 1 && is_gpu && strcmp(reg_name, "CUDA") == 0;
         if (is_gpu && strcmp(reg_name, "MTL") != 0) {
             gdn_state_rows_dev_ok = false;
         }
@@ -204,19 +200,17 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
         ggml_build_forward_expand(gf, cur);
 
-        bool attn_rows_selected = false;
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recr(il)) {
             // Linear attention layer (gated delta net)
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il,
-                    il == n_layer - 1 && narrow_last ? inp_out_ids : nullptr, attn_rows_selected);
+            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
         if (il == n_layer - 1 && narrow_last) {
-            if (!attn_rows_selected) cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+            cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
 
@@ -335,36 +329,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,
-        int                       il,
-        ggml_tensor *             output_ids,
-        bool &                    rows_selected) {
+        int                       il) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-
-    static const bool narrow_queries = getenv("GGML_CUDA_LAST_ATTN_ROWS") == nullptr ||
-                                       atoi(getenv("GGML_CUDA_LAST_ATTN_ROWS")) != 0;
-    const bool eligible = narrow_queries && output_ids && il == n_layer - 1 &&
-        n_outputs == 1 && ubatch.n_seqs_unq == 1 && cparams.flash_attn &&
-        n_embd_head == 256 && n_head == 16 && n_head_kv == 4 &&
-        model.layers[il].wq->type == GGML_TYPE_PQ2_0 &&
-        model.layers[il].wo->type == GGML_TYPE_PQ2_0 &&
-        loras->empty() && !model.layers[il].wq_s && !model.layers[il].wo_s &&
-        !inp->self_k_rot && !inp->self_v_rot &&
-        !cparams.embeddings_layer_inp[n_layer];
-    const auto selected = llm_build_last_attn_rows(ctx0, cur, inp_pos, inp->get_kq_mask(),
-                                                 output_ids, ubatch.n_seqs, eligible);
-    rows_selected = selected.query != nullptr;
-    const int64_t n_queries = rows_selected ? selected.query->ne[1] : n_tokens;
-    ggml_tensor * query_input = rows_selected ? selected.query : cur;
-    ggml_tensor * query_pos = rows_selected ? selected.positions : inp_pos;
 
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
-    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, query_input, model.layers[il].wq_s);
+    ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
     cb(Qcur_full, "Qcur_full", il);
 
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_queries,
+    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
     cb(Qcur, "Qcur_reshaped", il);
@@ -384,18 +359,18 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "Kcur_normed", il);
 
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_queries,
+    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
         ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_queries);
+    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "gate_reshaped", il);
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
     // Apply MRoPE
     Qcur = ggml_rope_multi(
-            ctx0, Qcur, query_pos, nullptr,
+            ctx0, Qcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow
             );
@@ -415,7 +390,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il, selected.mask);
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
@@ -426,13 +401,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
 
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
     cb(cur, "attn_output", il);
-
-    if (rows_selected) {
-        // All 16 slots represent the requested original row; keep one for
-        // the already-narrow final FFN. The original out_ids still selects
-        // the residual and all K/V and feature taps retain every input row.
-        cur = ggml_view_2d(ctx0, cur, cur->ne[0], 1, cur->nb[1], 0);
-    }
 
     return cur;
 }
@@ -461,7 +429,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * z         = qkvz.second;
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
-    ggml_tensor * beta_projection = beta;
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
@@ -471,10 +438,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(beta, "beta_sigmoid", il);
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
-    ggml_tensor * alpha_projection = alpha;
-    static const bool prefill_gates_early = getenv("GGML_CUDA_PREFILL_GATES_EARLY") == nullptr ||
-                                           atoi(getenv("GGML_CUDA_PREFILL_GATES_EARLY")) != 0;
-    llm_schedule_prefill_gates(gf, cur, beta_projection, alpha, n_seq_tokens, n_seqs, prefill_gates_early);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -493,12 +456,6 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     } else {
         gdn_raw_beta = gdn_raw_alpha = gdn_raw_dt_bias = gdn_raw_a = nullptr;
     }
-
-    static const bool decode_gates_side = getenv("GGML_CUDA_DECODE_GATES_SIDE") == nullptr ||
-                                          atoi(getenv("GGML_CUDA_DECODE_GATES_SIDE")) != 0;
-    const bool decode_gates_scheduled = llm_schedule_decode_gates(gf, cur, beta_projection, alpha_projection,
-        n_seq_tokens, n_seqs, decode_gates_side && gdn_mmf_side_dev_ok && gdn_raw_beta &&
-        cparams.n_rs_seq > 0 && head_k_dim == 128 && head_v_dim == 128 && num_v_heads == 32);
 
     ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
@@ -608,7 +565,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(v_conv, "v_conv_predelta", il);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il,
-            gdn_state_rows ? inp->s_copy_main : nullptr, decode_gates_scheduled ? cur : nullptr);
+            gdn_state_rows ? inp->s_copy_main : nullptr);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

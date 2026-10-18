@@ -35,7 +35,6 @@
 
 #define GGML_CUDA_DL_TM 0
 #define GGML_CUDA_DL_WM 1
-#define GGML_CUDA_DL_TM64 2
 
 #define GGML_CUDA_DL_H_SECTOR 0 // per-warp 32-byte L2 sector hints of its step region (CH must be 1)
 #define GGML_CUDA_DL_H_WBULK  1 // per-warp cp.async.bulk.prefetch.L2 of its step region (CH > 1: WM only)
@@ -537,12 +536,11 @@ static __device__ __forceinline__ int64_t ggml_cuda_dl_src_index(const int64_t d
     int64_t   q   = d / G;
     int64_t row;
     int st;
-    if constexpr (LAYOUT == GGML_CUDA_DL_TM || LAYOUT == GGML_CUDA_DL_TM64) {
-        constexpr int rows = LAYOUT == GGML_CUDA_DL_TM64 ? 64 : 128;
-        const int r = (int) (q % rows); q /= rows;
+    if constexpr (LAYOUT == GGML_CUDA_DL_TM) {
+        const int r = (int) (q % 128); q /= 128;
         st = (int) (q % nst);
         const int64_t it = q / nst;
-        row = it*rows + r;
+        row = it*128 + r;
     } else {
         const int r8 = (int) (q % 8); q /= 8;
         st = (int) (q % nst); q /= nst;
@@ -610,8 +608,6 @@ static void ggml_cuda_dl_repack(const char * src, char * dst, const int nrows, c
     const dim3 grid((unsigned) ((nblk + 255) / 256));
     if (layout == GGML_CUDA_DL_TM) {
         ggml_cuda_dl_repack_kernel<GGML_CUDA_DL_TM, G, BB><<<grid, 256, 0, stream>>>(src, dst, nrows, nkb);
-    } else if (layout == GGML_CUDA_DL_TM64) {
-        ggml_cuda_dl_repack_kernel<GGML_CUDA_DL_TM64, G, BB><<<grid, 256, 0, stream>>>(src, dst, nrows, nkb);
     } else {
         ggml_cuda_dl_repack_kernel<GGML_CUDA_DL_WM, G, BB><<<grid, 256, 0, stream>>>(src, dst, nrows, nkb);
     }
@@ -719,53 +715,6 @@ static __host__ __device__ constexpr size_t ggml_cuda_dl_ring_smem(const int S) 
     return (size_t) S*ggml_cuda_dl_ring_stage_bytes<FMT, SPS>() + (size_t) S*sizeof(uint64_t);
 }
 
-// Signed PTQ1 FFN variant: keep only one sub-block of activation words and
-// scales live. The MMA operands and FP32 accumulation order are unchanged.
-static __device__ __forceinline__ void ggml_cuda_ptq1_j16_jit_step(
-        float (&sum)[1][4], const char * sx, const char * sy, const int c) {
-    ggml_cuda_ptq1_j16_stage st;
-    const uint32_t * xw = (const uint32_t *) sx;
-    st.wa = xw[c];
-    st.wb = xw[4 + (c & 1)];
-    st.w6 = xw[6];
-    // The original decoder reads only these three initialized weight words.
-    uint32_t b[4][2];
-    ggml_cuda_ptq1_j16_decode(b, st, c);
-    const int xd = int(st.w6 >> 16);
-    const int d_lo = __shfl_sync(0xFFFFFFFF, xd, 8*c + 0);
-    const int d_hi = __shfl_sync(0xFFFFFFFF, xd, 8*c + 4);
-    const float dA[2] = {
-        __half2float(__ushort_as_half((unsigned short) d_lo)),
-        __half2float(__ushort_as_half((unsigned short) d_hi)),
-    };
-#pragma unroll
-    for (int s = 0; s < 4; ++s) {
-        // Volatile shared reads prevent the compiler from reconstructing the
-        // original all-four-subblock operand stage. Four words and two scales
-        // serve this MMA; values, signed mapping and FP32 expressions are exact.
-        const char * p0 = sy + 4*sizeof(float) + 32*s + 4*c;
-        const char * p1 = p0 + 8*sizeof(block_q8_1_mmq);
-        const int a0 = *(const volatile int *) p0;
-        const int a1 = *(const volatile int *) p1;
-        const int a2 = *(const volatile int *) (p0 + 16);
-        const int a3 = *(const volatile int *) (p1 + 16);
-        const float dB[2] = {
-            ((const volatile float *) sy)[s],
-            ((const volatile float *) (sy + 8*sizeof(block_q8_1_mmq)))[s],
-        };
-        int C[4] = {GGML_CUDA_PQ2_J16_MAGIC, GGML_CUDA_PQ2_J16_MAGIC,
-                    GGML_CUDA_PQ2_J16_MAGIC, GGML_CUDA_PQ2_J16_MAGIC};
-        const int b0 = int((b[s][0] + 0x7F7F7F7Fu) ^ 0x80808080u);
-        const int b1 = int((b[s][1] + 0x7F7F7F7Fu) ^ 0x80808080u);
-        ggml_cuda_pq2_j16_mma(C, a0, a1, a2, a3, b0, b1);
-#pragma unroll
-        for (int l = 0; l < 4; ++l) {
-            const float cf = __int_as_float(C[l]) - 12582912.0f;
-            sum[0][l] += cf*dA[l % 2]*dB[l / 2];
-        }
-    }
-}
-
 // Operands of one step of lane (g, c) of warp w from a stage, accumulated into sum (the DL kernels' calls).
 template <int FMT>
 static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4], const char * sx, const char * sy, const int c) {
@@ -789,13 +738,12 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
 // Same arguments as mul_mat_q_*_j16_dl (TM copy; mode 0 stream-k or mode 1 contiguous whole tiles), dynamic
 // shared memory ggml_cuda_dl_ring_smem<FMT, SPS>(S). Stage layout: weights of the SPS steps, then SPS x 16
 // activation blocks.
-template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false>
-__launch_bounds__(16*32, MIN_CTAS)
+template <int FMT, int S, int SPS>
+__launch_bounds__(16*32, 1)
 static __global__ void mul_mat_q_j16_dl_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
         const int nrows_x, const int nkb, const int ncols_y, const int stride_col_dst, const int ncols_dst,
         const int mode, float * dst_hi, const int nrows_lo) {
-    static_assert(!JIT || FMT == GGML_CUDA_DL_FMT_PTQ1S, "JIT operands require signed PTQ1");
     using F = ggml_cuda_dl_fmt<FMT>;
     constexpr int GB = F::GB;
     constexpr int G  = F::G;
@@ -811,7 +759,7 @@ static __global__ void mul_mat_q_j16_dl_ring(
     const int nst = nkb / G;
     const int nty = nrows_x / I;
     int it, st, rem, tile_inc;
-    ggml_cuda_dl_work<G, F::BPI>(it, st, rem, tile_inc, nty, nkb, PURE ? 1 : mode);
+    ggml_cuda_dl_work<G, F::BPI>(it, st, rem, tile_inc, nty, nkb, mode);
     const int total   = rem;
     const int nstages = (total + SPS - 1) / SPS;
     const int gs0     = it*nst + st;
@@ -864,11 +812,7 @@ static __global__ void mul_mat_q_j16_dl_ring(
             if (j < n) {
                 const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
                 const char * sy = smem + s*SB + SPS*XB + j*YB + g*(int) sizeof(block_q8_1_mmq);
-                if constexpr (JIT) {
-                    ggml_cuda_ptq1_j16_jit_step(sum, sx, sy, c);
-                } else {
-                    ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
-                }
+                ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
                 ++st;
                 const bool last = k*SPS + j == total - 1;
                 if (st == nst || last) { // end of a segment: the stores of the DL kernels
@@ -910,8 +854,6 @@ static __global__ void mul_mat_q_j16_dl_ring(
 }
 
 // ---------------------------------------------------------------------------------------------
-#include "mmq-j16-dl-tm64.cuh"
-
 // Host side (included by mmq.cuh after mmq_args and mmq-pq2-j16.cuh). GB10 only.
 //
 // The decode layout copies are made once at model load (ggml_backend_cuda_register_decode_layout,
@@ -929,22 +871,7 @@ struct ggml_cuda_dl_entry {
     int64_t      ncols;
     ggml_type    type;
     ggml_type    dl_type; // group format of the copy: type, or GGML_TYPE_PTQ1_0 for a PQ2_0 weight (C51)
-    char       * dl_tm64 = nullptr; // optional Q8 copy; dl always retains TM128 for fallback
 };
-
-// Only measured Q8 FFN and encoder shapes. This is independent of input data;
-// smaller attention matrices and every PTQ matrix keep their current kernels.
-static bool ggml_cuda_dl_q8_tm64_shape(int64_t rows, int64_t cols) {
-    return (rows == 12288 && cols == 4096) ||
-           (rows == 4096 && (cols == 12288 || cols == 32768));
-}
-
-static bool ggml_cuda_dl_q8_tm64_use(const mmq_args & args, const ggml_cuda_dl_entry & e) {
-    return args.type_x == GGML_TYPE_Q8_0 && e.type == GGML_TYPE_Q8_0 && e.dl_type == GGML_TYPE_Q8_0 &&
-           e.dl_tm64 != nullptr && args.nrows_x == e.nrows && args.ncols_x == e.ncols &&
-           args.ncols_dst == 16 && args.ncols_y == 16 && args.ncols_max == 16 && args.dst_hi == nullptr &&
-           ggml_cuda_dl_q8_tm64_shape(args.nrows_x, args.ncols_x);
-}
 
 // mmq.cu
 const ggml_cuda_dl_entry * ggml_cuda_dl_find(const void * src);
@@ -974,14 +901,13 @@ static void ggml_cuda_mmq_dl_launch(Kernel kernel, bool * attr_set, const mmq_ar
     // Programmatic stream serialization (PDL), as launch_mul_mat_q does on GB10.
     ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, 16, 1), 0, stream),
         (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
-        (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst_hi ? args.dst_hi : args.dst,
-        (int) (args.dst_hi ? args.nrows_lo : args.nrows_x));
+        (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
 }
 
-template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false>
+template <int FMT, int S, int SPS>
 static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
                                          const int nkb, float * tmp_fixup, cudaStream_t stream) {
-    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS, JIT, MIN_CTAS, PURE>;
+    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS>;
     constexpr size_t smem = ggml_cuda_dl_ring_smem<FMT, SPS>(S);
     static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
     const int device = ggml_cuda_get_device();
@@ -992,48 +918,12 @@ static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_
     }
     ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, 16, 1), smem, stream),
         (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
-        (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst_hi ? args.dst_hi : args.dst,
-        (int) (args.dst_hi ? args.nrows_lo : args.nrows_x));
+        (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
 }
 
 static int ggml_cuda_dl_env_int(const char * name, const int dflt) {
     const char * v = getenv(name);
     return v ? atoi(v) : dflt;
-}
-
-// Only the measured pure-tile FFN shapes use the two-CTA operand schedule.
-// The original TM128 copy, output ownership and K order are retained.
-static bool ggml_cuda_dl_ptq_ffn_jit_use(const mmq_args & args, const ggml_cuda_dl_entry & e,
-                                       const int grid, const int nsm) {
-    static const bool enabled = ggml_cuda_dl_env_int("GGML_CUDA_PTQ_FFN_JIT", 1) != 0;
-    const bool single = args.nrows_x == 12288 && args.dst_hi == nullptr && args.nrows_dst == 12288;
-    const bool stacked = args.nrows_x == 24576 && args.dst_hi != nullptr &&
-                         args.nrows_lo == 12288 && args.nrows_dst == 12288;
-    return enabled && (single || stacked) && args.ncols_x == 4096 &&
-           args.nrows_x == e.nrows && args.ncols_x == e.ncols && e.dl != nullptr &&
-           args.type_x == GGML_TYPE_PQ2_0 && e.type == GGML_TYPE_PQ2_0 && e.dl_type == GGML_TYPE_PTQ1_0 &&
-           args.ncols_y == 16 && args.ncols_dst == 16 && args.ncols_max == 16 &&
-           grid == args.nrows_x/128 && grid <= 4*nsm && ggml_cuda_mmq_dl_supported(args, e);
-}
-
-static void ggml_cuda_mmq_dl_launch_q8_tm64(const mmq_args & args, const ggml_cuda_dl_entry & e,
-                                           const int grid, const int mode, const int nkb,
-                                           float * tmp_fixup, cudaStream_t stream) {
-    const auto kernel = mul_mat_q_q8_j16_dl_ring_tm64<GGML_CUDA_DL_FMT_Q8, 2, 1>;
-    constexpr size_t smem = 2*(64*4*sizeof(block_q8_0) + 16*sizeof(block_q8_1_mmq)) + 2*sizeof(uint64_t);
-    static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
-    const int device = ggml_cuda_get_device();
-    if (!attr[device]) {
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
-        attr[device] = true;
-    }
-    // The doubled physical grid retains the original virtual K partitions and
-    // 128-row fixup allocation. Each pair writes disjoint halves of each tile.
-    ggml_cuda_kernel_launch(kernel,
-        ggml_cuda_kernel_launch_params(dim3(2*grid, 1, 1), dim3(32, 8, 1), smem, stream),
-        (const char *) e.dl_tm64, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
-        (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
 }
 
 // grid: the mul_mat_q grid rule (ggml_cuda_mmq_pq2_j16_grid). Stream-k shapes keep that partition and the
@@ -1058,9 +948,7 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
         static const bool ptq1_sgn = ggml_cuda_dl_env_int("GGML_CUDA_PTQ1_SIGNED", 1) != 0;
         if (e.dl_type == GGML_TYPE_PTQ1_0 && ring_pt && args.nrows_x >= 2048 && ptq1_sgn) {
             constexpr int FMT = GGML_CUDA_DL_FMT_PTQ1S;
-            if (ggml_cuda_dl_ptq_ffn_jit_use(args, e, grid, nsm)) {
-                ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2, true, 2, true>(args, e, grid, 1, nkb, tmp_fixup, stream);
-            } else if (tiling && ntiles > 4*nsm) {
+            if (tiling && ntiles > 4*nsm) {
                 ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);
             } else {
                 ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
@@ -1098,11 +986,7 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
         static const bool ring     = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING", 1) != 0;
         static const int  ring_min = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_MIN_ROWS", 4096);
         if (ring && args.nrows_x >= ring_min) {
-            if (ggml_cuda_dl_q8_tm64_use(args, e)) {
-                ggml_cuda_mmq_dl_launch_q8_tm64(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
-            } else {
-                ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_Q8, 2, 1>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
-            }
+            ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_Q8, 2, 1>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
         } else {
             static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
             ggml_cuda_mmq_dl_launch(mul_mat_q_q8_0_j16_dl<TM, GGML_CUDA_DL_H_SECTOR, 2, 1>, attr, args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
@@ -1112,8 +996,10 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
         const uint3 blocks_per_ne00_fd = init_fastdiv_values(nkb);
         const uint3 one_fd             = init_fastdiv_values(1);
         // Compile the48-SM partition divisor into the DL-only fixup; generic MMQ launches stay unchanged.
-        const auto fixup = grid == 48 ? mul_mat_q_stream_k_fixup<type, 16, false, 48>
-                                     : mul_mat_q_stream_k_fixup<type, 16, false>;
+        const bool partition_table = grid == 48 && args.nrows_x <= 1024;
+        const auto fixup = grid == 48
+            ? (partition_table ? mul_mat_q_stream_k_fixup<type, 16, false, 48, true> : mul_mat_q_stream_k_fixup<type, 16, false, 48>)
+            : mul_mat_q_stream_k_fixup<type, 16, false>;
         ggml_cuda_kernel_launch(fixup,
             ggml_cuda_kernel_launch_params(dim3(grid, 128/32, 1), dim3(32, 4, 1), 0, stream),
             nullptr, nullptr, args.dst, tmp_fixup, blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst,

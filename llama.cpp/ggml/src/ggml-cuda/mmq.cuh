@@ -1438,7 +1438,7 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
-template <ggml_type type, int J, bool fallback, int GRID = 0>
+template <ggml_type type, int J, bool fallback, int GRID = 0, bool PARTITION_TABLE = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
@@ -1484,11 +1484,29 @@ static __global__ void mul_mat_q_stream_k_fixup(
 
     // Iterate over previous blocks and sum up partial sums written to fixup buffer.
     // All CUDA blocks that get here must have a previous block that needs a fixup.
+    // Each warp caches 48 exact partition starts in two lane-distributed registers.
+    // Shuffles discover prior partitions; floating-point sums remain sequential.
+    int lane_start_lo = 0, lane_start_hi = 0;
+    if constexpr (PARTITION_TABLE) {
+        static_assert(GRID == 48, "partition table is specialized for the DL48 grid");
+        const int lane = threadIdx.x;
+        lane_start_lo = int64_t(lane)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / GRID;
+        lane_start_hi = int64_t(lane + warp_size)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / GRID;
+        lane_start_lo -= fastmodulo(lane_start_lo, blocks_per_ne00) % blocks_per_iter;
+        lane_start_hi -= fastmodulo(lane_start_hi, blocks_per_ne00) % blocks_per_iter;
+    }
     int bidx = bidx0 - 1;
     int kbc_stop = kbc0;
     while(true) {
-        int kbc = int64_t(bidx)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / grid_width;
-        kbc -= fastmodulo(kbc, blocks_per_ne00) % blocks_per_iter;
+        int kbc;
+        if constexpr (PARTITION_TABLE) {
+            const int lo = __shfl_sync(0xffffffffu, lane_start_lo, bidx % warp_size);
+            const int hi = __shfl_sync(0xffffffffu, lane_start_hi, bidx % warp_size);
+            kbc = bidx < warp_size ? lo : hi;
+        } else {
+            kbc = int64_t(bidx)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / grid_width;
+            kbc -= fastmodulo(kbc, blocks_per_ne00) % blocks_per_iter;
+        }
 
         if (kbc == kbc_stop) { // Did not have any data.
             bidx--;
@@ -1594,28 +1612,7 @@ struct mmq_args {
     // matmul's own output; nullptr = no ADD. Only the GB10 J=128 PQ2_0 kernel folds it (launch_mul_mat_q).
     const float * add_res = nullptr;
     float       * add_dst = nullptr;
-    // Stacked decode-layout launch (ggml_cuda_mmq_dl_run): rows [0, nrows_lo) to dst, [nrows_lo, nrows_x) to dst_hi
-    // (same column stride); nullptr = unstacked.
-    float       * dst_hi   = nullptr;
-    int64_t       nrows_lo = 0;
 };
-
-// GB10 prefill: the row-interleaved copy of a layer's ffn_gate/ffn_up PQ2_0 weights (made at model load): in every
-// 16-row group, 8 gate rows then the up rows of the same 8 features; the blocks are copied verbatim.
-struct ggml_cuda_glu_pair {
-    const void * gate;
-    const void * up;
-    char       * stacked;
-    int64_t      nrows; // F (rows of each weight)
-    int64_t      ncols;
-    // GB10 decode: the PTQ1_0 decode-layout copies of gate and up back to back (TM is tile-contiguous, so this
-    // is one 2F-row copy), for one stacked launch of the 16-row gate/up pair (launch_mul_mat_q); nullptr = none
-    char       * dl_stacked = nullptr;
-    // Optional exact alternating-row PTQ copy for the full-K decode SwiGLU.
-    char       * dl_glu = nullptr;
-};
-const ggml_cuda_glu_pair * ggml_cuda_glu_pair_find(const void * gate);
-size_t ggml_cuda_glu_pair_register(const void * gate, const void * up, int64_t nrows, int64_t ncols, ggml_type type);
 
 // C74: the residual ADD after a matmul whose kernel does not fold it, with k_bin_bcast's op_add expression.
 static __global__ void ggml_cuda_mmq_add_residual(const float * dst, const float * res, float * add_dst,
@@ -1654,7 +1651,6 @@ static void mmq_launch_kernel(const int cc, Kernel kernel, const dim3 & block_nu
 
 #include "mmq-pq2-j16.cuh"
 #include "mmq-j16-dl.cuh"
-#include "mmq-j16-glu.cuh"
 #include "mmq-pq2-j128.cuh"
 
 template <ggml_type type, int J, bool fallback>
@@ -1691,34 +1687,6 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             const ggml_cuda_dl_entry * e = ggml_cuda_dl_find(args.x);
             if (e != nullptr && ggml_cuda_mmq_dl_supported(args, *e)) {
                 const int grid = ggml_cuda_mmq_pq2_j16_grid(args, nsm);
-                // A stacked gate|up request for this weight (ggml_cuda_try_decode_gu_stack): one pure-tiling launch over
-                // the 2F-row copy, rows [F, 2F) stored to the up output. Each tile is one full-K segment of one CTA in
-                // both forms, so every value is the one the two launches store.
-                if constexpr (type == GGML_TYPE_PQ2_0) {
-                    if (ctx.dl_stack_gate != nullptr && ctx.dl_stack_gate == (const void *) args.x &&
-                            e->dl_type == GGML_TYPE_PTQ1_0 && grid == (int) (args.nrows_x/128)) {
-                        const ggml_cuda_glu_pair * p = ggml_cuda_glu_pair_find(args.x);
-                        mmq_args a2 = args;
-                        a2.nrows_x  = 2*args.nrows_x;
-                        a2.dst_hi   = ctx.dl_stack_up_dst;
-                        a2.nrows_lo = args.nrows_x;
-                        if (p != nullptr && p->dl_stacked != nullptr && p->nrows == e->nrows && args.nrows_x == e->nrows &&
-                                ggml_cuda_mmq_pq2_j16_grid(a2, nsm) == (int) (a2.nrows_x/128)) {
-                            ggml_cuda_dl_entry e2 = *e;
-                            e2.dl    = p->dl_stacked;
-                            e2.nrows = 2*e->nrows;
-                            GGML_ASSERT(ggml_cuda_mmq_dl_supported(a2, e2));
-                            ggml_cuda_mmq_dl_run<type>(a2, e2, (int) (a2.nrows_x/128), nsm, nullptr, stream);
-                            ctx.dl_stack_done = true;
-                            static bool logged = false;
-                            if (!logged) {
-                                GGML_LOG_INFO("%s: decode gate/up as one stacked launch (%d x 2 rows)\n", __func__, (int) args.nrows_x);
-                                logged = true;
-                            }
-                            return;
-                        }
-                    }
-                }
                 ggml_cuda_pool_alloc<float> tmp_fixup(ctx.pool(id));
                 if (ggml_cuda_mmq_pq2_j16_needs_fixup(args, grid)) {
                     tmp_fixup.alloc((size_t) grid*16*128);
@@ -1976,6 +1944,17 @@ size_t ggml_cuda_mul_mat_q_q8_size(const ggml_tensor * src0, const ggml_tensor *
 bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * src1,
                              ggml_tensor * gate_dst, const void * stacked, void * external_q8);
 
+// GB10 prefill: the row-interleaved copy of a layer's ffn_gate/ffn_up PQ2_0 weights (made at model load): in every
+// 16-row group, 8 gate rows then the up rows of the same 8 features; the blocks are copied verbatim.
+struct ggml_cuda_glu_pair {
+    const void * gate;
+    const void * up;
+    char       * stacked;
+    int64_t      nrows; // F (rows of each weight)
+    int64_t      ncols;
+};
+const ggml_cuda_glu_pair * ggml_cuda_glu_pair_find(const void * gate);
+size_t ggml_cuda_glu_pair_register(const void * gate, const void * up, int64_t nrows, int64_t ncols, ggml_type type);
 
 void ggml_cuda_mul_mat_q_fused_two(
         ggml_backend_cuda_context & ctx,
@@ -1984,10 +1963,3 @@ void ggml_cuda_mul_mat_q_fused_two(
         const ggml_tensor * norm_weight, const float * norm_scale);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
-
-// Validate the original signed PTQ1S/grid48 route. A null partials pointer is
-// a side-effect-free query; otherwise launch only that unchanged producer.
-// Caller must execute its exact exclusive fixup/ADD/RMS consumer before reuse.
-bool ggml_cuda_mul_mat_q_fixup_producer(ggml_backend_cuda_context & ctx,
-    const ggml_tensor * weight, const ggml_tensor * input, ggml_tensor * dst,
-    const void * q8, float * partials);

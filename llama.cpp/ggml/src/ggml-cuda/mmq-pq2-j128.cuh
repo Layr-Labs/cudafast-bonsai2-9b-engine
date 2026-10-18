@@ -267,67 +267,6 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_compute(float (&acc)[2
     }
 }
 
-// Exact compact compute loop with one K sub-block live at a time.
-template <bool DT = false>
-static __device__ __forceinline__ void ggml_cuda_pq2_ws_compute_compact(float (&acc)[2][4][4], const uint32_t xs, const uint32_t ys,
-        const uint32_t dbt = 0) {
-    const int lane = threadIdx.x;
-    const int g    = lane / 4;
-    const int c    = lane % 4;
-    constexpr int XS = 4*ggml_cuda_pq2_j128_xs; // bytes
-    constexpr int YS = 4*ggml_cuda_pq2_j128_ys;
-    // ldmatrix row addresses of this lane: A (x4): rows lane%16, ints (lane/16)*4; B (x2): columns lane%8,
-    // ints 4 + ((lane/8)%2)*4 (the first 4 ints of a column record are the D4 scales).
-    const uint32_t xa = xs + (lane % 16)*XS + (lane / 16)*16;
-    const uint32_t ya = ys + (lane % 8)*YS + 16 + ((lane / 8) % 2)*16;
-    const uint32_t xd = xs + g*XS + 4*32;   // dA of row g
-    const uint32_t yd = ys + 2*c*YS;        // D4 scales of column 2c
-
-    float dA[2][2], ndA[2][2];
-#pragma unroll
-    for (int rt = 0; rt < 2; ++rt) {
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            dA [rt][h] = ggml_cuda_pq2_j128_lds_f32(xd + (rt*16 + 8*h)*XS);
-            ndA[rt][h] = -12582912.0f*dA[rt][h];
-        }
-    }
-
-    // sub-block outer: A of one sub-block live (8 registers), dB per (column tile, sub-block)
-#pragma unroll 1
-    for (int s = 0; s < 4; ++s) {
-        int A[2][4];
-#pragma unroll
-        for (int rt = 0; rt < 2; ++rt) {
-            ggml_cuda_pq2_j128_ldsm_x4(A[rt], xa + rt*16*XS + s*32);
-        }
-#pragma unroll
-        for (int ct = 0; ct < 4; ++ct) {
-            float dB[2];
-            if constexpr (DT) {
-                // transposed D4 scales: [s][column] floats of the warp's columns, columns 2c, 2c+1 adjacent
-                const float2 v = ggml_cuda_pq2_j128_lds_v2f32(dbt + s*512 + (ct*8 + 2*c)*4);
-                dB[0] = v.x; dB[1] = v.y;
-            } else {
-                dB[0] = ggml_cuda_pq2_j128_lds_f32(yd + ct*8*YS + 4*s);
-                dB[1] = ggml_cuda_pq2_j128_lds_f32(yd + ct*8*YS + YS + 4*s);
-            }
-            int B[2];
-            ggml_cuda_pq2_j128_ldsm_x2(B, ya + ct*8*YS + s*32);
-#pragma unroll
-            for (int rt = 0; rt < 2; ++rt) {
-                int C[4];
-                ggml_cuda_pq2_j128_mma(C, A[rt], B[0], B[1]);
-#pragma unroll
-                for (int l = 0; l < 4; ++l) {
-                    const float t = __fmaf_rn(__int_as_float(C[l]), dA[rt][l/2], ndA[rt][l/2]);
-                    acc[rt][ct][l] = __fmaf_rn(t, dB[l%2], acc[rt][ct][l]);
-                }
-            }
-        }
-    }
-}
-
 // One output segment of the CTA: rows [row0, row0 + 64) of the tile, its 128 columns from col0, K blocks
 // [kb_start, kb_stop). block = (32, 8): warp w owns rows 32*(w/4) .. +31 and columns 32*(w%4) .. +31.
 // Shared layout (bytes): Y buffers 0/1 [0, 2*18432), the X tile [36864, 46080); the stream-k variant adds
@@ -335,7 +274,7 @@ static __device__ __forceinline__ void ggml_cuda_pq2_ws_compute_compact(float (&
 // unpack the next X block and start the copy of the one after, barrier. Each thread holds the raw X words
 // of the next block in registers (global loads issued one block ahead).
 // PURE (pure-tiling launch): Y by cp.async. !PURE (stream-k launch): Y by TMA bulk copies.
-template <bool PURE, bool COMPACT = false>
+template <bool PURE>
 static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
         float (&acc)[2][4][4], const uint32_t smem, const char * __restrict__ x, const int * y,
         const int row0, const int stride_row_x, const int ncols_y, const int col0,
@@ -394,8 +333,7 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
             if (hint_lane && kb + HINT_D < kb_stop) {
                 ggml_cuda_pq2_j128_hint(xblk + (HINT_D - 1)*BS + hint_off);
             }
-            if constexpr (COMPACT) ggml_cuda_pq2_ws_compute_compact<false>(acc, xw, yw + cur*YBYTES);
-            else ggml_cuda_pq2_j128_compute<false>(acc, xw, yw + cur*YBYTES);
+            ggml_cuda_pq2_j128_compute<false>(acc, xw, yw + cur*YBYTES);
             if (kb + 1 >= kb_stop) {
                 break;
             }
@@ -454,8 +392,7 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
             if (hint_lane && kb + HINT_D < kb_stop) {
                 ggml_cuda_pq2_j128_hint(xblk + (HINT_D - 1)*BS + hint_off);
             }
-            if constexpr (COMPACT) ggml_cuda_pq2_ws_compute_compact<true>(acc, xw, yw + cur*YBYTES, dbw + cur*2048);
-            else ggml_cuda_pq2_j128_compute<true>(acc, xw, yw + cur*YBYTES, dbw + cur*2048);
+            ggml_cuda_pq2_j128_compute<true>(acc, xw, yw + cur*YBYTES, dbw + cur*2048);
             if (kb + 1 >= kb_stop) {
                 break;
             }
@@ -574,7 +511,7 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_store_glu(
 // res and dst_add have dst's layout (stride_col_dst). dst_add may be dst or res; it overlaps nothing else.
 // GLU (pure tiling only): x is a gate/up row-interleaved weight of 2*F rows, dst the F-row gate output (see
 // ggml_cuda_pq2_j128_store_glu); every accumulator is the one the separate gate and up launches compute.
-template <bool PURE, bool ADD, bool GLU = false, bool COMPACT = false>
+template <bool PURE, bool ADD, bool GLU = false>
 __launch_bounds__(256, 2)
 static __global__ void mul_mat_q_pq2_j128(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
@@ -649,7 +586,7 @@ static __global__ void mul_mat_q_pq2_j128(
         if constexpr (ADD) {
             ggml_cuda_pq2_j128_res_hint(res, stride_col_dst, it*I + q*ROWS, jt*J, ncols_dst);
         }
-        ggml_cuda_pq2_j128_segment<PURE,COMPACT>(acc, smem, x, y, it*I + q*ROWS, stride_row_x, ncols_y, jt*J, 0, nkb, ph);
+        ggml_cuda_pq2_j128_segment<PURE>(acc, smem, x, y, it*I + q*ROWS, stride_row_x, ncols_y, jt*J, 0, nkb, ph);
         if constexpr (ADD) {
             const int64_t off = (int64_t) jt*J*stride_col_dst + it*I;
             ggml_cuda_pq2_j128_store_add(acc, dst_add + off, res + off, stride_col_dst, row_in_tile, col_in_tile,
@@ -677,7 +614,7 @@ static __global__ void mul_mat_q_pq2_j128(
         if (whole) {
             ggml_cuda_pq2_j128_res_hint(res, stride_col_dst, it*I + q*ROWS, jt*J, ncols_dst);
         }
-        ggml_cuda_pq2_j128_segment<PURE,COMPACT>(acc, smem, x, y, it*I + q*ROWS, stride_row_x, ncols_y, jt*J, kb0_start, kb0_stop, ph);
+        ggml_cuda_pq2_j128_segment<PURE>(acc, smem, x, y, it*I + q*ROWS, stride_row_x, ncols_y, jt*J, kb0_start, kb0_stop, ph);
         if (!ends_tile) {
             ggml_cuda_pq2_j128_store(acc, tmp_fixup + (int64_t) b*(J*I), I, row_in_tile, col_in_tile, J - 1);
             return;
@@ -840,21 +777,12 @@ static bool ggml_cuda_mmq_pq2_j128_use(const mmq_args & args, const int nsm) {
     return ggml_cuda_mmq_pq2_j128_supported(args);
 }
 
-// Compact compute defaults to 1, a compact K-subblock loop in every J128 launch;
-// 2 changes only the fused GLU launch. Grid partitioning and FP32 order stay
-// identical. The goal is lower register pressure without expanded weights.
-static int ggml_cuda_pq2_prefill_compact_mode() {
-    static const int mode = ggml_cuda_dl_env_int("GGML_CUDA_PREFILL_COMPACT", 1);
-    return mode;
-}
-
-template <ggml_type type, bool PURE, bool ADD, bool COMPACT = false>
+template <ggml_type type, bool PURE, bool ADD>
 static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid, float * tmp_fixup, cudaStream_t stream) {
     constexpr size_t smem = ggml_cuda_pq2_j128_smem() + (PURE ? 0 : 4096); // stream-k: + 2 x 2 KB transposed D4 scales
     const int nkb = (int) (args.ncols_x / QK_PQ2_0);
     const int ntx = (int) ((args.ncols_max + 127) / 128);
-    const auto kernel = COMPACT || ggml_cuda_pq2_prefill_compact_mode() == 1
-        ? mul_mat_q_pq2_j128<PURE, ADD, false, true> : mul_mat_q_pq2_j128<PURE, ADD>;
+    const auto kernel = mul_mat_q_pq2_j128<PURE, ADD>;
     static bool attr_set[GGML_CUDA_MAX_DEVICES] = { false };
     const int device = ggml_cuda_get_device();
     if (!attr_set[device]) {
@@ -885,20 +813,16 @@ static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid,
     }
 }
 
-#include "mmq-pq2-plane.cuh"
-
 // The GLU kernel over a 2*F-row interleaved weight (args.nrows_x = 2*F, args.dst = the gate output, args.nrows_dst its
 // column stride): pure tiling, one CTA per 128-row tile, no fixup.
 template <ggml_type type>
 static void ggml_cuda_mmq_pq2_j128_glu_launch(const mmq_args & args, cudaStream_t stream) {
     static_assert(type == GGML_TYPE_PQ2_0, "PQ2_0 only");
-    if (ggml_cuda_prefill_plane_glu_run<type>(args, stream)) return;
     constexpr size_t smem = ggml_cuda_pq2_j128_smem();
     const int nkb = (int) (args.ncols_x / QK_PQ2_0);
     const int ntx = (int) ((args.ncols_max + 127) / 128);
     const int ntiles = (int) (args.nrows_x / 128) * ntx;
-    const auto kernel = ggml_cuda_pq2_prefill_compact_mode() != 0
-        ? mul_mat_q_pq2_j128<true, false, true, true> : mul_mat_q_pq2_j128<true, false, true>;
+    const auto kernel = mul_mat_q_pq2_j128<true, false, true>;
     static bool attr_set[GGML_CUDA_MAX_DEVICES] = { false };
     const int device = ggml_cuda_get_device();
     if (!attr_set[device]) {

@@ -29,7 +29,6 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1365,7 +1364,6 @@ struct ggml_tensor_extra_gpu {
 #endif
 
 struct ggml_cuda_graph {
-    uint64_t gdn_dedup_registry_generation = 0;
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
         if (instance != nullptr) {
@@ -1634,8 +1632,6 @@ struct ggml_cuda_fwht_q8_context {
     }
 };
 
-struct ggml_cuda_gdn_dedup_entry;
-
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1731,28 +1727,6 @@ struct ggml_backend_cuda_context {
     // SWIGLU nodes whose value the prefill gate/up GEMM already wrote into its gate operand (ggml_cuda_try_prefill_glu);
     // the node is then not computed: its FWHT quantizer reads the gate operand, or it is a copy of it.
     std::vector<const ggml_tensor *> glu_prefused;
-    // Retained until the next graph evaluation/capture. Values describe producer-selected physical layouts only.
-    std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, int>> gdn_prefill_qk_layout;
-
-    // GB10 decode: a stacked gate|up request for the next launch_mul_mat_q of this gate weight (the up output and
-    // whether the stacked launch ran), set and cleared by ggml_cuda_try_decode_gu_stack
-    const void * dl_stack_gate   = nullptr;
-    float      * dl_stack_up_dst = nullptr;
-    bool         dl_stack_done   = false;
-
-    // GB10 decode: fork/join events of a D4 matmul run on stream 1 beside the main stream (ggml_cuda_d4_side_plan)
-    cudaEvent_t side_fork = nullptr;
-    cudaEvent_t side_join = nullptr;
-    cudaEvent_t gdn_mmf_fork = nullptr;
-    cudaEvent_t gdn_mmf_join = nullptr;
-    uint64_t gdn_mmf_side_launches = 0;
-    // Private rollback record counters: stable across graph clones and captures.
-    std::vector<std::shared_ptr<ggml_cuda_gdn_dedup_entry>> gdn_dedup_owners;
-    std::unordered_map<const void *, std::shared_ptr<ggml_cuda_gdn_dedup_entry>> gdn_dedup_caches;
-    uint64_t gdn_dedup_launches = 0;
-    std::unordered_set<const ggml_tensor *> gdn_dedup_nodes;
-    std::vector<std::pair<const void *, size_t>> gdn_dedup_graph_writes;
-
 
     cublasHandle_t cublas_handle() {
         if (cublas_handles[device][curr_stream_no] == nullptr) {
