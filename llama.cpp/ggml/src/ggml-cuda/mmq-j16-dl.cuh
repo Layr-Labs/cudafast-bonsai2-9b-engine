@@ -812,7 +812,30 @@ static __global__ void mul_mat_q_j16_dl_ring(
             if (j < n) {
                 const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
                 const char * sy = smem + s*SB + SPS*XB + j*YB + g*(int) sizeof(block_q8_1_mmq);
-                ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
+                if constexpr (FMT == GGML_CUDA_DL_FMT_Q8 && SPS == 1) {
+                    ggml_cuda_dl_q8_xstage xs;
+                    ggml_cuda_dl_q8_ystage ys;
+                    ggml_cuda_dl_q8_load_x(xs, sx, c);
+                    ggml_cuda_dl_q8_load_y(ys, sy, c);
+                    // Release the slot as soon as all shared operands have been
+                    // loaded. Refill then overlaps MMA on register-only operands.
+                    if (k + S < nstages) {
+                        __syncthreads();
+                    }
+                    if (tid == 0 && k + S < nstages) {
+                        const int kk = k + S;
+                        const int nn = min(SPS, total - kk*SPS);
+                        const int gsk = gs0 + kk*SPS;
+                        ggml_cuda_dl_mbar_expect_tx(&full[s], (uint32_t) nn*(XB + yb_bytes));
+                        ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + (int64_t) gsk*XB, (uint32_t) nn*XB, &full[s], wpol);
+                        for (int j = 0; j < nn; ++j) {
+                            ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB, (const char *) y + (int64_t) ((gsk + j) % nst)*yb_bytes, yb_bytes, &full[s]);
+                        }
+                    }
+                    ggml_cuda_dl_q8_compute(sum[0], xs, ys, c);
+                } else {
+                    ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
+                }
                 ++st;
                 const bool last = k*SPS + j == total - 1;
                 if (st == nst || last) { // end of a segment: the stores of the DL kernels
@@ -835,19 +858,21 @@ static __global__ void mul_mat_q_j16_dl_ring(
                 }
             }
         }
-        // Only reused stages need all warps to finish before the next bulk copy.
-        // This condition is uniform across the CTA; no stage is read after its last use.
-        if (k + S < nstages) {
-            __syncthreads();
-        }
-        if (tid == 0 && k + S < nstages) {
-            const int kk = k + S;
-            const int nn = min(SPS, total - kk*SPS);
-            const int gsk = gs0 + kk*SPS;
-            ggml_cuda_dl_mbar_expect_tx(&full[s], (uint32_t) nn*(XB + yb_bytes));
-            ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + (int64_t) gsk*XB, (uint32_t) nn*XB, &full[s], wpol);
-            for (int j = 0; j < nn; ++j) {
-                ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB, (const char *) y + (int64_t) ((gsk + j) % nst)*yb_bytes, yb_bytes, &full[s]);
+        if constexpr (FMT != GGML_CUDA_DL_FMT_Q8 || SPS != 1) {
+            // Only reused stages need all warps to finish before the next bulk copy.
+            // This condition is uniform across the CTA; no stage is read after its last use.
+            if (k + S < nstages) {
+                __syncthreads();
+            }
+            if (tid == 0 && k + S < nstages) {
+                const int kk = k + S;
+                const int nn = min(SPS, total - kk*SPS);
+                const int gsk = gs0 + kk*SPS;
+                ggml_cuda_dl_mbar_expect_tx(&full[s], (uint32_t) nn*(XB + yb_bytes));
+                ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + (int64_t) gsk*XB, (uint32_t) nn*XB, &full[s], wpol);
+                for (int j = 0; j < nn; ++j) {
+                    ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB, (const char *) y + (int64_t) ((gsk + j) % nst)*yb_bytes, yb_bytes, &full[s]);
+                }
             }
         }
     }
