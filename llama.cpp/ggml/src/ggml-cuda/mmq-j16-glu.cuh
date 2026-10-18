@@ -58,7 +58,8 @@ static __global__ void mul_mat_q_ptq_gu_ring(
         for (int k = 0; k < S && k < nstages; ++k) {
             const int n = min(SPS, total - k*SPS);
             for (int j = 0; j < n; ++j) {
-                const int stj = (gs0 + k*SPS + j) % nst;
+                // Whole-tile segments always begin at K step zero.
+                const int stj = (k*SPS + j) % nst;
                 ggml_cuda_dl_bulk_g2s(smem + k*SB + SPS*XB + j*YB, (const char *) y + (int64_t) stj*yb_bytes, yb_bytes, &full[k]);
             }
         }
@@ -67,6 +68,9 @@ static __global__ void mul_mat_q_ptq_gu_ring(
     const int w = threadIdx.y;
     const int g = threadIdx.x / 4;
     const int c = threadIdx.x % 4;
+    // K position of the next ring refill, always in [0,nst). The pure
+    // whole-tile partition makes this independent of the physical tile.
+    int refill_st = (S*SPS) % nst;
     float sum[1][4] = {{0.0f}};
 #pragma unroll 1
     for (int k = 0; k < nstages; ++k) {
@@ -122,8 +126,11 @@ static __global__ void mul_mat_q_ptq_gu_ring(
             ggml_cuda_dl_mbar_expect_tx(&full[s], (uint32_t) nn*(XB + yb_bytes));
             ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + (int64_t) gsk*XB, (uint32_t) nn*XB, &full[s], wpol);
             for (int j = 0; j < nn; ++j) {
-                ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB, (const char *) y + (int64_t) ((gsk + j) % nst)*yb_bytes, yb_bytes, &full[s]);
+                ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB, (const char *) y + (int64_t) ((refill_st + j) < nst ? (refill_st + j) : (refill_st + j - nst))*yb_bytes, yb_bytes, &full[s]);
             }
+            refill_st += SPS;
+            if (refill_st >= nst) { refill_st -= nst; }
+            if (nst < SPS) { refill_st %= nst; }
         }
     }
 }
