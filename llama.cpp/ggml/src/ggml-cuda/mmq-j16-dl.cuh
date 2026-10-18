@@ -738,7 +738,7 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
 // Same arguments as mul_mat_q_*_j16_dl (TM copy; mode 0 stream-k or mode 1 contiguous whole tiles), dynamic
 // shared memory ggml_cuda_dl_ring_smem<FMT, SPS>(S). Stage layout: weights of the SPS steps, then SPS x 16
 // activation blocks.
-template <int FMT, int S, int SPS>
+template <int FMT, int S, int SPS, bool FULL_STAGES = false>
 __launch_bounds__(16*32, 1)
 static __global__ void mul_mat_q_j16_dl_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
@@ -813,25 +813,49 @@ static __global__ void mul_mat_q_j16_dl_ring(
                 const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
                 const char * sy = smem + s*SB + SPS*XB + j*YB + g*(int) sizeof(block_q8_1_mmq);
                 ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
-                ++st;
-                const bool last = k*SPS + j == total - 1;
-                if (st == nst || last) { // end of a segment: the stores of the DL kernels
-                    if (st == nst) {
-                        const int row = it*I + w*8;
-                        if (row < nrows_lo) {
-                            ggml_cuda_pq2_j16_store<1>(sum, dst, row, stride_col_dst, ncols_dst - 1);
+                if constexpr (!FULL_STAGES) {
+                    ++st;
+                    const bool last = k*SPS + j == total - 1;
+                    if (st == nst || last) { // end of a segment: the stores of the DL kernels
+                        if (st == nst) {
+                            const int row = it*I + w*8;
+                            if (row < nrows_lo) {
+                                ggml_cuda_pq2_j16_store<1>(sum, dst, row, stride_col_dst, ncols_dst - 1);
+                            } else {
+                                ggml_cuda_pq2_j16_store<1>(sum, dst_hi, row - nrows_lo, stride_col_dst, ncols_dst - 1);
+                            }
+                            st = 0;
+                            it += tile_inc;
                         } else {
-                            ggml_cuda_pq2_j16_store<1>(sum, dst_hi, row - nrows_lo, stride_col_dst, ncols_dst - 1);
+                            ggml_cuda_pq2_j16_store<1>(sum, tmp_fixup + (int64_t) blockIdx.x*(J*I), w*8, I, J - 1);
                         }
-                        st = 0;
-                        it += tile_inc;
+    #pragma unroll
+                        for (int l = 0; l < 4; ++l) {
+                            sum[0][l] = 0.0f;
+                        }
+                    }
+                }
+            }
+        }
+        if constexpr (FULL_STAGES) {
+            st += SPS;
+            const bool last = k == nstages - 1;
+            if (st == nst || last) { // end of a segment: the stores of the DL kernels
+                if (st == nst) {
+                    const int row = it*I + w*8;
+                    if (row < nrows_lo) {
+                        ggml_cuda_pq2_j16_store<1>(sum, dst, row, stride_col_dst, ncols_dst - 1);
                     } else {
-                        ggml_cuda_pq2_j16_store<1>(sum, tmp_fixup + (int64_t) blockIdx.x*(J*I), w*8, I, J - 1);
+                        ggml_cuda_pq2_j16_store<1>(sum, dst_hi, row - nrows_lo, stride_col_dst, ncols_dst - 1);
                     }
+                    st = 0;
+                    it += tile_inc;
+                } else {
+                    ggml_cuda_pq2_j16_store<1>(sum, tmp_fixup + (int64_t) blockIdx.x*(J*I), w*8, I, J - 1);
+                }
 #pragma unroll
-                    for (int l = 0; l < 4; ++l) {
-                        sum[0][l] = 0.0f;
-                    }
+                for (int l = 0; l < 4; ++l) {
+                    sum[0][l] = 0.0f;
                 }
             }
         }
@@ -907,14 +931,18 @@ static void ggml_cuda_mmq_dl_launch(Kernel kernel, bool * attr_set, const mmq_ar
 template <int FMT, int S, int SPS>
 static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
                                          const int nkb, float * tmp_fixup, cudaStream_t stream) {
-    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS>;
+    using F = ggml_cuda_dl_fmt<FMT>;
+    // Stream-K endpoints and every tile boundary must coincide with a complete ring stage.
+    const int variant = SPS > 1 && (F::BPI % (F::G*SPS)) == 0 && (nkb / F::G) % SPS == 0;
+    const auto kernel = variant ? mul_mat_q_j16_dl_ring<FMT, S, SPS, true>
+                                : mul_mat_q_j16_dl_ring<FMT, S, SPS, false>;
     constexpr size_t smem = ggml_cuda_dl_ring_smem<FMT, SPS>(S);
-    static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
+    static bool attr[2][GGML_CUDA_MAX_DEVICES] = {};
     const int device = ggml_cuda_get_device();
-    if (!attr[device]) {
+    if (!attr[variant][device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
-        attr[device] = true;
+        attr[variant][device] = true;
     }
     ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, 16, 1), smem, stream),
         (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
