@@ -373,12 +373,14 @@ struct ggml_cuda_dl_q8_xstage {
 
 // The 8 qs bytes of (block, c) sit at a 2-byte aligned address: aligned 32-bit words + funnel shift
 // (the values equal the int8 bytes in memory order, as get_int_b2).
+template <bool ALIGNED_SHARED = false>
 static __device__ __forceinline__ void ggml_cuda_dl_q8_load_x(
         ggml_cuda_dl_q8_xstage & st, const char * __restrict__ xb, const int c) {
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
         const char     * qsi = xb + s*(int) sizeof(block_q8_0) + sizeof(ggml_half) + 8*c;
-        const int        mis = (int) (reinterpret_cast<uintptr_t>(qsi) & 3); // 0 or 2
+        // The TM64 shared step has a 4-byte aligned row base (136 bytes per row).
+        const int mis = ALIGNED_SHARED ? 2*(1 - s%2) : (int) (reinterpret_cast<uintptr_t>(qsi) & 3);
         const uint32_t * qwi = reinterpret_cast<const uint32_t *>(qsi - mis);
         const uint32_t   w0  = qwi[0];
         const uint32_t   w1  = qwi[1];
@@ -767,7 +769,7 @@ static __device__ __forceinline__ void ggml_cuda_ptq1_j16_jit_step(
 }
 
 // Operands of one step of lane (g, c) of warp w from a stage, accumulated into sum (the DL kernels' calls).
-template <int FMT>
+template <int FMT, bool ALIGNED_Q8_SHARED = false>
 static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4], const char * sx, const char * sy, const int c) {
     if constexpr (FMT == GGML_CUDA_DL_FMT_PQ2) {
         ggml_cuda_pq2_j16_stage<1> st;
@@ -780,7 +782,7 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
     } else {
         ggml_cuda_dl_q8_xstage xs;
         ggml_cuda_dl_q8_ystage ys;
-        ggml_cuda_dl_q8_load_x(xs, sx, c);
+        ggml_cuda_dl_q8_load_x<ALIGNED_Q8_SHARED>(xs, sx, c);
         ggml_cuda_dl_q8_load_y(ys, sy, c);
         ggml_cuda_dl_q8_compute(sum[0], xs, ys, c);
     }
