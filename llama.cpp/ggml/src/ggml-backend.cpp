@@ -1632,9 +1632,11 @@ static uint8_t * ggml_backend_sched_input_staging(ggml_backend_sched_t sched, co
         }
     }
 
-    // A scheduler-wide synchronization already completes these uploads. Otherwise
-    // preserve the event wait before overwriting the single pinned staging buffer.
+    // A scheduler-wide synchronization already completes these uploads. If
+    // staging is reused without one, record current backend completion now and
+    // wait before overwriting. Synchronized graphs need no staging event record.
     if (sched->input_staging_pending[backend_id]) {
+        ggml_backend_event_record(sched->input_staging_event[backend_id], backend);
         ggml_backend_event_synchronize(sched->input_staging_event[backend_id]);
         sched->input_staging_pending[backend_id] = false;
     }
@@ -1814,7 +1816,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (ec != GGML_STATUS_SUCCESS) {
                 // Uploads may still use staging even when graph submission fails.
                 if (staging != NULL) {
-                    ggml_backend_event_record(sched->input_staging_event[split_backend_id], split_backend);
                     sched->input_staging_pending[split_backend_id] = true;
                 }
                 return ec;
@@ -1841,7 +1842,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (ec != GGML_STATUS_SUCCESS) {
                     // Uploads may still use staging even when graph submission fails.
                     if (staging != NULL) {
-                        ggml_backend_event_record(sched->input_staging_event[split_backend_id], split_backend);
                         sched->input_staging_pending[split_backend_id] = true;
                     }
                     return ec;
@@ -1863,9 +1863,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
-        // the staging buffer is free again once the split has run
+        // Unsynchronized staging reuse must wait; defer the event until needed.
         if (staging != NULL) {
-            ggml_backend_event_record(sched->input_staging_event[split_backend_id], split_backend);
             sched->input_staging_pending[split_backend_id] = true;
         }
 
@@ -1956,7 +1955,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->events[b][c]);
         }
         if (sched->input_staging_event[b] != NULL) {
-            ggml_backend_event_synchronize(sched->input_staging_event[b]);
+            if (sched->input_staging_pending[b]) {
+                ggml_backend_event_record(sched->input_staging_event[b], sched->backends[b]);
+                ggml_backend_event_synchronize(sched->input_staging_event[b]);
+            }
             ggml_backend_event_free(sched->input_staging_event[b]);
         }
         ggml_backend_buffer_free(sched->input_staging[b]);
