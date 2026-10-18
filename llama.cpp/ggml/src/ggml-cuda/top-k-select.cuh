@@ -23,8 +23,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#define TOPK_SELECT_NT          512
-#define TOPK_SELECT_PER_THREAD  16
+#define TOPK_SELECT_NT          256
+#define TOPK_SELECT_PER_THREAD  32
 #define TOPK_SELECT_CHUNK       (TOPK_SELECT_NT * TOPK_SELECT_PER_THREAD)
 #define TOPK_SELECT_MAX_K       32
 #define TOPK_SELECT_MAX_ROWS    65535
@@ -49,6 +49,24 @@ static __device__ __forceinline__ uint64_t topk_select_warp_max(uint64_t v) {
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         const uint64_t w = __shfl_xor_sync(0xffffffff, v, offset);
+        v = w > v ? w : v;
+    }
+    return v;
+#endif
+}
+
+// Sixteen disjoint 16-lane groups retain a certified threshold with 256 threads.
+static __device__ __forceinline__ uint64_t topk_select_halfwarp_max(uint64_t v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t mask = 0xffffu << (threadIdx.x & 16);
+    const uint32_t hi = (uint32_t) (v >> 32);
+    const uint32_t max_hi = __reduce_max_sync(mask, hi);
+    const uint32_t max_lo = __reduce_max_sync(mask, hi == max_hi ? (uint32_t) v : 0u);
+    return ((uint64_t) max_hi << 32) | max_lo;
+#else
+#pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        const uint64_t w = __shfl_xor_sync(0xffffffffu, v, offset, 16);
         v = w > v ? w : v;
     }
     return v;
@@ -92,6 +110,7 @@ static __device__ __forceinline__ void topk_select_grid_dependency() {
 static __global__ void __launch_bounds__(TOPK_SELECT_NT)
 topk_select_partial(const float * src, uint64_t * part, const int ncols, const int k) {
     __shared__ uint64_t red[TOPK_SELECT_NT / 32 + 1];
+    __shared__ uint64_t threshold_groups[TOPK_SELECT_NT / 16];
     __shared__ uint64_t compact[TOPK_SELECT_COMPACT];
     __shared__ int      compact_count;
 
@@ -117,22 +136,24 @@ topk_select_partial(const float * src, uint64_t * part, const int ncols, const i
         best = v[j] > best ? v[j] : best;
     }
 
-    // Threshold path, k <= number of warps: the warps' maxima are distinct keys, so the smallest of them, T, has
+    // Threshold path: use warp groups for k <= 8 and half-warp groups for 9 <= k <= 16. Their minimum T has
     // at least that many keys >= T and no key < T is in the top k. A zero T (a warp without real keys) keeps every
     // real key. If at most TOPK_SELECT_COMPACT keys survive, warp 0 selects among them; otherwise the block
     // selection below runs on the untouched registers.
-    if (k <= TOPK_SELECT_NT / 32) {
+    if (k <= TOPK_SELECT_NT / 16) {
         const int lane = threadIdx.x % 32;
         const int warp = threadIdx.x / 32;
-        const uint64_t wmax = topk_select_warp_max(best);
-        if (lane == 0) {
-            red[warp] = wmax;
+        const int group_width = k <= TOPK_SELECT_NT / 32 ? 32 : 16;
+        const int ngroups = TOPK_SELECT_NT / group_width;
+        const uint64_t wmax = group_width == 32 ? topk_select_warp_max(best) : topk_select_halfwarp_max(best);
+        if (threadIdx.x % group_width == 0) {
+            threshold_groups[threadIdx.x / group_width] = wmax;
         }
         __syncthreads();
         if (threadIdx.x == 0) {
-            uint64_t t = red[0];
-            for (int w = 1; w < TOPK_SELECT_NT / 32; ++w) {
-                t = red[w] < t ? red[w] : t;
+            uint64_t t = threshold_groups[0];
+            for (int w = 1; w < ngroups; ++w) {
+                t = threshold_groups[w] < t ? threshold_groups[w] : t;
             }
             red[TOPK_SELECT_NT / 32] = t;
             compact_count = 0;
