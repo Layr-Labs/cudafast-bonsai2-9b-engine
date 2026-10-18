@@ -1438,7 +1438,19 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
-template <ggml_type type, int J, bool fallback, int GRID = 0>
+// Exact power-of-two divisor specialization, selected only by the DL host launcher.
+template <bool POW2_NKB>
+static __device__ __forceinline__ uint32_t ggml_cuda_mmq_fixup_div(uint32_t n, const uint3 fd) {
+    if constexpr (POW2_NKB) { return n >> fd.y; }
+    return fastdiv(n, fd);
+}
+template <bool POW2_NKB>
+static __device__ __forceinline__ uint32_t ggml_cuda_mmq_fixup_mod(uint32_t n, const uint3 fd) {
+    if constexpr (POW2_NKB) { return n & (fd.z - 1); }
+    return fastmodulo(n, fd);
+}
+
+template <ggml_type type, int J, bool fallback, int GRID = 0, bool POW2_NKB = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
@@ -1470,12 +1482,12 @@ static __global__ void mul_mat_q_stream_k_fixup(
     int kbc0      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / grid_width;
     int kbc0_stop = int64_t(blockIdx.x + 1)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / grid_width;
 
-    kbc0      -= fastmodulo(kbc0,      blocks_per_ne00) % blocks_per_iter;
-    kbc0_stop -= fastmodulo(kbc0_stop, blocks_per_ne00) % blocks_per_iter;
+    kbc0      -= ggml_cuda_mmq_fixup_mod<POW2_NKB>(kbc0, blocks_per_ne00) % blocks_per_iter;
+    kbc0_stop -= ggml_cuda_mmq_fixup_mod<POW2_NKB>(kbc0_stop, blocks_per_ne00) % blocks_per_iter;
 
     const bool did_not_have_any_data   = kbc0 == kbc0_stop;
-    const bool wrote_beginning_of_tile = fastmodulo(kbc0, blocks_per_ne00) == 0;
-    const bool did_not_write_last      = fastdiv(kbc0, blocks_per_ne00) == fastdiv(kbc0_stop, blocks_per_ne00) && fastmodulo(kbc0_stop, blocks_per_ne00) != 0;
+    const bool wrote_beginning_of_tile = ggml_cuda_mmq_fixup_mod<POW2_NKB>(kbc0, blocks_per_ne00) == 0;
+    const bool did_not_write_last      = ggml_cuda_mmq_fixup_div<POW2_NKB>(kbc0, blocks_per_ne00) == ggml_cuda_mmq_fixup_div<POW2_NKB>(kbc0_stop, blocks_per_ne00) && ggml_cuda_mmq_fixup_mod<POW2_NKB>(kbc0_stop, blocks_per_ne00) != 0;
     if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
         return;
     }
@@ -1488,7 +1500,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     int kbc_stop = kbc0;
     while(true) {
         int kbc = int64_t(bidx)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / grid_width;
-        kbc -= fastmodulo(kbc, blocks_per_ne00) % blocks_per_iter;
+        kbc -= ggml_cuda_mmq_fixup_mod<POW2_NKB>(kbc, blocks_per_ne00) % blocks_per_iter;
 
         if (kbc == kbc_stop) { // Did not have any data.
             bidx--;
@@ -1507,7 +1519,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
         }
 
         // If this block started in a previous tile we are done and don't need to combine additional partial results.
-        if (fastmodulo(kbc, blocks_per_ne00) == 0 || fastdiv(kbc, blocks_per_ne00) < fastdiv(kbc0, blocks_per_ne00)) {
+        if (ggml_cuda_mmq_fixup_mod<POW2_NKB>(kbc, blocks_per_ne00) == 0 || ggml_cuda_mmq_fixup_div<POW2_NKB>(kbc, blocks_per_ne00) < ggml_cuda_mmq_fixup_div<POW2_NKB>(kbc0, blocks_per_ne00)) {
             break;
         }
         bidx--;
@@ -1518,7 +1530,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
         return;
     }
 
-    int tmp = fastdiv(kbc0, blocks_per_ne00);
+    int tmp = ggml_cuda_mmq_fixup_div<POW2_NKB>(kbc0, blocks_per_ne00);
     uint2 tmp2 = fast_div_modulo(tmp, ntx);
     const int jt = tmp2.y;
     tmp = tmp2.x;
