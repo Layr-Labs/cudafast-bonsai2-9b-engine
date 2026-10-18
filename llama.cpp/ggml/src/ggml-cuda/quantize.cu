@@ -1326,6 +1326,12 @@ static __global__ void fwht_quantize_mmq_d4_fixup_add_rms(const float * a, const
     a+=row*N;
     b+=row*N;
     sum+=row*N;
+    // NT is a multiple of 256, so advancing m increases source by
+    // 3*NT/256 exactly. Hoist the thread-local base once, leaving the
+    // original floating-point fixup operations and order unchanged.
+    const int tile0 = tid/128;
+    partials += (tile0 + tile0/2)*2048 + row*128 + tid%128;
+    constexpr int PARTIAL_STRIDE = (3*NT/256)*2048;
     float tmp[R];
 #pragma unroll
     for(int j=0;j<R;++j) tmp[j]=0.0f;
@@ -1334,10 +1340,8 @@ static __global__ void fwht_quantize_mmq_d4_fixup_add_rms(const float * a, const
         const int col=m*NT+tid;
         // M4096 / grid48 / K4096 or K12288: one original partial per tile.
         // Keep the original fixup's +0 accumulation and suffix += partial_sum.
-        const int tile=col/128;
-        const int source=tile+tile/2;
         float partial_sum=0.0f;
-        partial_sum+=partials[source*2048+row*128+col%128];
+        partial_sum+=partials[m*PARTIAL_STRIDE];
         float corrected=a[col];
         corrected+=partial_sum;
         const float xi=__fadd_rn(corrected, b[col]);
