@@ -1110,15 +1110,19 @@ static __global__ void fwht_quantize_mmq_d4_glu_perm(const T * x, const T * g, c
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
     }
+    // NT=256 advances whole MMQ blocks; the intra-block byte/scale
+    // offsets and the starting row/block pointer are invariant.
+    const int64_t col0=base+tid;
+    const int offset=col0%QK8_1_MMQ;
+    y+=(col0/QK8_1_MMQ)*rows+row;
+    const int64_t stride=(NT/QK8_1_MMQ)*rows;
 #pragma unroll
     for(int i=0;i<NE;++i) {
-        const int64_t col=base+i*NT+tid;
         const float amax=warp_reduce_max<32>(fabsf(v[i]));
         const float d_inv=127.0f/amax;
         const int8_t q=roundf(v[i]*d_inv);
-        const int64_t ib=(col/QK8_1_MMQ)*rows+row;
-        y[ib].qs[col%QK8_1_MMQ]=q;
-        if(lane==0) y[ib].d4[(col%QK8_1_MMQ)/32]=1.0f/d_inv;
+        y[i*stride].qs[offset]=q;
+        if(lane==0) y[i*stride].d4[offset/32]=1.0f/d_inv;
     }
 }
 
@@ -1431,15 +1435,19 @@ static __global__ void fwht_quantize_mmq_d4_sigmoid_gate(const float * gate, con
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
     }
+    // NT=256 advances whole MMQ blocks; the intra-block byte/scale
+    // offsets and the starting row/block pointer are invariant.
+    const int64_t col0=base+tid;
+    const int offset=col0%QK8_1_MMQ;
+    y+=(col0/QK8_1_MMQ)*rows+row;
+    const int64_t stride=(NT/QK8_1_MMQ)*rows;
 #pragma unroll
     for(int i=0;i<NE;++i) {
-        const int64_t col=base+i*NT+tid;
         const float amax=warp_reduce_max<32>(fabsf(v[i]));
         const float d_inv=127.0f/amax;
         const int8_t q=roundf(v[i]*d_inv);
-        const int64_t ib=(col/QK8_1_MMQ)*rows+row;
-        y[ib].qs[col%QK8_1_MMQ]=q;
-        if(lane==0) y[ib].d4[(col%QK8_1_MMQ)/32]=1.0f/d_inv;
+        y[i*stride].qs[offset]=q;
+        if(lane==0) y[i*stride].d4[offset/32]=1.0f/d_inv;
     }
 }
 
