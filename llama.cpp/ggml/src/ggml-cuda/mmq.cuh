@@ -1438,7 +1438,7 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
-template <ggml_type type, int J, bool fallback, int GRID = 0>
+template <ggml_type type, int J, bool fallback, int GRID = 0, bool DL_LAYOUT = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
@@ -1466,9 +1466,13 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int bidx0 = blockIdx.x;
     const int grid_width = GRID > 0 ? GRID : (int)gridDim.x;
 
+    // DL callers have exactly one sample, channel and column tile; generic callers retain all dimensions.
+    const uint32_t total_kblocks = DL_LAYOUT ? nty*blocks_per_ne00.z
+        : nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z;
+
     // kbc == k block continuous, current index in continuous ijk space.
-    int kbc0      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / grid_width;
-    int kbc0_stop = int64_t(blockIdx.x + 1)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / grid_width;
+    int kbc0      = int64_t(blockIdx.x)    *total_kblocks / grid_width;
+    int kbc0_stop = int64_t(blockIdx.x + 1)*total_kblocks / grid_width;
 
     kbc0      -= fastmodulo(kbc0,      blocks_per_ne00) % blocks_per_iter;
     kbc0_stop -= fastmodulo(kbc0_stop, blocks_per_ne00) % blocks_per_iter;
@@ -1487,7 +1491,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     int bidx = bidx0 - 1;
     int kbc_stop = kbc0;
     while(true) {
-        int kbc = int64_t(bidx)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / grid_width;
+        int kbc = int64_t(bidx)*total_kblocks / grid_width;
         kbc -= fastmodulo(kbc, blocks_per_ne00) % blocks_per_iter;
 
         if (kbc == kbc_stop) { // Did not have any data.
@@ -1515,6 +1519,24 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 
     if (!any_fixup) {
+        return;
+    }
+
+    if constexpr (DL_LAYOUT) {
+        // This arm is launched only by the ID-free DL route with ntx=nchannels=nsamples=1.
+        const int it = fastdiv(kbc0, blocks_per_ne00);
+        dst += it*I;
+        if (fallback && i >= nrows_x - it*I) {
+            return;
+        }
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps) {
+            const int j = j0 + threadIdx.y;
+            if (j >= ncols_dst) {
+                return;
+            }
+            dst[j*stride_col_dst + i] += sum[j0/nwarps];
+        }
         return;
     }
 
