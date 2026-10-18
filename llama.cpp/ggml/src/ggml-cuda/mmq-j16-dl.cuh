@@ -181,6 +181,33 @@ static __device__ __forceinline__ void ggml_cuda_dl_work(int & it, int & st, int
     it = gs / nst; st = gs - it*nst; rem = gs_stop - gs; tile_inc = 1;
 }
 
+template <int G, int blocks_per_iter>
+static __device__ __forceinline__ void ggml_cuda_dl_work_static48(int & it, int & st, int & rem, int & tile_inc,
+                                                         const int nty, const int nkb, const int mode) {
+    const int b   = blockIdx.x;
+    const int nst = nkb / G;
+    if (mode == 2) {
+        it = b; st = 0; tile_inc = 48u;
+        rem = b < nty ? ((nty - 1 - b)/48u + 1)*nst : 0;
+        return;
+    }
+    int gs, gs_stop;
+    if (mode == 1) {
+        gs      = (int) ((int64_t) b      *nty / 48u) * nst;
+        gs_stop = (int) ((int64_t) (b + 1)*nty / 48u) * nst;
+    } else {
+        const int64_t W = (int64_t) nty*nkb;
+        int kbc      = (int) ((int64_t) b      *W / 48u);
+        int kbc_stop = (int) ((int64_t) (b + 1)*W / 48u);
+        kbc      -= (kbc      % nkb) % blocks_per_iter;
+        kbc_stop -= (kbc_stop % nkb) % blocks_per_iter;
+        gs      = kbc / G;
+        gs_stop = kbc_stop / G;
+    }
+    it = gs / nst; st = gs - it*nst; rem = gs_stop - gs; tile_inc = 1;
+}
+
+
 // Address of the group (row 8*w + g of tile it, step st).
 template <int LAYOUT, int GB>
 static __device__ __forceinline__ const char * ggml_cuda_dl_group(
@@ -738,7 +765,7 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
 // Same arguments as mul_mat_q_*_j16_dl (TM copy; mode 0 stream-k or mode 1 contiguous whole tiles), dynamic
 // shared memory ggml_cuda_dl_ring_smem<FMT, SPS>(S). Stage layout: weights of the SPS steps, then SPS x 16
 // activation blocks.
-template <int FMT, int S, int SPS>
+template <int FMT, int S, int SPS, bool STATIC_GRID = false>
 __launch_bounds__(16*32, 1)
 static __global__ void mul_mat_q_j16_dl_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
@@ -759,7 +786,11 @@ static __global__ void mul_mat_q_j16_dl_ring(
     const int nst = nkb / G;
     const int nty = nrows_x / I;
     int it, st, rem, tile_inc;
-    ggml_cuda_dl_work<G, F::BPI>(it, st, rem, tile_inc, nty, nkb, mode);
+    if constexpr (STATIC_GRID) {
+        ggml_cuda_dl_work_static48<G, F::BPI>(it, st, rem, tile_inc, nty, nkb, mode);
+    } else {
+        ggml_cuda_dl_work<G, F::BPI>(it, st, rem, tile_inc, nty, nkb, mode);
+    }
     const int total   = rem;
     const int nstages = (total + SPS - 1) / SPS;
     const int gs0     = it*nst + st;
@@ -921,6 +952,24 @@ static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_
         (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
 }
 
+template <int FMT, int S, int SPS>
+static void ggml_cuda_mmq_dl_launch_ring_static48(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
+                                         const int nkb, float * tmp_fixup, cudaStream_t stream) {
+    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS, true>;
+    constexpr size_t smem = ggml_cuda_dl_ring_smem<FMT, SPS>(S);
+    static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
+    const int device = ggml_cuda_get_device();
+    if (!attr[device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
+        attr[device] = true;
+    }
+    ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, 16, 1), smem, stream),
+        (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
+        (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
+}
+
+
 static int ggml_cuda_dl_env_int(const char * name, const int dflt) {
     const char * v = getenv(name);
     return v ? atoi(v) : dflt;
@@ -986,7 +1035,11 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
         static const bool ring     = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING", 1) != 0;
         static const int  ring_min = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_MIN_ROWS", 4096);
         if (ring && args.nrows_x >= ring_min) {
-            ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_Q8, 2, 1>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+            if (!tiling && grid == 48) {
+                ggml_cuda_mmq_dl_launch_ring_static48<GGML_CUDA_DL_FMT_Q8, 2, 1>(args, e, grid, 0, nkb, tmp_fixup, stream);
+            } else {
+                ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_Q8, 2, 1>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+            }
         } else {
             static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
             ggml_cuda_mmq_dl_launch(mul_mat_q_q8_0_j16_dl<TM, GGML_CUDA_DL_H_SECTOR, 2, 1>, attr, args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
