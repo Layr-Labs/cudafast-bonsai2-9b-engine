@@ -1019,7 +1019,16 @@ static __device__ __forceinline__ void fwht_quantize_mmq_d4_store(const float * 
 #pragma unroll
     for(int i=0;i<N/NT;++i) {
         const int64_t col=base+i*NT+tid;
-        const float amax=warp_reduce_max<32>(fabsf(v[i]));
+        const float magnitude = fabsf(v[i]);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+        // Nonnegative IEEE bits have the same order as normal float magnitudes.
+        // Zero magnitudes are exactly +0; preserve fallback for NaNs and nonzero denormal-only groups.
+        const uint32_t max_bits = __reduce_max_sync(0xffffffffu, __float_as_uint(magnitude));
+        const float amax = (max_bits == 0u || (max_bits >= 0x00800000u && max_bits <= 0x7f800000u)) ?
+            __uint_as_float(max_bits) : warp_reduce_max<32>(magnitude);
+#else
+        const float amax = warp_reduce_max<32>(magnitude);
+#endif
         const float d_inv=127.0f/amax;
         const int8_t q=roundf(v[i]*d_inv);
         const int64_t ib=(col/QK8_1_MMQ)*rows+row;
