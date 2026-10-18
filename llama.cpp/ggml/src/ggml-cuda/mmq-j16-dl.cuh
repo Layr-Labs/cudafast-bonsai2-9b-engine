@@ -1,4 +1,5 @@
 #pragma once
+#include "mmq-j16-tile-fixup.cuh"
 
 // GB10 (sm_121) decode layout ("DL") of the J=16 MMQ weights, plus the streaming J=16 kernels that read it.
 //
@@ -993,6 +994,18 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
         }
     }
     if (!tiling) {
+        // Bound products used by the exact uint32 fast-division path. Wider shapes
+        // retain the generic int64 partition computation below.
+        const int ntiles_fix = (int) (args.nrows_x / 128);
+        const int64_t work_fix = int64_t(ntiles_fix) * nkb;
+        if (args.nrows_x <= INT32_MAX && args.nrows_dst <= INT32_MAX &&
+                work_fix * grid <= INT32_MAX && int64_t(ntiles_fix) * grid <= INT32_MAX) {
+            ggml_cuda_kernel_launch(ggml_cuda_j16_tile_fixup<type>,
+                ggml_cuda_kernel_launch_params(dim3(ntiles_fix, 4), dim3(32, 4), 0, stream),
+                args.dst, tmp_fixup, (int) args.ncols_dst, (int) args.nrows_dst,
+                init_fastdiv_values(nkb), init_fastdiv_values(ntiles_fix), init_fastdiv_values(grid));
+            return;
+        }
         const uint3 blocks_per_ne00_fd = init_fastdiv_values(nkb);
         const uint3 one_fd             = init_fastdiv_values(1);
         ggml_cuda_kernel_launch(mul_mat_q_stream_k_fixup<type, 16, false>,
