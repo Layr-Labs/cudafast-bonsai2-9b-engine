@@ -1,5 +1,6 @@
 #include "norm.cuh"
 #include <cstdint>
+#include "l2norm-cached.cuh"
 
 template <int block_size>
 static __global__ void norm_f32(
@@ -505,7 +506,10 @@ static void l2_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
-    if (ncols < 1024) {
+    if (ncols == 128 && WARP_SIZE == 32) {
+        const ggml_cuda_kernel_launch_params launch_params{blocks_num, dim3(WARP_SIZE, 1, 1), 0, stream};
+        ggml_cuda_kernel_launch(l2_norm_f32_cached_128, launch_params, x, dst, stride_row, stride_channel, stride_sample, eps);
+    } else if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, stream};
         ggml_cuda_kernel_launch(l2_norm_f32<WARP_SIZE>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
