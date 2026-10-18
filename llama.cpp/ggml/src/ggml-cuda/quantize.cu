@@ -1407,7 +1407,7 @@ static __device__ __forceinline__ float fwht_gate_op_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
-template <bool SIGNED>
+template <bool SIGNED, bool STRIDED>
 __launch_bounds__(256, 1)
 static __global__ void fwht_quantize_mmq_d4_sigmoid_gate(const float * gate, const float * attn, const float * signs,
         block_q8_1_mmq * y, int64_t k, int64_t rows, int n0, int64_t g1, int64_t gt, int64_t at) {
@@ -1419,11 +1419,20 @@ static __global__ void fwht_quantize_mmq_d4_sigmoid_gate(const float * gate, con
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
     if (base<k) {
+        // n0==NT: fixed in-row input and one exact g1 stride per register.
+        const float * gate_base=gate;
+        if constexpr (STRIDED) gate_base += row*gt+(base/NT)*g1+tid;
 #pragma unroll
         for(int i=0;i<NE;++i) {
             const int64_t col=base+i*NT+tid;
-            const int c=int(col), i1=c/n0, i0=c-i1*n0;
-            v[i]=float(fwht_gate_op_sigmoid(float(gate[row*gt+i1*g1+i0]))*float(attn[row*at+col]))*(1.0f/64.0f);
+            float gate_value;
+            if constexpr (STRIDED) {
+                gate_value=gate_base[i*g1];
+            } else {
+                const int c=int(col), i1=c/n0, i0=c-i1*n0;
+                gate_value=gate[row*gt+i1*g1+i0];
+            }
+            v[i]=float(fwht_gate_op_sigmoid(float(gate_value))*float(attn[row*at+col]))*(1.0f/64.0f);
             if constexpr(SIGNED) v[i]*=signs[col];
         }
         ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
@@ -1448,9 +1457,12 @@ void fwht_quantize_mmq_d4_sigmoid_gate_cuda(const float * gate, const float * at
     GGML_ASSERT(k%4096==0 && kp%4096==0 && kp>=k && n0>0);
     const dim3 grid(kp/4096,rows,1);
     const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
-    if (signs) {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_sigmoid_gate<true>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at);
-    } else {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_sigmoid_gate<false>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at);
-    }
+#define SIGMOID_STRIDE_LAUNCH(S) do { if (signs) { \
+    ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_sigmoid_gate<true,S>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at); \
+    } else { \
+    ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_sigmoid_gate<false,S>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at); \
+    } } while (0)
+    if (kp<=INT32_MAX && n0==256) { SIGMOID_STRIDE_LAUNCH(true); }
+    else { SIGMOID_STRIDE_LAUNCH(false); }
+#undef SIGMOID_STRIDE_LAUNCH
 }
