@@ -1384,7 +1384,7 @@ static __global__ void __launch_bounds__(256, 3) gdn_compact32_prepare(
     const int n = min(C, prefix_tokens-t0);
     const int kh = fastmodulo(h, neqk1_magic);
     gdn_compact32 & out = work[ch*H+h];
-    __shared__ __align__(16) float ks[C][PITCH];
+    __shared__ __align__(16) float ks[C][PITCH], qs[8][PITCH];
     __shared__ float lower[C][C+1];
     __shared__ float decay[C], b[C];
     ggml_cuda_pdl_sync();
@@ -1424,15 +1424,15 @@ static __global__ void __launch_bounds__(256, 3) gdn_compact32_prepare(
         // shuffles, including j>i; only the Gram FMAs are triangular.
         if (i < n) {
             const float * qi = q+kh*sq1+(t0+i)*sq2;
-            const float4 q_lane = make_float4(gdn_chunk32_load1(qi+j), gdn_chunk32_load1(qi+j+32),
-                gdn_chunk32_load1(qi+j+64), gdn_chunk32_load1(qi+j+96));
+            // Each warp stages only its current query row, not the full chunk.
+            // The leading fence prevents reuse until every lane finished its previous row.
+            __syncwarp();
+            *(float4 *) &qs[tid/32][4*j] = gdn_chunk32_load4(qi+4*j);
+            __syncwarp();
             if (j <= i) { for (int t = j+1; t <= i; ++t) { ratio *= decay[t]; } }
 #pragma unroll
             for (int r = 0; r < 128; r += 4) {
-                const float qr = r < 32 ? q_lane.x : r < 64 ? q_lane.y : r < 96 ? q_lane.z : q_lane.w;
-                const float4 q4 = make_float4(__shfl_sync(0xffffffffu, qr, (r%32)+0),
-                    __shfl_sync(0xffffffffu, qr, (r%32)+1), __shfl_sync(0xffffffffu, qr, (r%32)+2),
-                    __shfl_sync(0xffffffffu, qr, (r%32)+3));
+                const float4 q4 = *(const float4 *) &qs[tid/32][r];
                 if (j <= i) {
                     const float4 ki = *(const float4 *) &ks[i][r];
                     const float4 kj = *(const float4 *) &ks[j][r];
