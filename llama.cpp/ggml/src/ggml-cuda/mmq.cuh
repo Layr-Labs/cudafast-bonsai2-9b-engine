@@ -1473,11 +1473,22 @@ static __global__ void mul_mat_q_stream_k_fixup(
     kbc0      -= fastmodulo(kbc0,      blocks_per_ne00) % blocks_per_iter;
     kbc0_stop -= fastmodulo(kbc0_stop, blocks_per_ne00) % blocks_per_iter;
 
-    const bool did_not_have_any_data   = kbc0 == kbc0_stop;
-    const bool wrote_beginning_of_tile = fastmodulo(kbc0, blocks_per_ne00) == 0;
-    const bool did_not_write_last      = fastdiv(kbc0, blocks_per_ne00) == fastdiv(kbc0_stop, blocks_per_ne00) && fastmodulo(kbc0_stop, blocks_per_ne00) != 0;
-    if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
-        return;
+    int tile_begin = 0;
+    if constexpr (GRID == 48) {
+        const int tile_k = fastmodulo(kbc0, blocks_per_ne00);
+        tile_begin = kbc0 - tile_k;
+        // Monotone aligned partitions: an interior start needs fixup iff
+        // this partition reaches the tile end. Widen before subtracting.
+        if (tile_k == 0 || int64_t(kbc0_stop) - kbc0 < int64_t(blocks_per_ne00.z) - tile_k) {
+            return;
+        }
+    } else {
+        const bool did_not_have_any_data   = kbc0 == kbc0_stop;
+        const bool wrote_beginning_of_tile = fastmodulo(kbc0, blocks_per_ne00) == 0;
+        const bool did_not_write_last      = fastdiv(kbc0, blocks_per_ne00) == fastdiv(kbc0_stop, blocks_per_ne00) && fastmodulo(kbc0_stop, blocks_per_ne00) != 0;
+        if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
+            return;
+        }
     }
 
     bool any_fixup = false;
@@ -1497,7 +1508,6 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
     // All visited starts are <= kbc0. The first start at/before this
     // tile boundary terminates the same descending reduction as div/mod.
-    const int tile_begin = PARTITION_TABLE ? kbc0 - fastmodulo(kbc0, blocks_per_ne00) : 0;
     int bidx = bidx0 - 1;
     int kbc_stop = kbc0;
     while(true) {
