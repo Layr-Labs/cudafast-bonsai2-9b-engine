@@ -1438,7 +1438,7 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
-template <ggml_type type, int J, bool fallback, int GRID = 0>
+template <ggml_type type, int J, bool fallback, int GRID = 0, bool PARTITION_TABLE = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
@@ -1484,11 +1484,32 @@ static __global__ void mul_mat_q_stream_k_fixup(
 
     // Iterate over previous blocks and sum up partial sums written to fixup buffer.
     // All CUDA blocks that get here must have a previous block that needs a fixup.
+    // Each warp caches 48 exact partition starts in two lane-distributed registers.
+    // Shuffles discover prior partitions; floating-point sums remain sequential.
+    int lane_start_lo = 0, lane_start_hi = 0;
+    if constexpr (PARTITION_TABLE) {
+        static_assert(GRID == 48, "partition table is specialized for the DL48 grid");
+        const int lane = threadIdx.x;
+        lane_start_lo = int64_t(lane)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / GRID;
+        lane_start_hi = int64_t(lane + warp_size)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / GRID;
+        lane_start_lo -= fastmodulo(lane_start_lo, blocks_per_ne00) % blocks_per_iter;
+        lane_start_hi -= fastmodulo(lane_start_hi, blocks_per_ne00) % blocks_per_iter;
+    }
+    // All visited starts are <= kbc0. The first start at/before this
+    // tile boundary terminates the same descending reduction as div/mod.
+    const int tile_begin = PARTITION_TABLE ? kbc0 - fastmodulo(kbc0, blocks_per_ne00) : 0;
     int bidx = bidx0 - 1;
     int kbc_stop = kbc0;
     while(true) {
-        int kbc = int64_t(bidx)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / grid_width;
-        kbc -= fastmodulo(kbc, blocks_per_ne00) % blocks_per_iter;
+        int kbc;
+        if constexpr (PARTITION_TABLE) {
+            const int lo = __shfl_sync(0xffffffffu, lane_start_lo, bidx % warp_size);
+            const int hi = __shfl_sync(0xffffffffu, lane_start_hi, bidx % warp_size);
+            kbc = bidx < warp_size ? lo : hi;
+        } else {
+            kbc = int64_t(bidx)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / grid_width;
+            kbc -= fastmodulo(kbc, blocks_per_ne00) % blocks_per_iter;
+        }
 
         if (kbc == kbc_stop) { // Did not have any data.
             bidx--;
@@ -1507,7 +1528,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
         }
 
         // If this block started in a previous tile we are done and don't need to combine additional partial results.
-        if (fastmodulo(kbc, blocks_per_ne00) == 0 || fastdiv(kbc, blocks_per_ne00) < fastdiv(kbc0, blocks_per_ne00)) {
+        if (PARTITION_TABLE ? kbc <= tile_begin :
+                (fastmodulo(kbc, blocks_per_ne00) == 0 || fastdiv(kbc, blocks_per_ne00) < fastdiv(kbc0, blocks_per_ne00))) {
             break;
         }
         bidx--;
