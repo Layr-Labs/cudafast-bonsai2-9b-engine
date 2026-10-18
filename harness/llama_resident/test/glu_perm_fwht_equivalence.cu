@@ -42,7 +42,7 @@ int main() {
     std::mt19937 rng(20261016);
     std::uniform_real_distribution<float> dist(-8.0f, 8.0f);
     std::uniform_int_distribution<int> pick(0, int(sizeof(special) / sizeof(special[0])) - 1);
-    const geometry geoms[] = { {128, 16, 2}, {128, 8, 4}, {128, 32, 1}, {64, 32, 2}, {128, 32, 2}, {256, 4, 8} };
+    const geometry geoms[] = { {128, 16, 2}, {128, 8, 4}, {128, 32, 1}, {64, 32, 2}, {128, 32, 2}, {256, 4, 8}, {96, 32, 4}, {128, 32, 3}, {64, 16, 12}, {4096, 1, 1} };
     int cases = 0;
     for (const geometry & gm : geoms) for (int rows : {1, 3, 16, 512}) for (bool signs_on : {false, true})
     for (bool padded : {false, true}) for (int mode : {0, 1, 2}) {

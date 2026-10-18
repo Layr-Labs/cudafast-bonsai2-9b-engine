@@ -1085,10 +1085,11 @@ void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * sig
 // <op_silu, T>'s expression (x activated, g the multiplier, row strides o0/o1 in elements), so it is the
 // value that kernel and the CONT would have stored. The butterfly and the quantization are
 // fwht_quantize_mmq_d4's.
-template <typename T, bool SIGNED>
+template <typename T, bool SIGNED, int DIVMODE>
 __launch_bounds__(256, 1)
 static __global__ void fwht_quantize_mmq_d4_glu_perm(const T * x, const T * g, const float * signs, block_q8_1_mmq * y,
-        int64_t k, int64_t rows, int64_t o0, int64_t o1, int n0, int n1, int64_t s1, int64_t s2) {
+        int64_t k, int64_t rows, int64_t o0, int64_t o1, int n0, int n1, int64_t s1, int64_t s2,
+        const uint3 n0_fd, const uint3 n1_fd) {
     constexpr int N=4096, NT=256, NE=N/NT;
     __shared__ float shared[N];
     const int tid=threadIdx.x, lane=tid%32;
@@ -1100,7 +1101,20 @@ static __global__ void fwht_quantize_mmq_d4_glu_perm(const T * x, const T * g, c
 #pragma unroll
         for(int i=0;i<NE;++i) {
             const int64_t col=base+i*NT+tid;
-            const int c=int(col), q=c/n0, i0=c-q*n0, i2=q/n1, i1=q-i2*n1;
+            int i0, i1, i2;
+            if constexpr (DIVMODE>0) {
+                // Host guard proves col fits the original nonnegative int domain.
+                const uint2 q0=DIVMODE==2
+                    ? make_uint2((uint32_t)col>>n0_fd.y,(uint32_t)col&(n0_fd.z-1))
+                    : fast_div_modulo((uint32_t)col,n0_fd);
+                const uint2 q1=DIVMODE==2
+                    ? make_uint2(q0.x>>n1_fd.y,q0.x&(n1_fd.z-1))
+                    : fast_div_modulo(q0.x,n1_fd);
+                i0=q0.y; i1=q1.y; i2=q1.x;
+            } else {
+                const int c=int(col), q=c/n0;
+                i0=c-q*n0; i2=q/n1; i1=q-i2*n1;
+            }
             const int64_t src=i0+s1*i1+s2*i2;
             v[i]=float(T(ggml_cuda_op_silu_single(float(x[row*o0+src]))*float(g[row*o1+src])))*(1.0f/64.0f);
             if constexpr(SIGNED) v[i]*=signs[col];
@@ -1128,11 +1142,15 @@ void fwht_quantize_mmq_d4_glu_perm_cuda(const float * x, const float * g, const 
     GGML_ASSERT(k%4096==0 && kp%4096==0 && kp>=k && n0>0 && n1>0);
     const dim3 grid(kp/4096,rows,1);
     const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
-    if (signs) {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_glu_perm<float,true>,lp,x,g,signs,(block_q8_1_mmq*)y,k,rows,o0,o1,n0,n1,s1,s2);
-    } else {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_glu_perm<float,false>,lp,x,g,signs,(block_q8_1_mmq*)y,k,rows,o0,o1,n0,n1,s1,s2);
-    }
+    const uint3 n0_fd=init_fastdiv_values(n0), n1_fd=init_fastdiv_values(n1);
+#define GLU_PERM_DIV_LAUNCH(FD) do { if(signs) { \
+    ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_glu_perm<float,true,FD>,lp,x,g,signs,(block_q8_1_mmq*)y,k,rows,o0,o1,n0,n1,s1,s2,n0_fd,n1_fd); \
+    } else { \
+    ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_glu_perm<float,false,FD>,lp,x,g,signs,(block_q8_1_mmq*)y,k,rows,o0,o1,n0,n1,s1,s2,n0_fd,n1_fd); \
+    } } while(0)
+    if (kp<=INT32_MAX && (n0&(n0-1))==0 && (n1&(n1-1))==0) { GLU_PERM_DIV_LAUNCH(2); }
+    else if (kp<=INT32_MAX) { GLU_PERM_DIV_LAUNCH(1); } else { GLU_PERM_DIV_LAUNCH(0); }
+#undef GLU_PERM_DIV_LAUNCH
 }
 
 // RMS_NORM * w in front of the signed transform, one block per 4096-wide row. The sum of squares is
@@ -1407,10 +1425,11 @@ static __device__ __forceinline__ float fwht_gate_op_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
-template <bool SIGNED>
+template <bool SIGNED, int DIVMODE>
 __launch_bounds__(256, 1)
 static __global__ void fwht_quantize_mmq_d4_sigmoid_gate(const float * gate, const float * attn, const float * signs,
-        block_q8_1_mmq * y, int64_t k, int64_t rows, int n0, int64_t g1, int64_t gt, int64_t at) {
+        block_q8_1_mmq * y, int64_t k, int64_t rows, int n0, int64_t g1, int64_t gt, int64_t at,
+        const uint3 n0_fd) {
     constexpr int N=4096, NT=256, NE=N/NT;
     __shared__ float shared[N];
     const int tid=threadIdx.x, lane=tid%32;
@@ -1422,7 +1441,15 @@ static __global__ void fwht_quantize_mmq_d4_sigmoid_gate(const float * gate, con
 #pragma unroll
         for(int i=0;i<NE;++i) {
             const int64_t col=base+i*NT+tid;
-            const int c=int(col), i1=c/n0, i0=c-i1*n0;
+            int i0, i1;
+            if constexpr (DIVMODE>0) {
+                const uint2 q0=DIVMODE==2
+                    ? make_uint2((uint32_t)col>>n0_fd.y,(uint32_t)col&(n0_fd.z-1))
+                    : fast_div_modulo((uint32_t)col,n0_fd);
+                i0=q0.y; i1=q0.x;
+            } else {
+                const int c=int(col); i1=c/n0; i0=c-i1*n0;
+            }
             v[i]=float(fwht_gate_op_sigmoid(float(gate[row*gt+i1*g1+i0]))*float(attn[row*at+col]))*(1.0f/64.0f);
             if constexpr(SIGNED) v[i]*=signs[col];
         }
@@ -1448,9 +1475,13 @@ void fwht_quantize_mmq_d4_sigmoid_gate_cuda(const float * gate, const float * at
     GGML_ASSERT(k%4096==0 && kp%4096==0 && kp>=k && n0>0);
     const dim3 grid(kp/4096,rows,1);
     const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
-    if (signs) {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_sigmoid_gate<true>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at);
-    } else {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_sigmoid_gate<false>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at);
-    }
+    const uint3 n0_fd=init_fastdiv_values(n0);
+#define SIGMOID_DIV_LAUNCH(FD) do { if(signs) { \
+    ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_sigmoid_gate<true,FD>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at,n0_fd); \
+    } else { \
+    ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_sigmoid_gate<false,FD>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at,n0_fd); \
+    } } while(0)
+    if (kp<=INT32_MAX && (n0&(n0-1))==0) { SIGMOID_DIV_LAUNCH(2); }
+    else if (kp<=INT32_MAX) { SIGMOID_DIV_LAUNCH(1); } else { SIGMOID_DIV_LAUNCH(0); }
+#undef SIGMOID_DIV_LAUNCH
 }
