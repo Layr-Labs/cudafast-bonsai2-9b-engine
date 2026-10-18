@@ -4,6 +4,9 @@
 #include "gdn-dedup.cuh"
 #include "scale.cuh"
 #include "state-clear.cuh"
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include "gdn-half-prefill.cuh"
+#endif
 
 #include <cstdlib>
 
@@ -66,7 +69,14 @@ static void launch_gated_delta_net(
                 if (l8_enabled && cc == GGML_CUDA_CC_DGX_SPARK && warp_size == 32 && cols_per_warp == 4 &&
                         n_tokens >= GDN_L8V_MIN_TOKENS && n_tokens <= GDN_L8V_MAX_TOKENS && (!lazy_eff || n_tokens <= K)) {
                     if (lazy_eff && dedup_counter && n_seqs == 1 && K >= 12) {
-                        ggml_cuda_kernel_launch(gated_delta_net_dedup_l8v_cuda<RAW, G_PRECOMPUTED, true>, launch_params,
+                        // Exact integer-only guard rewrite. Set 0 before graph construction
+                        // to retain the original remainder-then-quotient path for A/B runs.
+                        static const bool reuse_quotient = getenv("GGML_CUDA_GDN_QUOTIENT_REUSE") == nullptr ||
+                                                          atoi(getenv("GGML_CUDA_GDN_QUOTIENT_REUSE")) != 0;
+                        const auto kernel = reuse_quotient
+                            ? gated_delta_net_dedup_l8v_cuda<RAW, G_PRECOMPUTED, true, true>
+                            : gated_delta_net_dedup_l8v_cuda<RAW, G_PRECOMPUTED, true, false>;
+                        ggml_cuda_kernel_launch(kernel, launch_params,
                             q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                             sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride,
@@ -364,6 +374,30 @@ static void ggml_cuda_op_gated_delta_net_impl(
         }
         // The common frontier footprint above also covers every tail GD1 record,
         // base, final state and eager snapshot. N1 never writes GD2 parity slots.
+        static const bool half_prefill = getenv("GGML_CUDA_GDN_HALF_PREFILL") == nullptr ||
+            atoi(getenv("GGML_CUDA_GDN_HALF_PREFILL")) != 0;
+        static bool half_logged=false;
+        if(half_prefill && !half_logged) {
+            GGML_LOG_INFO("gdn_half_prefill: H=%lld HK=%lld K=%d T=%lld sq=%lld,%lld sv=%lld,%lld sb=%lld,%lld pre=%d packed=%d\n",
+                (long long)H,(long long)neqk1,K,(long long)n_tokens,(long long)sq1,(long long)sq2,
+                (long long)sv1,(long long)sv2,(long long)sb1,(long long)sb2,
+                int(raw_precomputed||g_precomputed),int(qk_packed));
+            half_logged=true;
+        }
+        if (half_prefill && H==32 && neqk1==16 && K==16 && (n_tokens-K)%16==0 &&
+                cache!=nullptr && sb1==1 && sb2==H &&
+                (raw_precomputed || g_precomputed)) {
+            if (qk_packed) {
+                gdn_half_prefill_launch<false,true,true>(ctx,q_d,k_d,v_d,g_d,b_d,rb_d,ra_d,s_d,dst_d,state_d,
+                    int(n_tokens),sq1,sq2,sq3,sv1,sv2,sv3,sb1,sb2,sb3,scale,state_slot_stride,
+                    s_ids,s_row_stride,lazy,zero[0],zero[0]?*zero[1]:0.0f,zero[0]?*zero[2]:0.0f,stream);
+            } else {
+                gdn_half_prefill_launch<false,true,false>(ctx,q_d,k_d,v_d,g_d,b_d,rb_d,ra_d,s_d,dst_d,state_d,
+                    int(n_tokens),sq1,sq2,sq3,sv1,sv2,sv3,sb1,sb2,sb3,scale,state_slot_stride,
+                    s_ids,s_row_stride,lazy,zero[0],zero[0]?*zero[1]:0.0f,zero[0]?*zero[2]:0.0f,stream);
+            }
+            return;
+        }
         ggml_cuda_pool_alloc<gdn_chunk32> work(ctx.pool(), size_t(H)*((n_tokens-K+31)/32));
 #define GDN_CHUNK_LAUNCH(RAW_, PRE_, PACK_) \
         gdn_chunk32_launch<RAW_, PRE_, PACK_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, work.ptr, \

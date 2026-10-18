@@ -65,6 +65,7 @@
 #include "ggml-cuda/state-clear.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/dflash2-conv.cuh"
+#include "ggml-cuda/dflash-concat-q8.h"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -6961,6 +6962,49 @@ static int ggml_cuda_try_fwht_mmq_sigmoid_gate(ggml_backend_cuda_context & ctx, 
     return i_mm - i_cont + 1;
 }
 
+// Avoid the six DFlash2 internal [context;noise] F32 copies. The ordinary
+// per-graph Q8 cache supplies both unchanged K/V MMQs; no cross-graph reuse.
+static bool ggml_cuda_try_dflash_concat_q8(ggml_backend_cuda_context & ctx,
+        const ggml_cgraph * graph, int index) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_DFLASH_CONCAT_Q8");
+        return !value || std::atoi(value) == 1;
+    }();
+    if (!enabled || ctx.curr_stream_no != 0 ||
+            ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_DGX_SPARK) return false;
+    const int first = ggml_cuda_dflash_concat_q8_match(graph, index);
+    if (first < 0) return false;
+    const ggml_tensor * cat = graph->nodes[index];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (ggml_cuda_should_use_mmvq(GGML_TYPE_Q8_0, cc, 32) ||
+            !ggml_cuda_should_use_mmq(GGML_TYPE_Q8_0, cc, 32, 0)) return false;
+    const auto buft = ggml_backend_cuda_buffer_type(ctx.device);
+    const ggml_tensor * sources[] = {cat, cat->src[0], cat->src[1]};
+    for (const ggml_tensor * x : sources) {
+        if (!x->buffer || ggml_backend_buffer_get_type(x->buffer) != buft) return false;
+    }
+    for (int j = first; j < graph->n_nodes; ++j) {
+        const ggml_tensor * mm = graph->nodes[j];
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != cat) continue;
+        const ggml_tensor * w = mm->src[0];
+        if (!w->buffer || !mm->buffer || ggml_backend_buffer_get_type(w->buffer) != buft ||
+                ggml_backend_buffer_get_type(mm->buffer) != buft ||
+                (ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                 ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) && w->view_src)) return false;
+    }
+    auto & reuse = ctx.fwht_q8();
+    const auto users = reuse.plain_q8_users.find(cat);
+    if (users == reuse.plain_q8_users.end() || users->second != 2 || reuse.plain_q8.count(cat)) return false;
+    auto buffer = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(),
+        ggml_cuda_mul_mat_q_q8_size(graph->nodes[first]->src[0], cat));
+    void * out = buffer->get();
+    reuse.held.push_back(std::move(buffer));
+    quantize_mmq_q8_1_concat_cuda((const float *) cat->src[0]->data, (const float *) cat->src[1]->data,
+        out, 4096, 16, 16, ctx.stream());
+    reuse.plain_q8[cat] = out;
+    return true;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -7228,6 +7272,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
                     GGML_ASSERT(gather == nullptr && "conv front-end refused after its GET_ROWS was skipped");
+                }
+
+                if (node->op == GGML_OP_CONCAT && !is_concurrent_event_active &&
+                        stream_ctx.concurrent_events.empty() &&
+                        ggml_cuda_try_dflash_concat_q8(*cuda_ctx, cgraph, i)) {
+                    continue;
                 }
 
                 // GDN gate projections: both k-split matmuls in one launch
