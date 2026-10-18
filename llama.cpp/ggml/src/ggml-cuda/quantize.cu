@@ -1013,13 +1013,26 @@ void quantize_mmq_fp4_cuda(
 }
 
 // MMQ D4 quantization of transformed rows held as v[i] = element base + i*NT + tid of row `row`.
-template <int N, int NT>
+template <int N, int NT, bool NATIVE_MAX = false>
 static __device__ __forceinline__ void fwht_quantize_mmq_d4_store(const float * v, block_q8_1_mmq * y,
         const int64_t base, const int64_t row, const int64_t rows, const int tid, const int lane) {
 #pragma unroll
     for(int i=0;i<N/NT;++i) {
         const int64_t col=base+i*NT+tid;
-        const float amax=warp_reduce_max<32>(fabsf(v[i]));
+        const float magnitude = fabsf(v[i]);
+        float amax;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+        if constexpr (NATIVE_MAX) {
+            // Positive normal IEEE magnitudes are ordered exactly as unsigned bits.
+            // Preserve the existing fmax reduction for NaNs and denormal-only groups.
+            const uint32_t max_bits = __reduce_max_sync(0xffffffffu, __float_as_uint(magnitude));
+            amax = max_bits >= 0x00800000u && max_bits <= 0x7f800000u ?
+                __uint_as_float(max_bits) : warp_reduce_max<32>(magnitude);
+        } else
+#endif
+        {
+            amax = warp_reduce_max<32>(magnitude);
+        }
         const float d_inv=127.0f/amax;
         const int8_t q=roundf(v[i]*d_inv);
         const int64_t ib=(col/QK8_1_MMQ)*rows+row;
@@ -1032,7 +1045,7 @@ static __device__ __forceinline__ void fwht_quantize_mmq_d4_store(const float * 
 // SWIGLU: the input is a SwiGLU no other node reads. Each element is formed with the expression of
 // unary_gated_op_kernel<op_silu, T> (x activated, g the multiplier, row strides o0/o1 in elements),
 // so it is the value that kernel would have stored and the plain variant would load here.
-template <typename T, bool SIGNED, bool SWIGLU>
+template <typename T, bool SIGNED, bool SWIGLU, bool NATIVE_MAX = false>
 __launch_bounds__(256, 1)
 static __global__ void fwht_quantize_mmq_d4(const T * x, const T * g, const float * signs, block_q8_1_mmq * y,
                                          int64_t k, int64_t kp, int64_t rows, int64_t o0, int64_t o1) {
@@ -1059,7 +1072,7 @@ static __global__ void fwht_quantize_mmq_d4(const T * x, const T * g, const floa
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
     }
-    fwht_quantize_mmq_d4_store<N,NT>(v,y,base,row,rows,tid,lane);
+    fwht_quantize_mmq_d4_store<N,NT,NATIVE_MAX>(v,y,base,row,rows,tid,lane);
     GGML_UNUSED(kp); GGML_UNUSED(g); GGML_UNUSED(o0); GGML_UNUSED(o1);
 }
 void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * signs, void * y,
@@ -1067,11 +1080,15 @@ void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * sig
     GGML_ASSERT(k%4096==0 && kp%4096==0 && kp>=k);
     const dim3 grid(kp/4096,rows,1);
     const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
-#define C6_LAUNCH(T, GLU) do { if(signs) { ggml_cuda_kernel_launch(fwht_quantize_mmq_d4<T,true,GLU>,lp,(const T*)x,(const T*)g,signs,(block_q8_1_mmq*)y,k,kp,rows,o0,o1); } else { ggml_cuda_kernel_launch(fwht_quantize_mmq_d4<T,false,GLU>,lp,(const T*)x,(const T*)g,signs,(block_q8_1_mmq*)y,k,kp,rows,o0,o1); } } while(0)
+#define C6_LAUNCH_IMPL(T, GLU, NATIVE) do { if(signs) { ggml_cuda_kernel_launch(fwht_quantize_mmq_d4<T,true,GLU,NATIVE>,lp,(const T*)x,(const T*)g,signs,(block_q8_1_mmq*)y,k,kp,rows,o0,o1); } else { ggml_cuda_kernel_launch(fwht_quantize_mmq_d4<T,false,GLU,NATIVE>,lp,(const T*)x,(const T*)g,signs,(block_q8_1_mmq*)y,k,kp,rows,o0,o1); } } while(0)
+// Only sufficiently wide batches use the native-max specialization: short-row
+// decoding retains its original kernel, register allocation and reduction path.
+#define C6_LAUNCH(T, GLU) do { if(rows >= 128) { C6_LAUNCH_IMPL(T, GLU, true); } else { C6_LAUNCH_IMPL(T, GLU, false); } } while(0)
 #define C6_LAUNCH_T(T) do { if(g) { C6_LAUNCH(T, true); } else { C6_LAUNCH(T, false); } } while(0)
     if(type==GGML_TYPE_F32) { C6_LAUNCH_T(float); } else { GGML_ASSERT(type==GGML_TYPE_F16); C6_LAUNCH_T(half); }
 #undef C6_LAUNCH_T
 #undef C6_LAUNCH
+#undef C6_LAUNCH_IMPL
 }
 
 // C56: the transform input is SWIGLU(x, g) read through a permuted view of it (the GDN out-projection's
