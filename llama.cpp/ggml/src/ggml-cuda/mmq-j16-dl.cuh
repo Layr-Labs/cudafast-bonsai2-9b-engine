@@ -996,8 +996,11 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
         const uint3 blocks_per_ne00_fd = init_fastdiv_values(nkb);
         const uint3 one_fd             = init_fastdiv_values(1);
         // Compile the48-SM partition divisor into the DL-only fixup; generic MMQ launches stay unchanged.
-        const auto fixup = grid == 48 ? mul_mat_q_stream_k_fixup<type, 16, false, 48>
-                                     : mul_mat_q_stream_k_fixup<type, 16, false>;
+        const bool narrow_partition = uint64_t(grid)*uint64_t(args.nrows_x/128)*uint64_t(nkb) <= UINT32_MAX;
+        const auto fixup = grid == 48
+            ? (narrow_partition ? mul_mat_q_stream_k_fixup<type, 16, false, 48, true>
+                                : mul_mat_q_stream_k_fixup<type, 16, false, 48>)
+            : mul_mat_q_stream_k_fixup<type, 16, false>;
         ggml_cuda_kernel_launch(fixup,
             ggml_cuda_kernel_launch_params(dim3(grid, 128/32, 1), dim3(32, 4, 1), 0, stream),
             nullptr, nullptr, args.dst, tmp_fixup, blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst,
