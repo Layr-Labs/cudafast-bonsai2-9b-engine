@@ -675,7 +675,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool swiglu = false, bool rms_scale = false>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool swiglu = false, bool rms_scale = false, bool row_concat = false>
 static __global__ void quantize_mmq_q8_1(
         const float * x, const int32_t * ids, void * vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -710,6 +710,19 @@ static __global__ void quantize_mmq_q8_1(
         base_idx = i3*s03 + i2*s02 + i01*s01;
     }
 
+    if constexpr (row_concat) {
+        static_assert(!scatter && !swiglu && !rms_scale && ds_layout == MMQ_Q8_1_DS_LAYOUT_D4,
+                      "two-source concat keeps the plain Q8_0 activation path");
+        // Every float4 belongs to one token row. Source selection changes only
+        // the address; the reduction, rounding and k-major output layout below
+        // remain the original quantizer's, including N=32 row interleaving.
+        // In this mutually exclusive mode the otherwise unused gate and
+        // n_expert_used arguments hold the second slab and first row count.
+        if (blockIdx.x >= (unsigned) n_expert_used) {
+            x = gate;
+            base_idx -= (int64_t) n_expert_used*s01;
+        }
+    }
     const float4 * x4 = (const float4 *) x;
     block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
 
@@ -801,6 +814,19 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
     GGML_UNUSED(n_expert_used);
+}
+
+void quantize_mmq_q8_1_concat_cuda(
+        const float * first, const float * second, void * out,
+        int64_t width, int first_rows, int second_rows, cudaStream_t stream) {
+    GGML_ASSERT(first && second && out && width > 0 && width % 512 == 0 && first_rows > 0 && second_rows > 0);
+    const int rows = first_rows + second_rows;
+    const dim3 grid(rows, width/(4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ), 1);
+    const dim3 block(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    const ggml_cuda_kernel_launch_params lp(grid, block, 0, stream);
+    ggml_cuda_kernel_launch(quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, false, false, true>, lp,
+        first, (const int32_t *) nullptr, out, width, width, width*rows, width*rows,
+        width, rows, 1, first_rows, second, (const float *) nullptr, (const float *) nullptr);
 }
 
 void quantize_mmq_q8_1_swiglu_cuda(

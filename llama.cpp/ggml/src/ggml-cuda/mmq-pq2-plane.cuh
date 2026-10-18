@@ -16,6 +16,20 @@ static bool ggml_cuda_prefill_plane_enabled() {
     return enabled;
 }
 
+// D4 alias route: reuse each thread's consumed compact-code words for scales.
+// Enabled by default; an explicit zero retains the original kernel.
+static bool ggml_cuda_prefill_plane_d4_alias_enabled() {
+    static const bool enabled = ggml_cuda_dl_env_int("GGML_CUDA_PREFILL_PLANE_D4_ALIAS", 1) != 0;
+    return enabled;
+}
+
+// Reduce D4-gather bank conflicts by permuting only producer ownership.
+// Canonical weights/shared layout and warp compute mapping remain unchanged.
+static bool ggml_cuda_prefill_plane_owner_enabled() {
+    static const bool enabled = ggml_cuda_dl_env_int("GGML_CUDA_PREFILL_PLANE_OWNER", 1) != 0;
+    return enabled;
+}
+
 static __global__ void ggml_cuda_prefill_plane_pack(const block_pq2_0 * original,
         unsigned char * dst,int rows,int nkb) {
     const int index=blockIdx.x*blockDim.x+threadIdx.x;
@@ -49,12 +63,30 @@ static __device__ __forceinline__ uint32_t ggml_cuda_prefill_plane_lds_u32(uint3
     return result;
 }
 
+// Each thread owns code[8*tid..8*tid+7], which is also D4[2*tid..2*tid+1].
+// PTX-local code words keep all address inputs live until the final output moves.
+// Read both code words before overwriting them; the scale copies are bitwise.
+static __device__ __forceinline__ void ggml_cuda_prefill_plane_d4_alias_load(
+        uint32_t code, uint32_t y, uint32_t & w0, uint32_t & w1) {
+    asm volatile("{\n"
+        " .reg .b32 code0, code1, d0, d1;\n"
+        " ld.shared.u32 code0, [%2];\n"
+        " ld.shared.u32 code1, [%2+4];\n"
+        " ld.shared.u32 d0, [%3];\n"
+        " ld.shared.u32 d1, [%3+144];\n"
+        " st.shared.v2.u32 [%2], {d0, d1};\n"
+        " mov.u32 %0, code0;\n"
+        " mov.u32 %1, code1;\n"
+        "}\n"
+        : "=r"(w0), "=r"(w1) : "r"(code), "r"(y) : "memory");
+}
+
 // Original 64x128 macro tile, eight compute warps and two CTAs/SM. Both Y and
 // compact 2-bit code tiles use TMA double buffers. The only global X loads in
 // the loop are 64 fp16 scales; one next-scale register stays live across MMA.
 // The 50176-byte footprint equals the existing stream-K kernel, with barriers
 // living in padding of the decoded X tile instead of enlarging shared memory.
-template <bool ADD,bool GLU>
+template <bool ADD,bool GLU,bool D4_ALIAS=false,bool OWNER=false>
 static __global__ void __launch_bounds__(256,2) mul_mat_q_pq2_plane(
         const unsigned char * codes,const uint16_t * scales,const int * y,float * dst,
         int nkb,int ncols_y,int stride_col_dst,int ntx,const float * residual) {
@@ -62,7 +94,8 @@ static __global__ void __launch_bounds__(256,2) mul_mat_q_pq2_plane(
     extern __shared__ int plane_smem[];
     const uint32_t smem=(uint32_t)__cvta_generic_to_shared(plane_smem);
     const uint32_t xtile=smem+2*YBYTES, ctiles=xtile+XBYTES, bars=xtile+136;
-    const int tid=threadIdx.y*32+threadIdx.x,quarter=tid%4,row=tid/4;
+    const int tid=threadIdx.y*32+threadIdx.x;
+    const int owner=OWNER?(tid^(((tid>>2)&3)<<6)):tid,quarter=owner%4,row=owner/4;
     const int rowtile=blockIdx.x/ntx,col0=(blockIdx.x%ntx)*128;
     const int wr=threadIdx.y/4,wc=threadIdx.y%4;
     const unsigned char * cp=codes+(int64_t)rowtile*nkb*CBYTES;
@@ -87,12 +120,23 @@ static __global__ void __launch_bounds__(256,2) mul_mat_q_pq2_plane(
         ggml_cuda_pq2_j128_mbar_wait(bars+buf*144,(kb/2)&1);
         const uint32_t ci=ctiles+buf*CBYTES+row*32+quarter*8;
         ggml_cuda_pq2_j128_xraw raw;
-        raw.w0=ggml_cuda_prefill_plane_lds_u32(ci); raw.w1=ggml_cuda_prefill_plane_lds_u32(ci+4);
+        if constexpr (D4_ALIAS) {
+            // Each thread overwrites only its own two compact-code words after
+            // loading both. The existing CTA barrier publishes the complete D4 table.
+            const uint32_t yi=smem+buf*YBYTES+(2*owner%128)*144+(owner/64)*4;
+            ggml_cuda_prefill_plane_d4_alias_load(ci,yi,raw.w0,raw.w1);
+        } else {
+            raw.w0=ggml_cuda_prefill_plane_lds_u32(ci); raw.w1=ggml_cuda_prefill_plane_lds_u32(ci+4);
+        }
         raw.w2=raw.w1; raw.sh=0; raw.d=scale;
         ggml_cuda_pq2_j128_xstore(raw,xtile+row*144+quarter*32,quarter);
         if (quarter==0 && kb+1<nkb) scale=sp[(kb+1)*64];
         __syncthreads();
-        ggml_cuda_pq2_ws_compute_compact<false>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144);
+        if constexpr (D4_ALIAS) {
+            ggml_cuda_pq2_ws_compute_compact<true>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144,ctiles+buf*CBYTES+wc*32*4);
+        } else {
+            ggml_cuda_pq2_ws_compute_compact<false>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144);
+        }
         if (kb+1<nkb) {
             __syncthreads();
             if (tid==0 && kb+2<nkb) {
@@ -129,12 +173,15 @@ static bool ggml_cuda_prefill_plane_glu_run(const mmq_args & args, cudaStream_t 
     const auto * e=ggml_cuda_prefill_plane_find(args.x);
     if (!e || e->device != device || e->ncols != args.ncols_x || e->nrows != args.nrows_x) return false;
     constexpr int SHARED=2*128*144+64*144+2*64*32;
-    const auto kernel=mul_mat_q_pq2_plane<false,true>;
-    static bool attr[GGML_CUDA_MAX_DEVICES]={};
-    if (!attr[device]) {
+    const bool alias=ggml_cuda_prefill_plane_d4_alias_enabled();
+    const bool owner=alias && ggml_cuda_prefill_plane_owner_enabled();
+    const auto kernel=owner?mul_mat_q_pq2_plane<false,true,true,true>:
+                      alias?mul_mat_q_pq2_plane<false,true,true,false>:mul_mat_q_pq2_plane<false,true,false,false>;
+    static bool attr[2][2][GGML_CUDA_MAX_DEVICES]={};
+    if (!attr[alias][owner][device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,SHARED));
         CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributePreferredSharedMemoryCarveout,(int)cudaSharedmemCarveoutMaxShared));
-        attr[device]=true;
+        attr[alias][owner][device]=true;
     }
     const int nkb=args.ncols_x/QK_PQ2_0,ntx=args.ncols_max/128;
     const uint16_t * scales=(const uint16_t *)(e->data+(int64_t)e->nrows*nkb*32);

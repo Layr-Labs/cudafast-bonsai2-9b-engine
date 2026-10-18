@@ -36,6 +36,12 @@ void quantize_mmq_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// Plain Q8_0 D4 activation quantization of a contiguous row concatenation.
+// No intermediate F32 concat is needed; all quantization math/layout is unchanged.
+void quantize_mmq_q8_1_concat_cuda(
+        const float * first, const float * second, void * out,
+        int64_t width, int first_rows, int second_rows, cudaStream_t stream);
+
 void quantize_mmq_q8_1_swiglu_cuda(
         const float * x, const float * gate, void * vy, ggml_type type_src0,
         int64_t ne00, int64_t s01, int64_t s02, int64_t s03,

@@ -24,7 +24,7 @@ static __device__ __forceinline__ void gdn_dedup_store_header(
     }
 }
 
-template <bool RAW, bool G_PRECOMPUTED, bool LAZY>
+template <bool RAW, bool G_PRECOMPUTED, bool LAZY, bool REUSE_QUOTIENT = false>
 __global__ void __launch_bounds__(128, 6)
 gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v, const float * g, const float * beta,
                         const float * raw_dt_bias, const float * raw_a, const float * curr_state, float * dst,
@@ -117,8 +117,17 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
     if (LAZY) {
         // gdn_lazy_replay in this layout
         const int64_t diff = curr_state - state;
-        if (state_slot_stride > 0 && diff >= 0 && diff % state_slot_stride == 0) {
-            const int64_t rb  = diff / state_slot_stride;
+        int64_t slot_q = 0;
+        if constexpr (REUSE_QUOTIENT) {
+            if (state_slot_stride > 0 && diff >= 0) {
+                slot_q = diff / state_slot_stride;
+            }
+        }
+        // Positive stride and nonnegative diff give slot_q*stride <= diff <= INT64_MAX.
+        // The product check is exact and reuses the quotient needed by rollback.
+        if (state_slot_stride > 0 && diff >= 0 &&
+                (REUSE_QUOTIENT ? slot_q * state_slot_stride == diff : diff % state_slot_stride == 0)) {
+            const int64_t rb = REUSE_QUOTIENT ? slot_q : diff / state_slot_stride;
             const float * rec = state + (2 + blockIdx.z) * state_slot_stride;
             const uint32_t * hdr = (const uint32_t *) rec;
             const int W = (int) hdr[1];
