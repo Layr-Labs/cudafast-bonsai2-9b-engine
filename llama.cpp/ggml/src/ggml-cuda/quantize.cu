@@ -1016,15 +1016,20 @@ void quantize_mmq_fp4_cuda(
 template <int N, int NT>
 static __device__ __forceinline__ void fwht_quantize_mmq_d4_store(const float * v, block_q8_1_mmq * y,
         const int64_t base, const int64_t row, const int64_t rows, const int tid, const int lane) {
+    static_assert(NT % QK8_1_MMQ == 0, "D4 block stride must be integral");
+    // Every caller's base is zero or a multiple of N=4096. NT advances
+    // complete quantization blocks, leaving the intra-block offset fixed.
+    const int64_t col0 = base + tid;
+    const int offset = col0 % QK8_1_MMQ;
+    y += (col0/QK8_1_MMQ)*rows + row;
+    const int64_t stride = (NT/QK8_1_MMQ)*rows;
 #pragma unroll
     for(int i=0;i<N/NT;++i) {
-        const int64_t col=base+i*NT+tid;
         const float amax=warp_reduce_max<32>(fabsf(v[i]));
         const float d_inv=127.0f/amax;
         const int8_t q=roundf(v[i]*d_inv);
-        const int64_t ib=(col/QK8_1_MMQ)*rows+row;
-        y[ib].qs[col%QK8_1_MMQ]=q;
-        if(lane==0) y[ib].d4[(col%QK8_1_MMQ)/32]=1.0f/d_inv;
+        y[i*stride].qs[offset]=q;
+        if(lane==0) y[i*stride].d4[offset/32]=1.0f/d_inv;
     }
 }
 
