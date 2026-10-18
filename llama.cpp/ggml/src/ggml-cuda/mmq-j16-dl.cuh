@@ -1,5 +1,9 @@
 #pragma once
 
+#if !defined(GGML_USE_HIP)
+#include <cooperative_groups.h>
+#endif
+
 // GB10 (sm_121) decode layout ("DL") of the J=16 MMQ weights, plus the streaming J=16 kernels that read it.
 //
 // The decode layout is a load-time copy of a PQ2_0 / Q8_0 weight matrix whose 34-byte blocks are only
@@ -735,10 +739,60 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
     }
 }
 
+// Single-matrix J=16 fixup after a cooperative producer barrier. The 16
+// producer warps map to the four 4-warp fixup CTAs without changing any sum.
+template <int BPI>
+static __device__ __forceinline__ void ggml_cuda_dl_ring_fixup(
+        float * dst, const float * partial, const int nrows, const int nkb,
+        const int stride, const int ncols) {
+    constexpr int I = 128, J = 16, NW = 4;
+    const int i = (threadIdx.y / NW)*32 + threadIdx.x;
+    const int wy = threadIdx.y % NW;
+    const int nty = nrows / I;
+    const int b0 = blockIdx.x;
+    int k0 = int64_t(b0)*(nty*nkb) / gridDim.x;
+    int k1 = int64_t(b0 + 1)*(nty*nkb) / gridDim.x;
+    k0 -= (k0 % nkb) % BPI;
+    k1 -= (k1 % nkb) % BPI;
+    if (k0 == k1 || k0 % nkb == 0 || (k0/nkb == k1/nkb && k1 % nkb != 0)) {
+        return;
+    }
+    float sum[J/NW] = {0.0f};
+    int b = b0 - 1;
+    int stop = k0;
+    while (true) {
+        int k = int64_t(b)*(nty*nkb) / gridDim.x;
+        k -= (k % nkb) % BPI;
+        if (k == stop) {
+            --b;
+            stop = k;
+            continue;
+        }
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += NW) {
+            sum[j0/NW] += partial[b*(J*I) + (j0 + wy)*I + i];
+        }
+        if (k % nkb == 0 || k/nkb < k0/nkb) {
+            break;
+        }
+        --b;
+        stop = k;
+    }
+    dst += (k0/nkb)*I;
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += NW) {
+        const int j = j0 + wy;
+        if (j >= ncols) {
+            return;
+        }
+        dst[j*stride + i] += sum[j0/NW];
+    }
+}
+
 // Same arguments as mul_mat_q_*_j16_dl (TM copy; mode 0 stream-k or mode 1 contiguous whole tiles), dynamic
 // shared memory ggml_cuda_dl_ring_smem<FMT, SPS>(S). Stage layout: weights of the SPS steps, then SPS x 16
 // activation blocks.
-template <int FMT, int S, int SPS>
+template <int FMT, int S, int SPS, bool FUSED_FIXUP = false>
 __launch_bounds__(16*32, 1)
 static __global__ void mul_mat_q_j16_dl_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
@@ -851,6 +905,12 @@ static __global__ void mul_mat_q_j16_dl_ring(
             }
         }
     }
+#if !defined(GGML_USE_HIP)
+    if constexpr (FUSED_FIXUP) {
+        cooperative_groups::this_grid().sync();
+        ggml_cuda_dl_ring_fixup<F::BPI>(dst, tmp_fixup, nrows_x, nkb, stride_col_dst, ncols_dst);
+    }
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -905,7 +965,7 @@ static void ggml_cuda_mmq_dl_launch(Kernel kernel, bool * attr_set, const mmq_ar
 }
 
 template <int FMT, int S, int SPS>
-static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
+static bool ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
                                          const int nkb, float * tmp_fixup, cudaStream_t stream) {
     const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS>;
     constexpr size_t smem = ggml_cuda_dl_ring_smem<FMT, SPS>(S);
@@ -916,9 +976,58 @@ static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
         attr[device] = true;
     }
+#if !defined(GGML_USE_HIP)
+    if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1S || FMT == GGML_CUDA_DL_FMT_Q8) {
+        const auto fused = mul_mat_q_j16_dl_ring<FMT, S, SPS, true>;
+        static const bool enabled = getenv("GGML_CUDA_DL_FUSED_FIXUP") == nullptr || atoi(getenv("GGML_CUDA_DL_FUSED_FIXUP")) != 0;
+        static bool checked[GGML_CUDA_MAX_DEVICES] = { false };
+        static int capacity[GGML_CUDA_MAX_DEVICES] = { 0 };
+        static int sms[GGML_CUDA_MAX_DEVICES] = { 0 };
+        if (enabled && mode == 0) {
+            if (!checked[device]) {
+                int cooperative = 0;
+                CUDA_CHECK(cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, device));
+                CUDA_CHECK(cudaDeviceGetAttribute(&sms[device], cudaDevAttrMultiProcessorCount, device));
+                if (cooperative) {
+                    CUDA_CHECK(cudaFuncSetAttribute(fused, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+                    CUDA_CHECK(cudaFuncSetAttribute(fused, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
+                    int blocks = 0;
+                    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, fused, 512, smem));
+                    capacity[device] = blocks*sms[device];
+                }
+                checked[device] = true;
+            }
+            if (grid == sms[device] && grid <= capacity[device]) {
+                cudaLaunchAttribute attrs[2] = {};
+                attrs[0].id = cudaLaunchAttributeCooperative;
+                attrs[0].val.cooperative = 1;
+                cudaLaunchConfig_t cfg = {};
+                cfg.gridDim = dim3(grid, 1, 1);
+                cfg.blockDim = dim3(32, 16, 1);
+                cfg.dynamicSmemBytes = smem;
+                cfg.stream = stream;
+                cfg.attrs = attrs;
+                cfg.numAttrs = 1;
+#if defined(GGML_CUDA_USE_PDL)
+                static const bool pdl = getenv("GGML_CUDA_PDL") == nullptr || atoi(getenv("GGML_CUDA_PDL")) != 0;
+                if (pdl && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(fused))) {
+                    attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+                    attrs[1].val.programmaticStreamSerializationAllowed = 1;
+                    cfg.numAttrs = 2;
+                }
+#endif
+                CUDA_CHECK(cudaLaunchKernelEx(&cfg, fused,
+                    (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
+                    (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x));
+                return true;
+            }
+        }
+    }
+#endif
     ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, 16, 1), smem, stream),
         (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
         (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
+    return false;
 }
 
 static int ggml_cuda_dl_env_int(const char * name, const int dflt) {
@@ -939,6 +1048,7 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
     const int nkb    = (int) (args.ncols_x / ggml_cuda_type_traits<type>::qk);
     const int ntiles = (int) (args.nrows_x / 128);
     const bool tiling = grid == ntiles;
+    bool fused_fixup = false;
     if constexpr (type == GGML_TYPE_PQ2_0) {
         const int64_t bytes = args.nrows_x*nkb*(int64_t) sizeof(block_pq2_0);
         // PTQ1_0 matrices of at least 2048 rows: bulk-copy ring of 2-step stages (c64); GGML_CUDA_DL_RING_PT=0 off.
@@ -949,16 +1059,16 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
         if (e.dl_type == GGML_TYPE_PTQ1_0 && ring_pt && args.nrows_x >= 2048 && ptq1_sgn) {
             constexpr int FMT = GGML_CUDA_DL_FMT_PTQ1S;
             if (tiling && ntiles > 4*nsm) {
-                ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);
+                fused_fixup = ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);
             } else {
-                ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+                fused_fixup = ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
             }
         } else if (e.dl_type == GGML_TYPE_PTQ1_0 && ring_pt && args.nrows_x >= 2048) {
             constexpr int FMT = GGML_CUDA_DL_FMT_PTQ1;
             if (tiling && ntiles > 4*nsm) {
-                ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);
+                fused_fixup = ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);
             } else {
-                ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+                fused_fixup = ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
             }
         } else if (e.dl_type == GGML_TYPE_PTQ1_0) {
             // PTQ1_0 groups (C51). Prefetch from the c51 microbenchmark: CTA bulk prefetch, 16 steps in chunks
@@ -986,13 +1096,13 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
         static const bool ring     = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING", 1) != 0;
         static const int  ring_min = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_MIN_ROWS", 4096);
         if (ring && args.nrows_x >= ring_min) {
-            ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_Q8, 2, 1>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+            fused_fixup = ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_Q8, 2, 1>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
         } else {
             static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
             ggml_cuda_mmq_dl_launch(mul_mat_q_q8_0_j16_dl<TM, GGML_CUDA_DL_H_SECTOR, 2, 1>, attr, args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
         }
     }
-    if (!tiling) {
+    if (!tiling && !fused_fixup) {
         const uint3 blocks_per_ne00_fd = init_fastdiv_values(nkb);
         const uint3 one_fd             = init_fastdiv_values(1);
         ggml_cuda_kernel_launch(mul_mat_q_stream_k_fixup<type, 16, false>,
