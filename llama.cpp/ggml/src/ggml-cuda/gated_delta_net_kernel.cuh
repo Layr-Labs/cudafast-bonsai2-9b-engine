@@ -968,10 +968,14 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
 
         float * rec = state + (2 + blockIdx.z) * state_slot_stride + GDN_LAZY_HDR;
         constexpr int stride = gdn_lazy_token_stride<S_v, 4>();
-        for (int e = tid; e < (int) n_tokens * (S_v + 16); e += 128) {
-            const int t = e / (S_v + 16);
-            const int i = e % (S_v + 16);
-            gdn_st(evs, &rec[t * stride + i], i < S_v ? stage[t][((i / 32) * 8 + i % 8) * 4 + (i % 32) / 8] : stage[t][i]);
+        // Each thread owns one K record component and the first16 threads
+        // also own a V component. Hoist the invariant K permutation out of t.
+        const int key_src = ((tid / 32) * 8 + tid % 8) * 4 + (tid % 32) / 8;
+        for (int t = 0; t < (int) n_tokens; ++t) {
+            gdn_st(evs, &rec[t * stride + tid], stage[t][key_src]);
+            if (tid < 16) {
+                gdn_st(evs, &rec[t * stride + S_v + tid], stage[t][S_v + tid]);
+            }
         }
         if (threadIdx.y == 0 && lane < n_tokens) {
             gdn_st(evs, &rec[lane * stride + S_v + GDN_LAZY_NWARPS * 4 + 0], g_lane);
