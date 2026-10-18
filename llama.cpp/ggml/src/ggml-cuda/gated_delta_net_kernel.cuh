@@ -847,24 +847,37 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
         const float * k_base  = k + iq3 * sq3 + iq1 * sq1;
         const float * v_base  = v + sequence * sv3 + h_idx * sv1 + blockIdx.z * 16;
         const int64_t gb_base = sequence * sb3 + h_idx * sb1;
-        for (int e = tid; e < (int) n_tokens * TOK_SM; e += 128) {
-            const int t = e / TOK_SM;
-            const int i = e % TOK_SM;
-            const float * src;
-            int dst_i = i;
-            if (i < S_v) {
-                const int r = i / 32, n_ = i % 8, m = (i % 32) / 8;
-                src   = k_base + t * sq2 + i;
-                dst_i = (r * 8 + n_) * 4 + m;
-            } else if (i < S_v + 16) {
-                src = v_base + t * sv2 + (i - S_v);
-            } else if (i < S_v + 18) {
-                src = (i == S_v + 16 ? g : beta) + gb_base + t * sb2;
-            } else {
-                continue;  // padding
+        // Key permutation is fixed by lane. Stage token rows directly, and
+        // group the contiguous16-value block into four aligned16-byte copies.
+        const int r = tid / 32, n_ = tid % 8, m = (tid % 32) / 8;
+        const int key_dst = (r * 8 + n_) * 4 + m;
+        for (int t = 0; t < (int) n_tokens; ++t) {
+            const unsigned int kd = (unsigned int) __cvta_generic_to_shared(&stage[t][key_dst]);
+            const float * ks = k_base + t * sq2 + tid;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(kd), "l"(ks));
+        }
+        if ((((uintptr_t) v_base | (uintptr_t) (sv2*sizeof(float))) & 15u) == 0) {
+        if (tid < 4) {
+            for (int t = 0; t < (int) n_tokens; ++t) {
+                const unsigned int vd = (unsigned int) __cvta_generic_to_shared(&stage[t][S_v + 4*tid]);
+                const float * vs = v_base + t * sv2 + 4*tid;
+                // The launcher already requires contiguous float128 rows.
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" :: "r"(vd), "l"(vs));
             }
-            const unsigned int dst = (unsigned int) __cvta_generic_to_shared(&stage[t][dst_i]);
-            asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(dst), "l"(src));
+        }
+        } else if (tid < 16) {
+            for (int t = 0; t < (int) n_tokens; ++t) {
+                const unsigned int vd = (unsigned int) __cvta_generic_to_shared(&stage[t][S_v + tid]);
+                const float * vs = v_base + t * sv2 + tid;
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(vd), "l"(vs));
+            }
+        }
+        if (tid < 2) {
+            for (int t = 0; t < (int) n_tokens; ++t) {
+                const float * src = (tid == 0 ? g : beta) + gb_base + t * sb2;
+                const unsigned int dst = (unsigned int) __cvta_generic_to_shared(&stage[t][S_v + 16 + tid]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(dst), "l"(src));
+            }
         }
         asm volatile("cp.async.commit_group;");
     }
