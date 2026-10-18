@@ -155,11 +155,16 @@ struct ggml_cuda_dl_hint {
 //           number of tiles is pure tiling); contiguous range of (tile, step).
 //   mode 1: contiguous whole tiles per CTA.  mode 2: tiles b, b + gridDim.x, ... (whole tiles).
 // In modes 1 and 2 every tile is one full-K segment of one CTA, exactly as in pure tiling.
-template <int G, int blocks_per_iter>
+template <int G, int blocks_per_iter, bool ONE_TILE = false>
 static __device__ __forceinline__ void ggml_cuda_dl_work(int & it, int & st, int & rem, int & tile_inc,
                                                          const int nty, const int nkb, const int mode) {
     const int b   = blockIdx.x;
     const int nst = nkb / G;
+    if constexpr (ONE_TILE) {
+        // The host proves mode == 1 && grid == nty: one complete K segment per tile.
+        it = b; st = 0; rem = nst; tile_inc = 1;
+        return;
+    }
     if (mode == 2) {
         it = b; st = 0; tile_inc = gridDim.x;
         rem = b < nty ? ((nty - 1 - b)/gridDim.x + 1)*nst : 0;
@@ -738,7 +743,7 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
 // Same arguments as mul_mat_q_*_j16_dl (TM copy; mode 0 stream-k or mode 1 contiguous whole tiles), dynamic
 // shared memory ggml_cuda_dl_ring_smem<FMT, SPS>(S). Stage layout: weights of the SPS steps, then SPS x 16
 // activation blocks.
-template <int FMT, int S, int SPS>
+template <int FMT, int S, int SPS, bool ONE_TILE = false>
 __launch_bounds__(16*32, 1)
 static __global__ void mul_mat_q_j16_dl_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
@@ -759,7 +764,7 @@ static __global__ void mul_mat_q_j16_dl_ring(
     const int nst = nkb / G;
     const int nty = nrows_x / I;
     int it, st, rem, tile_inc;
-    ggml_cuda_dl_work<G, F::BPI>(it, st, rem, tile_inc, nty, nkb, mode);
+    ggml_cuda_dl_work<G, F::BPI, ONE_TILE>(it, st, rem, tile_inc, nty, nkb, mode);
     const int total   = rem;
     const int nstages = (total + SPS - 1) / SPS;
     const int gs0     = it*nst + st;
@@ -907,14 +912,16 @@ static void ggml_cuda_mmq_dl_launch(Kernel kernel, bool * attr_set, const mmq_ar
 template <int FMT, int S, int SPS>
 static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
                                          const int nkb, float * tmp_fixup, cudaStream_t stream) {
-    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS>;
+    const int variant = mode == 1 && grid == (int) (args.nrows_x / 128);
+    const auto kernel = variant ? mul_mat_q_j16_dl_ring<FMT, S, SPS, true>
+                                : mul_mat_q_j16_dl_ring<FMT, S, SPS, false>;
     constexpr size_t smem = ggml_cuda_dl_ring_smem<FMT, SPS>(S);
-    static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
+    static bool attr[2][GGML_CUDA_MAX_DEVICES] = {};
     const int device = ggml_cuda_get_device();
-    if (!attr[device]) {
+    if (!attr[variant][device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
-        attr[device] = true;
+        attr[variant][device] = true;
     }
     ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, 16, 1), smem, stream),
         (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
