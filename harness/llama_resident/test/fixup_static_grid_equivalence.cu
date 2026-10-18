@@ -52,6 +52,10 @@ template<ggml_type TYPE> static int run() {
 }
 
 int main() {
-    int cases=run<GGML_TYPE_Q8_0>()+run<GGML_TYPE_PQ2_0>();
-    printf("FIXUP_STATIC_GRID_PASS cases=%d exact_output_bits=true\n",cases);
+    const int q8=run<GGML_TYPE_Q8_0>();
+    if(q8!=360) return 1;
+    const int pq=run<GGML_TYPE_PQ2_0>();
+    if(pq!=360) return 1;
+    printf("FIXUP_STATIC_GRID_PASS cases=%d exact_output_bits=true\n",q8+pq);
+    return 0;
 }

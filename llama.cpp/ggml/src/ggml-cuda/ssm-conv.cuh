@@ -22,6 +22,7 @@ struct ggml_cuda_ssm_conv_front_ext {
     const int32_t * gather_ids  = nullptr; //   the GET_ROWS that produced it is skipped
     int64_t         gather_row  = 0;
     float *         qk          = nullptr; // channels [0, qk_channels) go l2-normalized (eps) to qk [128, heads, T]
+    int             qk_layout   = 0;       // default off; 2 = packed row + head-major
     int64_t         qk_channels = 0;       //   instead of out (their L2_NORM is skipped)
     float           eps         = 0.0f;
     int64_t         x_tail_t0   = INT64_MAX; // x rows [x_tail_t0, T) (that qk lands on) are read from a copy

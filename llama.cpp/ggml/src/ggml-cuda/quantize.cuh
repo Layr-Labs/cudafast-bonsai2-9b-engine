@@ -122,3 +122,8 @@ void fwht_quantize_mmq_d4_gnorm_cuda(const float * x, const float * z, int64_t z
 // i0 + n0*i1 of row r reads gate[r*gt + i1*g1 + i0] and attn[r*at + i0 + n0*i1] (strides in elements).
 void fwht_quantize_mmq_d4_sigmoid_gate_cuda(const float * gate, const float * attn, const float * signs, void * y,
     int64_t k, int64_t kp, int64_t rows, int n0, int64_t g1, int64_t gt, int64_t at, cudaStream_t stream);
+
+// Only for the guarded M4096/N16/grid48 PTQ producer with K4096 or K12288.
+void fwht_quantize_mmq_d4_fixup_add_rms_cuda(const float * a, const float * b, float * sum,
+    const float * w, float eps, const float * signs, float * norm, void * y,
+    const float * partials, cudaStream_t stream);

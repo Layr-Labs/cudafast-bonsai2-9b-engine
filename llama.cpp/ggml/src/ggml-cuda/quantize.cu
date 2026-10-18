@@ -1302,6 +1302,81 @@ void fwht_quantize_mmq_d4_add_rms_cuda(const float * a, const float * b, float *
     }
 }
 
+// Exact grid48 PTQ stream-K fixup folded into its exclusive ADD/RMS consumer.
+// The producer's +0 partial accumulation, suffix addition and RN residual add
+// are deliberately separate, matching the original fixup then ADD sequence.
+template <int NT, bool SIGNED>
+__launch_bounds__(NT, 1)
+static __global__ void fwht_quantize_mmq_d4_fixup_add_rms(const float * a, const float * b, float * sum, const float * w,
+        const int ncols, const float eps, const float * signs, float * norm, block_q8_1_mmq * y, const int64_t rows, const float * partials) {
+    constexpr int N=4096, NE=N/NT, NR=1024, R=NR/NT;
+    static_assert(NT==256 || NT==512 || NT==1024, "add_rms fold block size");
+    __shared__ float s_sum[NR/WARP_SIZE];
+    __shared__ float shared[N];
+    const int tid=threadIdx.x, lane=tid%WARP_SIZE, warp=tid/WARP_SIZE;
+    const int64_t row=blockIdx.y;
+    float v[NE], wv[NE], sv[NE];
+#pragma unroll
+    for(int m=0;m<NE;++m) {
+        wv[m]=w[m*NT+tid];
+        sv[m]=SIGNED ? signs[m*NT+tid] : 1.0f;
+    }
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    a+=row*N;
+    b+=row*N;
+    sum+=row*N;
+    float tmp[R];
+#pragma unroll
+    for(int j=0;j<R;++j) tmp[j]=0.0f;
+#pragma unroll
+    for(int m=0;m<NE;++m) {
+        const int col=m*NT+tid;
+        // M4096 / grid48 / K4096 or K12288: one original partial per tile.
+        // Keep the original fixup's +0 accumulation and suffix += partial_sum.
+        const int tile=col/128;
+        const int source=tile+tile/2;
+        float partial_sum=0.0f;
+        partial_sum+=partials[source*2048+row*128+col%128];
+        float corrected=a[col];
+        corrected+=partial_sum;
+        const float xi=__fadd_rn(corrected, b[col]);
+        sum[col]=xi;
+        v[m]=xi;
+        tmp[m%R]+=xi*xi;
+    }
+#pragma unroll
+    for(int j=0;j<R;++j) {
+        tmp[j]=warp_reduce_sum(tmp[j]);
+        if(lane==0) s_sum[j*(NT/WARP_SIZE)+warp]=tmp[j];
+    }
+    __syncthreads();
+    const float total=warp_reduce_sum(s_sum[lane]);
+    const float scale=rsqrtf(total/ncols+eps);
+#pragma unroll
+    for(int m=0;m<NE;++m) {
+        const float xn=scale*v[m]*wv[m];
+        if(norm) norm[row*N+m*NT+tid]=xn;
+        v[m]=xn*(1.0f/64.0f);
+        if constexpr(SIGNED) v[m]*=sv[m];
+    }
+    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
+}
+void fwht_quantize_mmq_d4_fixup_add_rms_cuda(const float * a, const float * b, float * sum,
+        const float * w, float eps, const float * signs, float * norm, void * y,
+        const float * partials, cudaStream_t stream) {
+    constexpr int NT=1024;
+    const ggml_cuda_kernel_launch_params lp(dim3(1,16,1),dim3(NT,1,1),0,stream);
+    if (signs) {
+        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_fixup_add_rms<NT,true>, lp,
+            a,b,sum,w,4096,eps,signs,norm,(block_q8_1_mmq *)y,int64_t(16),partials);
+    } else {
+        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_fixup_add_rms<NT,false>, lp,
+            a,b,sum,w,4096,eps,signs,norm,(block_q8_1_mmq *)y,int64_t(16),partials);
+    }
+}
+
 void fwht_quantize_mmq_d4_rms_cuda(const float * x, int64_t stride_row, const float * w, float eps,
     const float * signs, float * norm, void * y, int64_t k, int64_t rows, cudaStream_t stream) {
     GGML_ASSERT(k==4096);

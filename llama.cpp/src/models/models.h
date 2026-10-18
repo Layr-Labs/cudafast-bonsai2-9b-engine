@@ -102,7 +102,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il,
-            ggml_tensor *        state_rows = nullptr);
+            ggml_tensor *        state_rows = nullptr,
+            ggml_tensor *        gate_input_lifetime = nullptr);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -2269,13 +2270,16 @@ struct llama_model_qwen35 : public llama_model_base {
         // device-dependent path choices, scanned once per graph build (not per layer)
         bool gdn_state_rows_dev_ok = true; // every GPU device is Metal: fused GDN may read state rows in place
         bool gdn_raw_gates_dev_ok  = true; // every device is CPU/Metal/CUDA/ROCm/MUSA: fused GDN takes raw gates
+        bool gdn_mmf_side_dev_ok   = false; // one CUDA device; backend also checks GB10 and exact geometry
     private:
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
-                            int   il);
+                            int   il,
+                    ggml_tensor * output_ids,
+                           bool & rows_selected);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

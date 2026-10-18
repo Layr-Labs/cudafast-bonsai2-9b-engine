@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-decode-gates.h"
 
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
@@ -539,7 +540,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        b,
         ggml_tensor *        s,
         int                  il,
-        ggml_tensor *        state_rows) {
+        ggml_tensor *        state_rows,
+        ggml_tensor *        gate_input_lifetime) {
     const auto * mctx_cur   = inp->mctx;
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
@@ -589,6 +591,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     if (raw) {
         ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
     }
+    llm_hold_decode_gate_input(gdn_out, gate_input_lifetime);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

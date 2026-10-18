@@ -542,6 +542,54 @@ static std::mutex & ggml_cuda_dl_mutex() {
     return m;
 }
 
+static std::unordered_map<const void *, ggml_cuda_prefill_plane_entry> & ggml_cuda_prefill_plane_map() {
+    static std::unordered_map<const void *, ggml_cuda_prefill_plane_entry> m;
+    return m;
+}
+
+const ggml_cuda_prefill_plane_entry * ggml_cuda_prefill_plane_find(const void * src) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
+    const auto & m = ggml_cuda_prefill_plane_map();
+    const auto it = m.find(src);
+    return it == m.end() ? nullptr : &it->second;
+}
+
+// Caller holds the model-layout lock. This runs only at pair registration,
+// after its immutable source upload, never during an evaluation or capture.
+static size_t ggml_cuda_prefill_plane_register(const void * stacked, int64_t nrows, int64_t ncols) {
+    if (!ggml_cuda_prefill_plane_enabled() || !stacked || nrows <= 0 || nrows > 65536 || nrows%128 ||
+            ncols <= 0 || ncols%(2*QK_PQ2_0) || ncols/QK_PQ2_0 > INT_MAX/nrows) {
+        return 0;
+    }
+    auto & m = ggml_cuda_prefill_plane_map();
+    if (m.count(stacked)) return 0;
+    static_assert(sizeof(block_pq2_0) == 34, "PQ2 block bytes stay unchanged");
+    const size_t nblocks = (size_t)nrows*(ncols/QK_PQ2_0);
+    const size_t bytes = nblocks*sizeof(block_pq2_0);
+    unsigned char * dst = nullptr;
+    if (cudaMalloc(&dst, bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0; // keep the original GLU implementation if the copy cannot fit
+    }
+    ggml_cuda_prefill_plane_pack<<<(nblocks+255)/256,256>>>(
+        (const block_pq2_0 *)stacked,dst,(int)nrows,(int)(ncols/QK_PQ2_0));
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    m.emplace(stacked,ggml_cuda_prefill_plane_entry{dst,nrows,ncols,bytes,ggml_cuda_get_device()});
+    return bytes;
+}
+
+// Caller holds the same lock. Erase before releasing the stacked source so a
+// reused device address can never find a stale layout from an unloaded model.
+static void ggml_cuda_prefill_plane_erase(const void * stacked) {
+    auto & m = ggml_cuda_prefill_plane_map();
+    const auto it = m.find(stacked);
+    if (it != m.end()) {
+        CUDA_CHECK(cudaFree(it->second.data));
+        m.erase(it);
+    }
+}
+
 static std::unordered_map<const void *, ggml_cuda_dl_entry> & ggml_cuda_dl_map() {
     static std::unordered_map<const void *, ggml_cuda_dl_entry> m;
     return m;
@@ -630,10 +678,110 @@ size_t ggml_cuda_dl_register(const void * src, const int64_t nrows, const int64_
         ggml_cuda_dl_repack<4, 34>((const char *) src, dl, (int) nrows, (int) nkb, GGML_CUDA_DL_TM, stream);
     }
     CUDA_CHECK(cudaGetLastError());
+    // Retain the existing layout for all unsupported column
+    // counts, views, disabled-ring runs, and allocation-failure fallbacks.
+    static const bool q8_tm64 = ggml_cuda_dl_env_int("GGML_CUDA_DL_Q8_TM64", 1) != 0;
+    char * dl_tm64 = nullptr;
+    if (q8_tm64 && type == GGML_TYPE_Q8_0 && ggml_cuda_dl_q8_tm64_shape(nrows, ncols)) {
+        if (cudaMalloc(&dl_tm64, bytes) == cudaSuccess) {
+            ggml_cuda_dl_repack<4, 34>((const char *) src, dl_tm64, (int) nrows, (int) nkb, GGML_CUDA_DL_TM64, stream);
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            (void) cudaGetLastError();
+            dl_tm64 = nullptr;
+        }
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaStreamDestroy(stream));
-    m.emplace(src, ggml_cuda_dl_entry{ (const char *) src, dl, nrows, ncols, type, type });
-    return bytes;
+    m.emplace(src, ggml_cuda_dl_entry{ (const char *) src, dl, nrows, ncols, type, type, dl_tm64 });
+    if (dl_tm64 != nullptr) {
+        GGML_LOG_INFO("%s: Q8 TM64 copy M=%lld K=%lld, %.2f MiB; N=16 only\n", __func__,
+                      (long long) nrows, (long long) ncols, bytes/1024.0/1024.0);
+    }
+    return bytes + (dl_tm64 != nullptr ? bytes : 0);
+}
+
+bool ggml_cuda_mul_mat_q_fixup_producer(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * weight, const ggml_tensor * input, ggml_tensor * dst,
+        const void * q8, float * partials) {
+#if defined(GGML_USE_HOPPER_Q1)
+    return false;
+#endif
+    static const bool ring = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_PT", 1) != 0;
+    static const bool signed_mma = ggml_cuda_dl_env_int("GGML_CUDA_PTQ1_SIGNED", 1) != 0;
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    if (!ring || !signed_mma || device.cc != GGML_CUDA_CC_DGX_SPARK || device.nsm != 48 ||
+            !weight || !input || !dst || !q8 || weight->type != GGML_TYPE_PQ2_0 ||
+            input->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            (weight->ne[0] != 4096 && weight->ne[0] != 12288) || weight->ne[1] != 4096 ||
+            weight->ne[2] != 1 || weight->ne[3] != 1 || input->ne[0] != weight->ne[0] ||
+            input->ne[1] != 16 || input->ne[2] != 1 || input->ne[3] != 1 ||
+            dst->ne[0] != 4096 || dst->ne[1] != 16 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            !ggml_is_contiguous(weight) || !ggml_is_contiguous(input) || !ggml_is_contiguous(dst) ||
+            !weight->buffer || ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    mmq_args args = {};
+    args.x=(const char *)weight->data; args.type_x=GGML_TYPE_PQ2_0; args.y=(const int *)q8;
+    args.dst=(float *)dst->data; args.ncols_x=weight->ne[0]; args.nrows_x=4096;
+    args.ncols_dst=args.ncols_y=args.ncols_max=16; args.nrows_dst=4096;
+    args.stride_row_x=weight->ne[0]/QK_PQ2_0;
+    args.nchannels_x=args.nchannels_y=args.nsamples_x=args.nsamples_y=1;
+    args.stride_channel_dst=args.stride_sample_dst=4096*16;
+    const auto * entry=ggml_cuda_dl_find(weight->data);
+    if (!entry || !entry->dl || entry->type != GGML_TYPE_PQ2_0 || entry->dl_type != GGML_TYPE_PTQ1_0 ||
+            entry->nrows != 4096 || entry->ncols != weight->ne[0] ||
+            !ggml_cuda_mmq_dl_supported(args,*entry) || ggml_cuda_mmq_pq2_j16_grid(args,device.nsm) != 48) {
+        return false;
+    }
+    if (partials) {
+        ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_PTQ1S,3,2>(
+            args,*entry,48,0,int(weight->ne[0]/QK_PQ2_0),partials,ctx.stream());
+    }
+    return true;
+}
+
+static bool ggml_cuda_decode_glu_enabled() {
+    static const bool enabled = ggml_cuda_dl_env_int("GGML_CUDA_DECODE_GU_EPILOGUE", 1) != 0;
+    return enabled;
+}
+
+static bool ggml_cuda_decode_glu_run(ggml_backend_cuda_context & ctx, const ggml_tensor * weight,
+        const ggml_tensor * input, ggml_tensor * dst, const void * stacked, const void * q8) {
+    static const bool jit = ggml_cuda_dl_env_int("GGML_CUDA_PTQ_FFN_JIT", 1) != 0;
+    static const bool ring = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_PT", 1) != 0;
+    static const bool signed_mma = ggml_cuda_dl_env_int("GGML_CUDA_PTQ1_SIGNED", 1) != 0;
+    if (!ggml_cuda_decode_glu_enabled() || !jit || !ring || !signed_mma || (uintptr_t) q8 % 16 != 0 ||
+            weight->ne[0] != 4096 || weight->ne[1] != 12288 || input->ne[1] != 16 ||
+            !ggml_is_contiguous(weight) || !ggml_is_contiguous(input) || !ggml_is_contiguous(dst) ||
+            ggml_cuda_info().devices[ctx.device].nsm != 48) {
+        return false;
+    }
+    const auto * pair = ggml_cuda_glu_pair_find(weight->data);
+    if (!pair || !pair->dl_glu || pair->stacked != stacked ||
+            pair->nrows != weight->ne[1] || pair->ncols != weight->ne[0]) {
+        return false;
+    }
+    constexpr int F = 12288, K = 4096, N = 16;
+    constexpr size_t shared = ggml_cuda_dl_ring_smem<GGML_CUDA_DL_FMT_PTQ1S, 2>(3);
+    const auto kernel = mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true>;
+    static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
+    if (!attr[ctx.device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared)));
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, int(cudaSharedmemCarveoutMaxShared)));
+        attr[ctx.device] = true;
+    }
+    ggml_cuda_kernel_launch(kernel,
+        ggml_cuda_kernel_launch_params(dim3(2*F/128), dim3(32,16), shared, ctx.stream()),
+        (const char *) pair->dl_glu, (const int *) q8, (float *) dst->data, (float *) nullptr,
+        2*F, K/128, N, F, N, 1, (float *) dst->data, F);
+    CUDA_CHECK(cudaGetLastError());
+    static bool logged = false;
+    if (!logged) {
+        GGML_LOG_INFO("%s: exact decode SwiGLU epilogue, F=%d K=%d N=%d\n", __func__, F, K, N);
+        logged = true;
+    }
+    return true;
 }
 
 bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * src1,
@@ -648,6 +796,9 @@ bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor 
             gate_dst->nb[0] != sizeof(float) || gate_w->ne[1] % 128 != 0 || gate_dst->ne[0] != gate_w->ne[1] ||
             gate_dst->ne[1] != src1->ne[1] || src1->ne[0] != gate_w->ne[0]) {
         return false;
+    }
+    if (ggml_cuda_decode_glu_run(ctx, gate_w, src1, gate_dst, stacked, external_q8)) {
+        return true;
     }
     // the J that mul_mat_q_switch_J<PQ2_0, false> picks for these columns
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
@@ -704,6 +855,21 @@ const ggml_cuda_glu_pair * ggml_cuda_glu_pair_find(const void * gate) {
     return it == m.end() ? nullptr : &it->second;
 }
 
+// Copy complete PTQ blocks from the two original TM128 allocations. The inverse
+// maps alternating row r to input row r/2 in gate (even) or up (odd).
+static __global__ void ggml_cuda_decode_glu_pack(const uint32_t * gate, const uint32_t * up,
+        uint32_t * dst, int rows, int steps) {
+    const size_t count = size_t(2*rows)*steps*7;
+    for (size_t i = size_t(blockIdx.x)*blockDim.x + threadIdx.x; i < count; i += size_t(gridDim.x)*blockDim.x) {
+        const size_t block = i/7;
+        const int row = int(block/(128*steps))*128 + int(block%128);
+        const int kb = int(block/128)%steps;
+        const int src_row = row/2;
+        const size_t src_block = (size_t(src_row/128)*steps + kb)*128 + src_row%128;
+        dst[i] = (row&1 ? up : gate)[7*src_block + i%7];
+    }
+}
+
 // Returns the bytes allocated (0: not eligible or out of memory; the pair then keeps the separate launches).
 size_t ggml_cuda_glu_pair_register(const void * gate, const void * up, const int64_t nrows, const int64_t ncols,
                                    const ggml_type type) {
@@ -728,7 +894,40 @@ size_t ggml_cuda_glu_pair_register(const void * gate, const void * up, const int
     CUDA_CHECK(cudaMemcpy2D(stacked,             16*row_bytes, gate, 8*row_bytes, 8*row_bytes, (size_t) nrows/8, cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy2D(stacked + 8*row_bytes, 16*row_bytes, up, 8*row_bytes, 8*row_bytes, (size_t) nrows/8, cudaMemcpyDeviceToDevice));
     m[gate] = { gate, up, stacked, nrows, ncols };
-    return bytes;
+    size_t total = bytes + ggml_cuda_prefill_plane_register(stacked, 2*nrows, ncols);
+
+    // GB10 decode: the PTQ1_0 decode-layout copies of the pair back to back, when both exist (registered before the
+    // pair): one 2F-row copy for the stacked 16-row launch (launch_mul_mat_q, ggml_cuda_try_decode_gu_stack)
+    const auto & dl = ggml_cuda_dl_map();
+    const auto ig = dl.find(gate);
+    const auto iu = dl.find(up);
+    if (ig != dl.end() && iu != dl.end() && ig->second.dl_type == GGML_TYPE_PTQ1_0 && iu->second.dl_type == GGML_TYPE_PTQ1_0 &&
+            ig->second.nrows == nrows && iu->second.nrows == nrows && ig->second.ncols == ncols && iu->second.ncols == ncols) {
+        const size_t dl_bytes = (size_t) nrows*(size_t) (ncols/QK_PQ2_0)*sizeof(block_ptq1_0);
+        char * dl_stacked = nullptr;
+        if (cudaMalloc(&dl_stacked, 2*dl_bytes) == cudaSuccess) {
+            CUDA_CHECK(cudaMemcpy(dl_stacked,            ig->second.dl, dl_bytes, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(dl_stacked + dl_bytes, iu->second.dl, dl_bytes, cudaMemcpyDeviceToDevice));
+            m[gate].dl_stacked = dl_stacked;
+            total += 2*dl_bytes;
+        } else {
+            (void) cudaGetLastError();
+        }
+        if (ggml_cuda_decode_glu_enabled() && nrows == 12288 && ncols == 4096) {
+            char * dl_glu = nullptr;
+            if (cudaMalloc(&dl_glu, 2*dl_bytes) == cudaSuccess) {
+                ggml_cuda_decode_glu_pack<<<512,256>>>((const uint32_t *) ig->second.dl,
+                    (const uint32_t *) iu->second.dl, (uint32_t *) dl_glu, int(nrows), int(ncols/QK_PQ2_0));
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                m[gate].dl_glu = dl_glu;
+                total += 2*dl_bytes;
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
+    }
+    return total;
 }
 
 void ggml_cuda_dl_unregister_range(const void * base, const size_t size) {
@@ -740,7 +939,14 @@ void ggml_cuda_dl_unregister_range(const void * base, const size_t size) {
         };
         for (auto it = g.begin(); it != g.end();) {
             if (in_range(it->second.gate) || in_range(it->second.up)) {
+                ggml_cuda_prefill_plane_erase(it->second.stacked);
                 CUDA_CHECK(cudaFree(it->second.stacked));
+                if (it->second.dl_stacked != nullptr) {
+                    CUDA_CHECK(cudaFree(it->second.dl_stacked));
+                }
+                if (it->second.dl_glu != nullptr) {
+                    CUDA_CHECK(cudaFree(it->second.dl_glu));
+                }
                 it = g.erase(it);
             } else {
                 ++it;
@@ -752,6 +958,9 @@ void ggml_cuda_dl_unregister_range(const void * base, const size_t size) {
         const char * p = (const char *) it->first;
         if (p >= (const char *) base && p < (const char *) base + size) {
             CUDA_CHECK(cudaFree(it->second.dl));
+            if (it->second.dl_tm64 != nullptr) {
+                CUDA_CHECK(cudaFree(it->second.dl_tm64));
+            }
             it = m.erase(it);
         } else {
             ++it;

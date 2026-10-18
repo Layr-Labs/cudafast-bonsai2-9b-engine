@@ -240,7 +240,7 @@ static __device__ __forceinline__ float ssm_conv_front_input(const float * st, c
 // after it, so a snapshot may land on the gathered conv-state row (states = gather_base + gather_ids[0]*gather_row);
 // only the block that owns a channel reads its conv states (v blocks; qk blocks of chunk 0). x rows that qk lands on
 // are read from a copy (xs.x_tail).
-template <bool apply_silu, int n_seg, int unroll, int qk_tt>
+template <bool apply_silu, int n_seg, int unroll, int qk_tt, int qk_layout = 0>
 static __global__ void __launch_bounds__(32 * n_seg) ssm_conv_front_f32(const float * states, const int32_t * gather_ids,
         const int64_t gather_row, const float * w, const float * bias, float * y, float * qk,
         const ggml_cuda_ssm_conv_snaps snaps, const int64_t C, const int64_t c_v0, const int n_vblocks,
@@ -439,7 +439,11 @@ static __global__ void __launch_bounds__(32 * n_seg) ssm_conv_front_f32(const fl
         const float scale = rsqrtf(fmaxf(tmp, eps * eps));
 #pragma unroll
         for (int i = 0; i < head / WARP_SIZE; ++i) {
-            qk[t * c_v0 + c0 + i * WARP_SIZE + threadIdx.x] = scale * buf[t - tc0][i * WARP_SIZE + threadIdx.x];
+            // The permutation changes addresses only. Each warp still writes the same 32 consecutive words.
+            const int col = qk_layout ? i * WARP_SIZE + (threadIdx.x % 8) * 4 + threadIdx.x / 8
+                                      : i * WARP_SIZE + threadIdx.x;
+            const int64_t row = qk_layout == 2 ? ((int64_t) h * n_t + t) * head : t * c_v0 + c0;
+            qk[row + col] = scale * buf[t - tc0][i * WARP_SIZE + threadIdx.x];
         }
     }
 }
@@ -489,23 +493,26 @@ void ggml_cuda_ssm_conv_front(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int     n_vb = (int) ((C - c_v0 + WARP_SIZE - 1) / WARP_SIZE);
 
     constexpr int unroll = 8;
-    auto launch = [&](auto silu_c, auto seg_c, auto tt_c) {
+    auto launch = [&](auto silu_c, auto seg_c, auto tt_c, auto layout_c) {
         constexpr bool silu     = decltype(silu_c)::value;
         constexpr int  n_seg    = decltype(seg_c)::value;
         constexpr int  qk_tt    = decltype(tt_c)::value;
         const int64_t  seg_len  = (n_t + n_seg - 1) / n_seg;
         const int      n_chunks = (int) ((n_t + qk_tt - 1) / qk_tt);
         const int      n_qkb    = ext.qk ? (int) (c_v0 / 128) * n_chunks : 0;
-        ggml_cuda_kernel_launch_gb10(cc, ssm_conv_front_f32<silu, n_seg, unroll, qk_tt>,
+        ggml_cuda_kernel_launch_gb10(cc, ssm_conv_front_f32<silu, n_seg, unroll, qk_tt, decltype(layout_c)::value>,
             ggml_cuda_kernel_launch_params(dim3((unsigned int) (n_vb + n_qkb)), dim3(WARP_SIZE, n_seg), 0, stream),
             states_d, ext.gather_ids, ext.gather_row, w_d, (const float *) nullptr, y_d, ext.qk, snaps, C, c_v0,
             n_vb, n_chunks, n_t, seg_len, xs, w_c, y_t, ext.hold, ext.eps, ext.zero_row, ext.zero_scale, ext.zero_bias);
     };
-    if (n_t >= 64) {
-        if (apply_silu) launch(std::true_type{},  std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{});
-        else            launch(std::false_type{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{});
+    // Only the prefill SILU/L2 producer has experimental layouts; every unmatched path is the original template.
+    if (n_t >= 64 && apply_silu && ext.qk && ext.qk_layout == 2) {
+        launch(std::true_type{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 2>{});
+    } else if (n_t >= 64) {
+        if (apply_silu) launch(std::true_type{},  std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 0>{});
+        else            launch(std::false_type{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 0>{});
     } else {
-        if (apply_silu) launch(std::true_type{},  std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{});
-        else            launch(std::false_type{}, std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{});
+        if (apply_silu) launch(std::true_type{},  std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 0>{});
+        else            launch(std::false_type{}, std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 0>{});
     }
 }
