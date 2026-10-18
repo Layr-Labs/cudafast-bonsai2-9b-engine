@@ -811,6 +811,7 @@ struct ggml_backend_sched {
     // stream; the event marks when the staging buffer can be written again
     ggml_backend_buffer_t input_staging[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_event_t  input_staging_event[GGML_SCHED_MAX_BACKENDS];
+    bool                  input_staging_pending[GGML_SCHED_MAX_BACKENDS];
 
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
@@ -1631,8 +1632,12 @@ static uint8_t * ggml_backend_sched_input_staging(ggml_backend_sched_t sched, co
         }
     }
 
-    // the uploads of the previous split from this buffer must have run before it is written again
-    ggml_backend_event_synchronize(sched->input_staging_event[backend_id]);
+    // A scheduler-wide synchronization already completes these uploads. Otherwise
+    // preserve the event wait before overwriting the single pinned staging buffer.
+    if (sched->input_staging_pending[backend_id]) {
+        ggml_backend_event_synchronize(sched->input_staging_event[backend_id]);
+        sched->input_staging_pending[backend_id] = false;
+    }
 
     if (sched->input_staging[backend_id] == NULL || ggml_backend_buffer_get_size(sched->input_staging[backend_id]) < size) {
         ggml_backend_buffer_free(sched->input_staging[backend_id]);
@@ -1807,6 +1812,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                // Uploads may still use staging even when graph submission fails.
+                if (staging != NULL) {
+                    ggml_backend_event_record(sched->input_staging_event[split_backend_id], split_backend);
+                    sched->input_staging_pending[split_backend_id] = true;
+                }
                 return ec;
             }
         } else {
@@ -1829,6 +1839,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    // Uploads may still use staging even when graph submission fails.
+                    if (staging != NULL) {
+                        ggml_backend_event_record(sched->input_staging_event[split_backend_id], split_backend);
+                        sched->input_staging_pending[split_backend_id] = true;
+                    }
                     return ec;
                 }
 
@@ -1851,6 +1866,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // the staging buffer is free again once the split has run
         if (staging != NULL) {
             ggml_backend_event_record(sched->input_staging_event[split_backend_id], split_backend);
+            sched->input_staging_pending[split_backend_id] = true;
         }
 
         prev_backend_id = split_backend_id;
@@ -2052,6 +2068,7 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+        sched->input_staging_pending[i] = false;
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
