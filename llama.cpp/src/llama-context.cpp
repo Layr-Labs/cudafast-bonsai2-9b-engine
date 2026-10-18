@@ -1179,13 +1179,14 @@ bool llama_context::set_encoder_inp_slabs(uint32_t n) {
     return true;
 }
 
-bool llama_context::embd_import_stage(std::vector<embd_import_src> srcs) {
+bool llama_context::embd_import_stage(std::vector<embd_import_src> srcs, bool gather, ggml_backend_event_t wait_event,
+                                      const llama_context * tap_src) {
     const ggml_tensor *   t   = srcs.front().tensor;
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
     ggml_backend_dev_t    dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
     for (const auto & b : backends) {
         if (ggml_backend_get_device(b.get()) == dev) {
-            embd_import = { std::move(srcs), b.get() };
+            embd_import = { std::move(srcs), b.get(), gather, wait_event, tap_src };
             return true;
         }
     }
@@ -1208,7 +1209,8 @@ bool llama_context::set_embd_import_layer_inp(const llama_context & src, const i
         srcs.push_back({ t, ggml_backend_sched_get_tensor_backend(src.sched.get(), t), r });
     }
 
-    return !srcs.empty() && embd_import_stage(std::move(srcs));
+    // the rows are gathered by one launch on this context's stream, after the target's graph (its tap event)
+    return !srcs.empty() && src.tap_event && embd_import_stage(std::move(srcs), true, src.tap_event.get(), &src);
 }
 
 bool llama_context::set_embd_import_nextn() {
@@ -1218,6 +1220,12 @@ bool llama_context::set_embd_import_nextn() {
     }
 
     ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+
+    if (n_graph_slots > 1) {
+        // the graph that wrote the rows keeps its own slot (compute buffer) until it runs again, and the
+        // import only reads them: no copy out first
+        return embd_import_stage({ { t, backend, 0 } });
+    }
 
     // the rows leave the compute buffer before the next graph is allocated over it
     if (nextn_dev == nullptr || nextn_dev->ne[0] != t->ne[0] || nextn_dev->ne[1] < t->ne[1]) {
@@ -1685,6 +1693,19 @@ void llama_context::dflash_walk_stage(ggml_tensor * t) {
     ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
     GGML_ASSERT(backend != nullptr);
 
+    if (!walk_event) {
+        walk_event.reset(ggml_backend_event_new(ggml_backend_get_device(backend)));
+        GGML_ASSERT(walk_event && "the DFlash2 device walk needs backend events");
+    }
+    if (n_graph_slots > 1) {
+        // the draft graph keeps its own slot (compute buffer) until it runs again, after the importer and
+        // the host read: the ids are read where the walk wrote them
+        walk_src = t;
+        ggml_backend_event_record(walk_event.get(), backend);
+        return;
+    }
+    walk_src = nullptr;
+
     // the ids leave the compute buffer before the next graph is allocated over it
     if (walk_dev == nullptr || walk_dev->ne[0] != t->ne[0]) {
         // an import may still read the old copy
@@ -1706,27 +1727,24 @@ void llama_context::dflash_walk_stage(ggml_tensor * t) {
         GGML_ASSERT(buf_walk_dev && "failed to allocate the DFlash2 walk buffer");
         walk_dev = dev_t;
     }
-    if (!walk_event) {
-        walk_event.reset(ggml_backend_event_new(ggml_backend_get_device(backend)));
-        GGML_ASSERT(walk_event && "the DFlash2 device walk needs backend events");
-    }
 
     ggml_backend_tensor_copy_async(backend, backend, t, walk_dev);
     ggml_backend_event_record(walk_event.get(), backend);
 }
 
 int32_t llama_context::get_dflash_walk(int32_t * out, int32_t n_out) {
-    if (walk_dev == nullptr || !walk_event || n_out < walk_dev->ne[0]) {
+    const ggml_tensor * walk = walk_tensor();
+    if (walk == nullptr || !walk_event || n_out < walk->ne[0]) {
         return -1;
     }
     // the ids were written on this context's stream; the event orders the host read after them
     ggml_backend_event_synchronize(walk_event.get());
-    ggml_backend_tensor_get(walk_dev, out, 0, ggml_nbytes(walk_dev));
-    return (int32_t) walk_dev->ne[0];
+    ggml_backend_tensor_get(walk, out, 0, ggml_nbytes(walk));
+    return (int32_t) walk->ne[0];
 }
 
 bool llama_context::set_token_import_dflash_walk(const llama_context & src, int32_t row0, int32_t n) {
-    if (src.walk_dev == nullptr || !src.walk_event || row0 < 0 || n <= 0 || n > src.walk_dev->ne[0]) {
+    if (src.walk_tensor() == nullptr || !src.walk_event || row0 < 0 || n <= 0 || n > src.walk_tensor()->ne[0]) {
         return false;
     }
     token_import = { &src, row0, n };
@@ -1925,6 +1943,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the previous ubatch's raw logits must leave the device before its graph is replaced
     logits_materialize();
 
+    // the importer of the previous graph's layer inputs reads them on its own stream: not before it is done
+    // (in a decode round it long is: the draft and its walk come in between)
+    if (tap_done_pending) {
+        tap_done_pending = false;
+        ggml_backend_event_synchronize(tap_done_event.get());
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2026,9 +2051,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (token_import.src) {
             const llama_context & src = *token_import.src;
             ggml_tensor * dst = res->t_inp_tokens;
-            GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 && src.walk_dev);
+            GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 && src.walk_tensor());
             const int64_t n = token_import.n;
-            GGML_ASSERT(n <= src.walk_dev->ne[0] && token_import.row0 + n <= ggml_nelements(dst));
+            GGML_ASSERT(n <= src.walk_tensor()->ne[0] && token_import.row0 + n <= ggml_nelements(dst));
             ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), dst);
             GGML_ASSERT(backend != nullptr);
             GGML_ASSERT(dst->buffer && !ggml_backend_buffer_is_host(dst->buffer) &&
@@ -2037,7 +2062,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             dst_rows.ne[0] = n;
             dst_rows.ne[1] = dst_rows.ne[2] = dst_rows.ne[3] = 1;
             dst_rows.data  = (char *) dst->data + (size_t) token_import.row0*sizeof(int32_t);
-            ggml_tensor src_rows = *src.walk_dev;
+            ggml_tensor src_rows = *src.walk_tensor();
             src_rows.ne[0] = n;
             // both views are n contiguous i32: same shape and strides, as the copy requires
             for (int d = 1; d < GGML_MAX_DIMS; ++d) {
@@ -2058,6 +2083,36 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_tensor *  dst  = res->t_inp_embd;
         const int64_t  n    = dst->ne[1];
         const auto   & srcs = embd_import_cur.srcs;
+
+        if (embd_import_cur.gather) {
+            // one launch on this stream interleaves the sources' rows into the input, after the graph that
+            // wrote them: no copy per source, no host wait for this stream (the launch is ordered after
+            // the graph that read this input last), and no permuting copy inside the graph
+            GGML_ASSERT(embd_import_cur.wait_event != nullptr && dst->ne[0] == srcs[0].tensor->ne[0]*(int64_t) srcs.size());
+            ggml_backend_dev_t dev = ggml_backend_get_device(embd_import_cur.backend_dst);
+            using gather_fn_t = bool (*)(ggml_backend_t, ggml_tensor *, const ggml_tensor * const *, const int64_t *, int, int64_t);
+            auto * gather_fn = (gather_fn_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_gather_rows_async");
+            GGML_ASSERT(gather_fn != nullptr && "the DFlash encoder import needs the CUDA row gather");
+            std::vector<const ggml_tensor *> src_t(srcs.size());
+            std::vector<int64_t>             src_r(srcs.size());
+            for (size_t k = 0; k < srcs.size(); ++k) {
+                src_t[k] = srcs[k].tensor;
+                src_r[k] = srcs[k].row0;
+            }
+            ggml_backend_event_wait(embd_import_cur.backend_dst, embd_import_cur.wait_event);
+            const bool gathered = gather_fn(embd_import_cur.backend_dst, dst, src_t.data(), src_r.data(), (int) srcs.size(), n);
+            GGML_ASSERT(gathered && "the DFlash encoder import: row gather refused the layer inputs");
+            // the gather runs on this stream, not the target's: the target's next graph must not overwrite
+            // the layer inputs before it has read them (see the top of process_ubatch)
+            const llama_context * tsrc = embd_import_cur.tap_src;
+            if (!tsrc->tap_done_event) {
+                tsrc->tap_done_event.reset(ggml_backend_event_new(dev));
+                GGML_ASSERT(tsrc->tap_done_event && "the DFlash encoder import needs backend events");
+            }
+            ggml_backend_event_record(tsrc->tap_done_event.get(), embd_import_cur.backend_dst);
+            tsrc->tap_done_pending = true;
+            embd_import_cur = {};
+        } else {
         GGML_ASSERT(ggml_nrows(dst) == n*(int64_t) srcs.size());
 
         for (const auto & s : srcs) {
@@ -2073,6 +2128,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_tensor_copy_async(srcs[k].backend, embd_import_cur.backend_dst, &src_rows, &dst_rows);
         }
         embd_import_cur = {};
+        }
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -2080,6 +2136,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (cparams.embeddings_layer_inp_dev) {
+        // the layer inputs kept on the device are final once the graph is: mark that point on the stream,
+        // before the output reads that follow, for the context that imports them
+        for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+            ggml_tensor * t = cparams.embeddings_layer_inp[il] ? res->get_layer_inp((int) il) : nullptr;
+            if (t == nullptr) {
+                continue;
+            }
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+            if (backend != nullptr) {
+                if (!tap_event) {
+                    tap_event.reset(ggml_backend_event_new(ggml_backend_get_device(backend)));
+                }
+                if (tap_event) {
+                    ggml_backend_event_record(tap_event.get(), backend);
+                }
+            }
+            break;
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;

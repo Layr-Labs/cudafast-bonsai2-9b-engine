@@ -369,12 +369,18 @@ private:
     struct embd_import_info {
         std::vector<embd_import_src> srcs;
         ggml_backend_t               backend_dst = nullptr;
+        // sources gathered into one interleaved matrix by a single launch on backend_dst (the DFlash
+        // encoder's layer inputs), after the event that follows the graph that wrote them
+        bool                         gather     = false;
+        ggml_backend_event_t         wait_event = nullptr;
+        const llama_context *        tap_src    = nullptr; // the context whose graph wrote the sources
     };
     embd_import_info embd_import;     // staged for the next encode/decode
     embd_import_info embd_import_cur; // taken by the running encode/decode
 
     // stage an embeddings import from these sources (llama_set_embd_import_*)
-    bool embd_import_stage(std::vector<embd_import_src> srcs);
+    bool embd_import_stage(std::vector<embd_import_src> srcs, bool gather = false, ggml_backend_event_t wait_event = nullptr,
+                           const llama_context * tap_src = nullptr);
 
     // batch token index of the last ubatch's first token (rows of its layer inputs)
     int64_t layer_inp_tok0 = 0;
@@ -384,12 +390,24 @@ private:
     ggml_backend_buffer_ptr buf_nextn_dev;
     ggml_tensor *           nextn_dev = nullptr;
 
+    // recorded on the backend right after each graph that keeps layer inputs on the device
+    // (llama_set_embeddings_layer_inp_dev): the importer of those rows waits for it
+    ggml_backend_event_ptr  tap_event;
+    // recorded by the importer after its gather: the next graph of this context may overwrite the layer inputs
+    // only after it (the gather runs on another stream)
+    mutable ggml_backend_event_ptr tap_done_event;
+    mutable bool                   tap_done_pending = false;
+
     // DFlash2 device walk (llama_set_dflash_device_walk): the ids of the last draft graph's walk, kept on
     // the device past the graph, and an event recorded after they are written
     ggml_context_ptr        ctx_walk_dev;
     ggml_backend_buffer_ptr buf_walk_dev;
     ggml_tensor *           walk_dev = nullptr;
     ggml_backend_event_ptr  walk_event;
+    // with graph slots the draft graph's own slot keeps the ids until its next run: they are read there,
+    // with no copy to walk_dev. Set only between a draft graph and its importer.
+    ggml_tensor *           walk_src = nullptr;
+    const ggml_tensor *     walk_tensor() const { return walk_src ? walk_src : walk_dev; }
 
     // a staged import of another context's device walk into this context's next input tokens
     struct token_import_info {

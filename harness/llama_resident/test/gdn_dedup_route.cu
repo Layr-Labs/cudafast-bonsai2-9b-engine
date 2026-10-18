@@ -96,13 +96,14 @@ struct Graph {
         out=ggml_cont(ctx,ggml_view_1d(ctx,gdn,int64_t(D)*H*t,0));ggml_set_output(out);ggml_build_forward_expand(graph,out);allocator=ggml_gallocr_new(ggml_backend_get_default_buffer_type(b.b));need(ggml_gallocr_alloc_graph(allocator,graph),"graph allocation");
     }
     ~Graph(){ggml_backend_synchronize(backend.b);ggml_gallocr_free(allocator);ggml_free(ctx);}
+    bool n1() const { const char * e=std::getenv("GGML_CUDA_GDN_CHUNKED");return t>=64&&(!e||std::atoi(e)!=0); }
     void flag(){setenv("GGML_CUDA_GDN_DEDUP",candidate?"1":"0",1);}
     void run(){flag();need(ggml_backend_graph_compute_async(backend.b,graph)==GGML_STATUS_SUCCESS,"graph compute");ggml_backend_synchronize(backend.b);}
     uint32_t* counter(){flag();return ggml_cuda_gdn_dedup_counter(backend.cuda(),state.data(),ROW,H,K);}
     std::vector<uint32_t> counts(){auto* p=counter();std::vector<uint32_t>b(H,REHYDRATE);if(p)check(cudaMemcpy(b.data(),p,H*4,cudaMemcpyDeviceToHost));return b;}
     cudaGraph_t captured(){return ::captured(backend,graph);}
-    void inspect(bool wanted){auto gr=captured();size_t n=0;check(cudaGraphGetNodes(gr,nullptr,&n));std::vector<cudaGraphNode_t> nodes(n);check(cudaGraphGetNodes(gr,nodes.data(),&n));int gdns=0;for(auto node:nodes){cudaGraphNodeType type;check(cudaGraphNodeGetType(node,&type));if(type!=cudaGraphNodeTypeKernel)continue;cudaKernelNodeParams p={};check(cudaGraphKernelNodeGetParams(node,&p));const char* name=nullptr;check(cudaFuncGetName(&name,p.func));if(!std::strstr(name,"gated_delta_net_"))continue;++gdns;const bool dedup=std::strstr(name,"gated_delta_net_dedup_l8v_cuda");need(dedup==wanted,"captured positive/negative GD2 dispatch identity");need(p.gridDim.x==H&&p.gridDim.y==1&&p.gridDim.z==8&&p.blockDim.x==32&&p.blockDim.y==4,"actual GDN geometry");need(*static_cast<float**>(p.kernelParams[9])==state.data(),"actual fused cache destination");if(dedup)need(*static_cast<uint32_t**>(p.kernelParams[30])==counter(),"actual stable counter pointer");}
-        need(gdns==1,"one actual GDN kernel");
+    void inspect(bool wanted){auto gr=captured();size_t n=0;check(cudaGraphGetNodes(gr,nullptr,&n));std::vector<cudaGraphNode_t> nodes(n);check(cudaGraphGetNodes(gr,nodes.data(),&n));int gdns=0,prepares=0,scans=0,resets=0;for(auto node:nodes){cudaGraphNodeType type;check(cudaGraphNodeGetType(node,&type));if(type!=cudaGraphNodeTypeKernel)continue;cudaKernelNodeParams p={};check(cudaGraphKernelNodeGetParams(node,&p));const char* name=nullptr;check(cudaFuncGetName(&name,p.func));prepares+=std::strstr(name,"gdn_compact32_prepare")||std::strstr(name,"gdn_chunk32_prepare");scans+=std::strstr(name,"gdn_compact32_scan")||std::strstr(name,"gdn_chunk32_scan");resets+=std::strstr(name,"rehydrate")!=nullptr;if(!std::strstr(name,"gated_delta_net_"))continue;++gdns;const bool dedup=std::strstr(name,"gated_delta_net_dedup_l8v_cuda");need(dedup==wanted,"captured positive/negative GD2 dispatch identity");need(p.gridDim.x==H&&p.gridDim.y==1&&p.gridDim.z==8&&p.blockDim.x==32&&p.blockDim.y==4,"actual GDN geometry");need(*static_cast<float**>(p.kernelParams[9])==state.data(),"actual fused cache destination");if(dedup)need(*static_cast<uint32_t**>(p.kernelParams[30])==counter(),"actual stable counter pointer");}
+        need(gdns==1,"one native recurrence or N1 tail");need(prepares==int(n1())&&scans==int(n1()),"captured N1 prepare/scan selection");if(n1()&&counter())need(resets>0,"captured N1 cache invalidation");
 #ifdef GGML_CUDA_USE_PDL
         size_t edges=0;check(cudaGraphGetEdges(gr,nullptr,nullptr,nullptr,&edges));std::vector<cudaGraphNode_t> from(edges),to(edges);std::vector<cudaGraphEdgeData> data(edges);check(cudaGraphGetEdges(gr,from.data(),to.data(),data.data(),&edges));bool pdl=false;for(auto e:data)pdl|=e.type==cudaGraphDependencyTypeProgrammatic;need(pdl,"actual programmatic-dependency capture edges");
 #else
@@ -123,6 +124,7 @@ Before before(Graph& g,uint32_t* owner_counter=nullptr){
     // current generation; absence from the new context does not mean rehydrate.
     return {g.state.get(),std::move(count),p};
 }
+// N1 marks every long compatible cache write; the next GD2 verify must rehydrate.
 void compare(Graph& reference,Graph& got,const Before& old,const char* label,bool writer,bool eager=false,bool reset=false){
     equal(label,read(reference.out),read(got.out));const auto ref=reference.state.get(),actual=got.state.get();auto expected=old.cache;const int w=std::min(got.t,K);const bool verify=got.t>=8&&got.t<=16;
     if(eager){equal(label,ref,actual);++checks;return;}
@@ -133,7 +135,7 @@ void compare(Graph& reference,Graph& got,const Before& old,const char* label,boo
     auto* actual_counter=got.counter();
     if(old.counter_pointer)need(actual_counter==old.counter_pointer,"registration preserves existing counter allocation");
     for(int h=0;h<H;++h){const uint32_t c=old.counter[h],gen=(c&~REHYDRATE)/8u;const bool v2=writer&&!(c&REHYDRATE);
-        const uint32_t want=reset?REHYDRATE:writer?((c&REHYDRATE)?0u:c+8u):c;
+        const uint32_t want=(reset||got.n1())?REHYDRATE:writer?((c&REHYDRATE)?0u:c+8u):c;
         if(actual_counter&&now[h]!=want){
             const auto* node=got.gdn;
             const bool allowed=got.backend.cuda().gdn_dedup_nodes.count(node)!=0;
@@ -200,7 +202,7 @@ void main_cases(){
         std::vector<uint32_t> wrap(H,0x7ffffff8u);check(cudaMemcpy(got.counter(),wrap.data(),H*4,cudaMemcpyHostToDevice));
         step(ref,got,471,0,"last-owned-counter-generation");step(ref,got,472,8,"owned-counter-wrap-rehydrate");step(ref,got,473,0,"owned-counter-wrap-restart");
 
-        for(int t:{1,4,64,512}){Graph short_ref(control,in,rs,t,mode,false),short_got(candidate,in,gs,t,mode,true);for(int rb:{0,8,16}){seed(ref,got,500+t+rb);step(short_ref,short_got,600+t+rb,rb,"GD2-original-compatible-token-shape",false);step(ref,got,650+t+rb,0,"compatible-GD1-back-to-GD2");}}
+        for(int t:{1,4,64,512}){Graph short_ref(control,in,rs,t,mode,false),short_got(candidate,in,gs,t,mode,true);for(int rb:{0,8,16}){seed(ref,got,500+t+rb);step(short_ref,short_got,600+t+rb,rb,"GD2-original-compatible-token-shape",false);step(ref,got,650+t+rb,0,"compatible-GD1-back-to-GD2");}if(t>=64)short_got.inspect(false);}
         // Imported GD2 has unrelated generation. Every public write path must
         // request the one-pass GD1 compatibility writer, including graph replay.
         seed(ref,got,700);const auto saved_ref=rs.get(),saved_got=gs.get();State src(candidate);src.put(saved_got);

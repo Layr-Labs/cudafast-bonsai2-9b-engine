@@ -772,6 +772,9 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+typedef void (*ggml_sched_upload_set_fn) (ggml_backend_t, struct ggml_tensor *, const void *, size_t, size_t);
+typedef void (*ggml_sched_upload_join_fn)(ggml_backend_t);
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -811,7 +814,13 @@ struct ggml_backend_sched {
     // stream; the event marks when the staging buffer can be written again
     ggml_backend_buffer_t input_staging[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_event_t  input_staging_event[GGML_SCHED_MAX_BACKENDS];
+    // whether input_staging_event was recorded after the last staged split and not yet waited for
+    // (a scheduler-wide synchronization completes those uploads, see ggml_backend_sched_synchronize)
     bool                  input_staging_pending[GGML_SCHED_MAX_BACKENDS];
+    // the backend's upload-stream entry points for staged inputs (reg proc addresses; looked up once)
+    ggml_sched_upload_set_fn  input_upload_set[GGML_SCHED_MAX_BACKENDS];
+    ggml_sched_upload_join_fn input_upload_join[GGML_SCHED_MAX_BACKENDS];
+    bool                      input_upload_probed[GGML_SCHED_MAX_BACKENDS];
 
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
@@ -1650,6 +1659,25 @@ static uint8_t * ggml_backend_sched_input_staging(ggml_backend_sched_t sched, co
     return (uint8_t *) ggml_backend_buffer_get_base(sched->input_staging[backend_id]);
 }
 
+// whether the backend uploads staged inputs on an auxiliary stream (the CUDA backend: reg procs
+// ggml_backend_cuda_set_tensor_input_async and ggml_backend_cuda_input_upload_join)
+static bool ggml_backend_sched_input_upload_probe(ggml_backend_sched_t sched, int backend_id) {
+    if (!sched->input_upload_probed[backend_id]) {
+        sched->input_upload_probed[backend_id] = true;
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[backend_id]);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+        if (reg != NULL) {
+            sched->input_upload_set[backend_id]  = (ggml_sched_upload_set_fn)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_tensor_input_async");
+            sched->input_upload_join[backend_id] = (ggml_sched_upload_join_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_input_upload_join");
+            if (sched->input_upload_set[backend_id] == NULL || sched->input_upload_join[backend_id] == NULL) {
+                sched->input_upload_set[backend_id]  = NULL;
+                sched->input_upload_join[backend_id] = NULL;
+            }
+        }
+    }
+    return sched->input_upload_set[backend_id] != NULL;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1676,10 +1704,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // inputs in host memory (user inputs and outputs of host splits, final at this point) are
-        // staged in pinned memory and go up on the split backend's stream, after its previous work,
-        // so neither the copies nor the launch wait for that work on the host
+        // staged in pinned memory and go up asynchronously (on the backend's upload stream when it has
+        // one, joined into its stream just before the graph; otherwise on the backend's stream), so
+        // neither the copies nor the launch wait for the backend's queued work on the host
         uint8_t * staging     = ggml_backend_sched_input_staging(sched, split);
         size_t    staging_off = 0;
+        bool      input_uploads = false;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1690,7 +1720,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (staging != NULL && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer)) {
                 const size_t nbytes = ggml_nbytes(input);
                 memcpy(staging + staging_off, input->data, nbytes);
-                ggml_backend_tensor_set_async(split_backend, input_cpy, staging + staging_off, 0, nbytes);
+                if (ggml_backend_sched_input_upload_probe(sched, split_backend_id)) {
+                    // on the backend's upload stream: not behind its queued work (an event wait, the encoder,
+                    // ...) and not in front of its graph; the join below orders the graph after the uploads
+                    sched->input_upload_set[split_backend_id](split_backend, input_cpy, staging + staging_off, 0, nbytes);
+                    input_uploads = true;
+                } else {
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, staging + staging_off, 0, nbytes);
+                }
                 staging_off += GGML_PAD(nbytes, 128);
             } else if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1807,6 +1844,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        if (input_uploads) {
+            sched->input_upload_join[split_backend_id](split_backend);
         }
 
         if (!sched->callback_eval) {

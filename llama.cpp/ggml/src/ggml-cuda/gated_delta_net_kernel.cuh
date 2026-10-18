@@ -170,10 +170,11 @@ static __device__ __forceinline__ void gdn_lazy_store_header(float * rec, const 
 
 // A compatible fallback may consume an imported GD2L cache without a counter:
 // it writes GD1L and never changes either shared parity record. Only seq1, the
-// original 8-CTA/16-column geometry can own this representation.
+// original eight logical record slices own this representation. Wider N1
+// readers provide that logical geometry explicitly; writers keep the format.
 static __device__ __forceinline__ const float * gdn_dedup_read_record(
-        const float * state, int64_t stride, int K, const uint32_t * hdr) {
-    if (hdr[0] != GDN_DEDUP_MAGIC || K < 12 || gridDim.y != 1 || gridDim.z != 8) return nullptr;
+        const float * state, int64_t stride, int K, const uint32_t * hdr, int record_nz = -1) {
+    if (hdr[0] != GDN_DEDUP_MAGIC || K < 12 || gridDim.y != 1 || (record_nz < 0 ? (int) gridDim.z : record_nz) != 8) return nullptr;
     const uint32_t gen = hdr[3];
     const float * rec = state + (10 + (gen & 1u)) * stride;
     const uint32_t * sh = reinterpret_cast<const uint32_t *>(rec);
@@ -183,7 +184,8 @@ static __device__ __forceinline__ const float * gdn_dedup_read_record(
 template <int S_v, int warp_size, int rows_per_lane, int cols_per_warp>
 static __device__ __forceinline__ bool gdn_lazy_replay(
         float (&s_shard)[cols_per_warp][rows_per_lane], const float * curr_state, const float * state,
-        const int64_t slot_stride, const int K, const int col, const int lane) {
+        const int64_t slot_stride, const int K, const int col, const int lane,
+        const int record_z = -1, const int record_warp = -1, const int record_nz = -1) {
     if (slot_stride <= 0) {
         return false;
     }
@@ -192,14 +194,17 @@ static __device__ __forceinline__ bool gdn_lazy_replay(
         return false;
     }
     const int64_t rb = diff / slot_stride;  // rolled-back tokens
-    const float * rec = state + (2 + blockIdx.z) * slot_stride;
+    const int rz = record_z < 0 ? (int) blockIdx.z : record_z;
+    const int rw = record_warp < 0 ? (int) threadIdx.y : record_warp;
+    const int nz = record_nz < 0 ? (int) gridDim.z : record_nz;
+    const float * rec = state + (2 + rz) * slot_stride;
     const uint32_t * hdr = (const uint32_t *) rec;
     const int W = (int) hdr[1];
     const float * shared_rec = nullptr;
     if constexpr (S_v == 128 && warp_size == 32 && cols_per_warp == 4) {
-        shared_rec = gdn_dedup_read_record(state, slot_stride, K, hdr);
+        shared_rec = gdn_dedup_read_record(state, slot_stride, K, hdr, nz);
     }
-    if ((hdr[0] != GDN_LAZY_MAGIC && !shared_rec) || W < 1 || W > K || rb > W || 2 + (int) gridDim.z > K ||
+    if ((hdr[0] != GDN_LAZY_MAGIC && !shared_rec) || W < 1 || W > K || rb > W || 2 + nz > K ||
             (rb == 0 && (hdr[2] != GDN_LAZY_NOFINAL || !gdn_lazy_slot0_marked(curr_state, col, S_v)))) {
         return false;
     }
@@ -214,7 +219,7 @@ static __device__ __forceinline__ bool gdn_lazy_replay(
             h = gdn_lazy_mix(h, __float_as_uint(s_shard[c][r]));
         }
     }
-    if (gdn_lazy_warp_hash<warp_size>(h) != hdr[4 + threadIdx.y]) {
+    if (gdn_lazy_warp_hash<warp_size>(h) != hdr[4 + rw]) {
         return false;  // slot 1 no longer holds this record's base
     }
     const int n_replay = W - (int) rb;
@@ -239,7 +244,7 @@ static __device__ __forceinline__ bool gdn_lazy_replay(
             }
             float kv_col = warp_reduce_sum<warp_size>(kv_shard);
 
-            float delta_col = (tv[threadIdx.y * cols_per_warp + c] - g_val * kv_col) * beta_val;
+            float delta_col = (tv[rw * cols_per_warp + c] - g_val * kv_col) * beta_val;
 
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
@@ -557,7 +562,7 @@ static __device__ __forceinline__ float gdn_l8_reduce(float (&p)[4]) {
     return x;
 }
 
-template <bool RAW, bool G_PRECOMPUTED, bool HEAD_MAJOR = false>
+template <bool RAW, bool G_PRECOMPUTED, bool HEAD_MAJOR = false, bool MATERIALIZED = false>
 __global__ void __launch_bounds__(128, 6)
 gated_delta_net_l8_cuda(const float * q, const float * k, const float * v, const float * g, const float * beta,
                         const float * raw_dt_bias, const float * raw_a, const float * curr_state, float * dst,
@@ -597,7 +602,7 @@ gated_delta_net_l8_cuda(const float * q, const float * k, const float * v, const
 
     lazy = lazy && state_slot_stride > 0 && 2 + (int) gridDim.z <= K;
     bool replayed = false;
-    if (lazy && !zeroed) {
+    if (lazy && !zeroed && !MATERIALIZED) {
         // gdn_lazy_replay in this layout
         const int64_t diff = curr_state - state;
         if (state_slot_stride > 0 && diff >= 0 && diff % state_slot_stride == 0) {
@@ -1110,3 +1115,907 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
                               /*final_in_slot0 =*/ false);
     }
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+// N1: full-f32 chunk/WY prefill. No TF32, reduced-precision operand, or gate quotient.
+// For a chunk, G_i=prod(a_0..a_i), R_ij=prod(a_(j+1)..a_i), and
+// L_ij=beta_i R_ij dot(k_i,k_j) (j<i). The unit-lower triangular solves give
+// W=(I+L)^-1 diag(beta G) K, U=(I+L)^-1 diag(beta) V.
+// Then D=U-W S, Y=G Q S+tril(R*(Q K^T)) D,
+// S'=G_last S+K^T diag(R_last) D. All products/solves/accumulators are f32.
+// The last K tokens run through l8, so its snapshots/records describe an exact
+// recurrence from the chunk-rounded boundary, including checksums and slot 0.
+static constexpr int GDN_CHUNK = 32;
+static bool gdn_chunk32_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_GDN_CHUNKED") == nullptr || atoi(getenv("GGML_CUDA_GDN_CHUNKED")) != 0;
+    return enabled;
+}
+static bool gdn_chunk32_scan_ilp_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_GDN_SCAN_ILP") == nullptr || atoi(getenv("GGML_CUDA_GDN_SCAN_ILP")) != 0;
+    return enabled;
+}
+static bool gdn_chunk32_prefetch_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_GDN_PREFETCH") == nullptr || atoi(getenv("GGML_CUDA_GDN_PREFETCH")) != 0;
+    return enabled && gdn_chunk32_scan_ilp_enabled();
+}
+static bool gdn_chunk32_wide_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_GDN_WIDE") == nullptr || atoi(getenv("GGML_CUDA_GDN_WIDE")) != 0;
+    return enabled && gdn_chunk32_prefetch_enabled();
+}
+static bool gdn_chunk32_compact_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_GDN_COMPACT") == nullptr || atoi(getenv("GGML_CUDA_GDN_COMPACT")) != 0;
+    return enabled && gdn_chunk32_wide_enabled();
+}
+
+static bool gdn_chunk32_qstage_enabled() {
+    static const bool enabled = !getenv("GGML_CUDA_GDN_QSTAGE") || atoi(getenv("GGML_CUDA_GDN_QSTAGE")) != 0;
+    return enabled && gdn_chunk32_compact_enabled();
+}
+
+// Explicit 16-byte f32 loads, cached in L1 as well as L2. Volatile inline PTX
+// also keeps them after the kernel's PDL dependency synchronization. The host
+// checks alignment/strides before selecting this path. No numerical cast.
+static __device__ __forceinline__ float4 gdn_chunk32_load4(const float * p) {
+    float4 v;
+    asm volatile("ld.global.ca.v4.f32 {%0, %1, %2, %3}, [%4];"
+        : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "l"(p));
+    return v;
+}
+static __device__ __forceinline__ float gdn_chunk32_load1(const float * p) {
+    float v;
+    asm volatile("ld.global.ca.f32 %0, [%1];" : "=f"(v) : "l"(p));
+    return v;
+}
+static __device__ __forceinline__ void gdn_chunk32_fma4(float a, const float4 & b, float4 & c) {
+    c.x = fmaf(a, b.x, c.x); c.y = fmaf(a, b.y, c.y);
+    c.z = fmaf(a, b.z, c.z); c.w = fmaf(a, b.w, c.w);
+}
+static __device__ __forceinline__ float4 gdn_chunk32_mul4(float a, const float4 & b) {
+    return make_float4(a*b.x, a*b.y, a*b.z, a*b.w);
+}
+// Physical key order of the frontier Q/K producer -> natural cache row.
+// Replay shards start in natural lane ownership; permute them within a warp
+// before the wide shared scatter so the XOR layout keeps its bank behavior.
+template <bool HEAD_MAJOR>
+static __device__ __forceinline__ int gdn_chunk32_natural_key(int row) {
+    return HEAD_MAJOR ? (row/32)*32+(row%32)/4+(row%4)*8 : row;
+}
+template <bool HEAD_MAJOR>
+static __device__ __forceinline__ float gdn_chunk32_replay_lane(float value, int lane) {
+    if constexpr (HEAD_MAJOR) { return __shfl_sync(0xffffffffu, value, lane/4+(lane%4)*8); }
+    return value;
+}
+struct gdn_chunk32 {
+    float w[GDN_CHUNK][128];
+    float u[GDN_CHUNK][128];
+    float m[GDN_CHUNK][GDN_CHUNK];
+    float prefix[GDN_CHUNK];
+    float suffix[GDN_CHUNK];
+};
+// Wide scan: issue all non-W/Q chunk reads before the projections, then stage
+// K/M just before their first consumer barrier. This hides their load latency
+// behind W*S and Q*S without another shared buffer or another chunk's state.
+struct gdn_chunk32_scan_stage {
+    float4 k[4], m, u;
+    float suffix[4], prefix, last;
+};
+// (I+L)^-1 replaces both 32x128 W/U transforms. Raw V is consumed by scan.
+// Packed entries use only this prefix of the original scratch allocation; the
+// full capacity remains available for alignment/diagnostic fallbacks to i1-i4.
+struct gdn_compact32 {
+    float inv[GDN_CHUNK][GDN_CHUNK];
+    float m[GDN_CHUNK][GDN_CHUNK];
+    float prefix[GDN_CHUNK], suffix[GDN_CHUNK], beta[GDN_CHUNK];
+};
+static_assert(sizeof(gdn_compact32) == 8576, "compact f32 layout");
+static_assert(sizeof(gdn_compact32) <= sizeof(gdn_chunk32), "scratch capacity");
+
+template <bool RAW, bool G_PRECOMPUTED, bool PREFETCH, bool QREG>
+static __global__ void __launch_bounds__(256, QREG ? 4 : 2) gdn_chunk32_prepare(
+        const float * q, const float * k, const float * v, const float * g, const float * beta,
+        const float * raw_dt_bias, const float * raw_a, gdn_chunk32 * work,
+        int H, int prefix_tokens, int64_t sq1, int64_t sq2, int64_t sv1, int64_t sv2,
+        int64_t sb1, int64_t sb2, uint3 neqk1_magic) {
+    constexpr int C = GDN_CHUNK;
+    constexpr int PITCH = PREFETCH ? 132 : 129;
+    const int h = blockIdx.x, ch = blockIdx.y, tid = threadIdx.x;
+    const int t0 = ch*C;
+    const int n = min(C, prefix_tokens-t0);
+    const int kh = fastmodulo(h, neqk1_magic);
+    gdn_chunk32 & out = work[ch*H+h];
+    // Padding avoids 32-way bank conflicts in the pairwise Gram products.
+    // The wide path broadcasts each q row from warp registers. Removing its
+    // 16 KiB shared tile admits four 256-thread CTAs/SM at <=64 registers.
+    __shared__ __align__(16) float qs[QREG ? 1 : C][PITCH], ks[C][PITCH];
+    __shared__ float lower[C][C+1];
+    __shared__ float decay[C], b[C], G[C];
+    ggml_cuda_pdl_sync();
+    if constexpr (PREFETCH) {
+        for (int i = tid; i < C*32; i += 256) {
+            const int t = i/32, r = (i%32)*4;
+            float4 q4;
+            if constexpr (!QREG) {
+                q4 = t < n ? gdn_chunk32_load4(q+kh*sq1+(t0+t)*sq2+r) : make_float4(0, 0, 0, 0);
+            }
+            const float4 k4 = t < n ? gdn_chunk32_load4(k+kh*sq1+(t0+t)*sq2+r) : make_float4(0, 0, 0, 0);
+            if constexpr (!QREG) { *(float4 *) &qs[t][r] = q4; }
+            *(float4 *) &ks[t][r] = k4;
+        }
+    } else {
+        for (int i = tid; i < C*128; i += 256) {
+            const int t = i/128, r = i%128;
+            qs[t][r] = t < n ? q[kh*sq1+(t0+t)*sq2+r] : 0.0f;
+            ks[t][r] = t < n ? k[kh*sq1+(t0+t)*sq2+r] : 0.0f;
+        }
+    }
+    if (tid < C) {
+        float gv = 1.0f, bv = 0.0f;
+        if (tid < n) {
+            float g0 = g[h*sb1+(t0+tid)*sb2];
+            bv = beta[h*sb1+(t0+tid)*sb2];
+            static_assert(!(RAW && G_PRECOMPUTED), "raw and precomputed gates are exclusive");
+            if constexpr (RAW) {
+                const float x = g0 + raw_dt_bias[h];
+                g0 = raw_a[h] * (x > 20.0f ? x : logf(1.0f+expf(x)));
+                bv = 1.0f/(1.0f+expf(-bv));
+            }
+            gv = G_PRECOMPUTED ? g0 : expf(g0);
+        }
+        decay[tid] = gv;
+        b[tid] = bv;
+    }
+    __syncthreads();
+    if (tid < C) {
+        float p = 1.0f, s = 1.0f;
+        for (int j = 0; j <= tid; ++j) { p *= decay[j]; }
+        for (int j = tid+1; j < n; ++j) { s *= decay[j]; }
+        G[tid] = out.prefix[tid] = p;
+        out.suffix[tid] = s;
+    }
+    for (int ij = tid; ij < C*C; ij += 256) {
+        const int i = ij/C, j = ij%C;
+        float kk = 0.0f, qk = 0.0f, ratio = 1.0f;
+        if constexpr (QREG) {
+            // i is warp-uniform, j is the lane. ALL lanes must execute the
+            // shuffles, including j>i; only the Gram FMAs are triangular.
+            if (i < n) {
+                const float * qi = q+kh*sq1+(t0+i)*sq2;
+                const float4 q_lane = make_float4(gdn_chunk32_load1(qi+j), gdn_chunk32_load1(qi+j+32),
+                    gdn_chunk32_load1(qi+j+64), gdn_chunk32_load1(qi+j+96));
+                if (j <= i) { for (int t = j+1; t <= i; ++t) { ratio *= decay[t]; } }
+#pragma unroll
+                for (int r = 0; r < 128; r += 4) {
+                    const float qr = r < 32 ? q_lane.x : r < 64 ? q_lane.y : r < 96 ? q_lane.z : q_lane.w;
+                    const float4 q4 = make_float4(__shfl_sync(0xffffffffu, qr, (r%32)+0),
+                        __shfl_sync(0xffffffffu, qr, (r%32)+1), __shfl_sync(0xffffffffu, qr, (r%32)+2),
+                        __shfl_sync(0xffffffffu, qr, (r%32)+3));
+                    if (j <= i) {
+                        const float4 ki = *(const float4 *) &ks[i][r];
+                        const float4 kj = *(const float4 *) &ks[j][r];
+                        kk = fmaf(ki.x, kj.x, kk); qk = fmaf(q4.x, kj.x, qk);
+                        kk = fmaf(ki.y, kj.y, kk); qk = fmaf(q4.y, kj.y, qk);
+                        kk = fmaf(ki.z, kj.z, kk); qk = fmaf(q4.z, kj.z, qk);
+                        kk = fmaf(ki.w, kj.w, kk); qk = fmaf(q4.w, kj.w, qk);
+                    }
+                }
+            }
+        } else if (j <= i && i < n) {
+            // Pairwise products remain defined even when a gate or G_i is zero.
+            for (int t = j+1; t <= i; ++t) { ratio *= decay[t]; }
+            if constexpr (PREFETCH) {
+#pragma unroll
+                for (int r = 0; r < 128; r += 4) {
+                    const float4 ki = *(const float4 *) &ks[i][r];
+                    const float4 kj = *(const float4 *) &ks[j][r];
+                    const float4 qi = *(const float4 *) &qs[i][r];
+                    // Keep the original ascending-r accumulation, not a new tree.
+                    kk = fmaf(ki.x, kj.x, kk); qk = fmaf(qi.x, kj.x, qk);
+                    kk = fmaf(ki.y, kj.y, kk); qk = fmaf(qi.y, kj.y, qk);
+                    kk = fmaf(ki.z, kj.z, kk); qk = fmaf(qi.z, kj.z, qk);
+                    kk = fmaf(ki.w, kj.w, kk); qk = fmaf(qi.w, kj.w, qk);
+                }
+            } else {
+#pragma unroll
+                for (int r = 0; r < 128; ++r) {
+                    kk = fmaf(ks[i][r], ks[j][r], kk);
+                    qk = fmaf(qs[i][r], ks[j][r], qk);
+                }
+            }
+        }
+        lower[i][j] = j < i ? b[i]*ratio*kk : 0.0f;
+        out.m[i][j] = ratio*qk;
+    }
+    __syncthreads();
+    // Independent triangular solves for the 128 W and 128 U columns. Unroll
+    // both loops so the 32 previous entries stay in registers, not local memory.
+    const bool is_w = tid < 128;
+    const int r = tid%128;
+    float x[C];
+    float rhs_pre[C];
+    if constexpr (PREFETCH) {
+        // Issue all independent RHS reads before the dependent solve and before
+        // any W/U store. This avoids one global v load on every triangular row.
+        float v_pre[C];
+        if (!is_w) {
+#pragma unroll
+            for (int i = 0; i < C; ++i) {
+                v_pre[i] = i < n ? gdn_chunk32_load1(v+h*sv1+(t0+i)*sv2+r) : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < C; ++i) {
+            rhs_pre[i] = i < n ? (is_w ? (b[i]*G[i])*ks[i][r] : b[i]*v_pre[i]) : 0.0f;
+        }
+        asm volatile("" ::: "memory"); // compiler barrier, no GPU synchronization
+    }
+#pragma unroll
+    for (int i = 0; i < C; ++i) {
+        float rhs = 0.0f;
+        if constexpr (PREFETCH) { rhs = rhs_pre[i]; }
+        else if (i < n) {
+            rhs = is_w ? (b[i]*G[i])*ks[i][r] : b[i]*v[h*sv1+(t0+i)*sv2+r];
+        }
+#pragma unroll
+        for (int j = 0; j < i; ++j) { rhs = fmaf(-lower[i][j], x[j], rhs); }
+        x[i] = rhs;
+        if constexpr (!PREFETCH) {
+            if (is_w) { out.w[i][r] = rhs; } else { out.u[i][r] = rhs; }
+        }
+    }
+    if constexpr (PREFETCH) {
+#pragma unroll
+        for (int i = 0; i < C; ++i) {
+            if (is_w) { out.w[i][r] = x[i]; } else { out.u[i][r] = x[i]; }
+        }
+    }
+}
+
+template <bool RAW, bool G_PRECOMPUTED>
+// Leave more register room than i4's spill-producing four-CTA/64-register cap.
+static __global__ void __launch_bounds__(256, 3) gdn_compact32_prepare(
+        const float * q, const float * k, const float * g, const float * beta,
+        const float * raw_dt_bias, const float * raw_a, gdn_compact32 * work,
+        int H, int prefix_tokens, int64_t sq1, int64_t sq2,
+        int64_t sb1, int64_t sb2, uint3 neqk1_magic) {
+    constexpr int C = GDN_CHUNK;
+    constexpr int PITCH = 132;
+    const int h = blockIdx.x, ch = blockIdx.y, tid = threadIdx.x;
+    const int t0 = ch*C;
+    const int n = min(C, prefix_tokens-t0);
+    const int kh = fastmodulo(h, neqk1_magic);
+    gdn_compact32 & out = work[ch*H+h];
+    __shared__ __align__(16) float ks[C][PITCH];
+    __shared__ float lower[C][C+1];
+    __shared__ float decay[C], b[C];
+    ggml_cuda_pdl_sync();
+    for (int i = tid; i < C*32; i += 256) {
+        const int t = i/32, r = (i%32)*4;
+        const float4 k4 = t < n ? gdn_chunk32_load4(k+kh*sq1+(t0+t)*sq2+r) : make_float4(0, 0, 0, 0);
+        *(float4 *) &ks[t][r] = k4;
+    }
+    if (tid < C) {
+        float gv = 1.0f, bv = 0.0f;
+        if (tid < n) {
+            float g0 = g[h*sb1+(t0+tid)*sb2];
+            bv = beta[h*sb1+(t0+tid)*sb2];
+            static_assert(!(RAW && G_PRECOMPUTED), "raw and precomputed gates are exclusive");
+            if constexpr (RAW) {
+                const float x = g0 + raw_dt_bias[h];
+                g0 = raw_a[h] * (x > 20.0f ? x : logf(1.0f+expf(x)));
+                bv = 1.0f/(1.0f+expf(-bv));
+            }
+            gv = G_PRECOMPUTED ? g0 : expf(g0);
+        }
+        decay[tid] = gv;
+        b[tid] = out.beta[tid] = bv;
+    }
+    __syncthreads();
+    if (tid < C) {
+        float p = 1.0f, s = 1.0f;
+        for (int j = 0; j <= tid; ++j) { p *= decay[j]; }
+        for (int j = tid+1; j < n; ++j) { s *= decay[j]; }
+        out.prefix[tid] = p;
+        out.suffix[tid] = s;
+    }
+    for (int ij = tid; ij < C*C; ij += 256) {
+        const int i = ij/C, j = ij%C;
+        float kk = 0.0f, qk = 0.0f, ratio = 1.0f;
+        // i is warp-uniform, j is the lane. ALL lanes must execute the
+        // shuffles, including j>i; only the Gram FMAs are triangular.
+        if (i < n) {
+            const float * qi = q+kh*sq1+(t0+i)*sq2;
+            const float4 q_lane = make_float4(gdn_chunk32_load1(qi+j), gdn_chunk32_load1(qi+j+32),
+                gdn_chunk32_load1(qi+j+64), gdn_chunk32_load1(qi+j+96));
+            if (j <= i) { for (int t = j+1; t <= i; ++t) { ratio *= decay[t]; } }
+#pragma unroll
+            for (int r = 0; r < 128; r += 4) {
+                const float qr = r < 32 ? q_lane.x : r < 64 ? q_lane.y : r < 96 ? q_lane.z : q_lane.w;
+                const float4 q4 = make_float4(__shfl_sync(0xffffffffu, qr, (r%32)+0),
+                    __shfl_sync(0xffffffffu, qr, (r%32)+1), __shfl_sync(0xffffffffu, qr, (r%32)+2),
+                    __shfl_sync(0xffffffffu, qr, (r%32)+3));
+                if (j <= i) {
+                    const float4 ki = *(const float4 *) &ks[i][r];
+                    const float4 kj = *(const float4 *) &ks[j][r];
+                    kk = fmaf(ki.x, kj.x, kk); qk = fmaf(q4.x, kj.x, qk);
+                    kk = fmaf(ki.y, kj.y, kk); qk = fmaf(q4.y, kj.y, qk);
+                    kk = fmaf(ki.z, kj.z, kk); qk = fmaf(q4.z, kj.z, qk);
+                    kk = fmaf(ki.w, kj.w, kk); qk = fmaf(q4.w, kj.w, qk);
+                }
+            }
+        }
+        lower[i][j] = j < i ? b[i]*ratio*kk : 0.0f;
+        out.m[i][j] = ratio*qk;
+    }
+    __syncthreads();
+    // Only 32 inverse columns, rather than 128 W + 128 U columns.
+    // Solve the unit-diagonal system directly; there is no division or gate
+    // quotient. Each inverse entry uses ascending-j f32 FMAs.
+    if (tid < C) {
+        float x[C];
+#pragma unroll
+        for (int i = 0; i < C; ++i) {
+            float rhs = i == tid ? 1.0f : 0.0f;
+#pragma unroll
+            for (int j = 0; j < i; ++j) { rhs = fmaf(-lower[i][j], x[j], rhs); }
+            x[i] = rhs;
+        }
+#pragma unroll
+        for (int i = 0; i < C; ++i) { out.inv[i][tid] = x[i]; }
+    }
+}
+
+// One token x four value columns per thread. W/Q are reused across four values,
+// loaded as float4 with register lookahead; kd and delta use vector shared reads.
+// The only inter-chunk dependency is the same state tile as before. First W/Q
+// vectors of the next chunk are loaded while the current state update computes.
+// WIDE doubles dv/CTA, and uses three-quad lookahead (a four-slot register ring).
+template <int DV, bool WIDE>
+static __device__ __forceinline__ void gdn_chunk32_tile4(
+        const float * q_head, const gdn_chunk32 * work, float * dst, int H, int h,
+        int prefix_tokens, int t0, int n, int col0, int tid, int64_t sq2, float scale,
+        float (&s)[128][DV], float (&delta)[GDN_CHUNK][DV],
+        float (&kd)[GDN_CHUNK][132], float (&m)[GDN_CHUNK][36],
+        float4 (&look_w)[WIDE ? 3 : 1], float4 (&look_q)[WIDE ? 3 : 1],
+        const gdn_chunk32_scan_stage & stage) {
+    constexpr int PIPE = WIDE ? 4 : 2, SEED = PIPE-1;
+    const int ti = tid/(DV/4), cv = (tid%(DV/4))*4;
+    const gdn_chunk32 & in = work[(t0/GDN_CHUNK)*H+h];
+    float4 d = make_float4(0, 0, 0, 0), y = d;
+    if (ti < n) {
+        float4 w4[PIPE], q4[PIPE];
+#pragma unroll
+        for (int p = 0; p < SEED; ++p) { w4[p] = look_w[p]; q4[p] = look_q[p]; }
+#pragma unroll
+        for (int r4 = 0; r4 < 32; ++r4) {
+            const int cur = r4%PIPE, future = r4+SEED;
+            if (future < 32) {
+                w4[future%PIPE] = gdn_chunk32_load4(&in.w[ti][future*4]);
+                q4[future%PIPE] = gdn_chunk32_load4(q_head+(t0+ti)*sq2+future*4);
+            }
+            const float4 s0 = *(const float4 *) &s[r4*4+0][cv ^ (WIDE ? ((r4*4+0)&7)*4 : 0)];
+            const float4 s1 = *(const float4 *) &s[r4*4+1][cv ^ (WIDE ? ((r4*4+1)&7)*4 : 0)];
+            const float4 s2 = *(const float4 *) &s[r4*4+2][cv ^ (WIDE ? ((r4*4+2)&7)*4 : 0)];
+            const float4 s3 = *(const float4 *) &s[r4*4+3][cv ^ (WIDE ? ((r4*4+3)&7)*4 : 0)];
+            gdn_chunk32_fma4(w4[cur].x, s0, d); gdn_chunk32_fma4(q4[cur].x, s0, y);
+            gdn_chunk32_fma4(w4[cur].y, s1, d); gdn_chunk32_fma4(q4[cur].y, s1, y);
+            gdn_chunk32_fma4(w4[cur].z, s2, d); gdn_chunk32_fma4(q4[cur].z, s2, y);
+            gdn_chunk32_fma4(w4[cur].w, s3, d); gdn_chunk32_fma4(q4[cur].w, s3, y);
+        }
+        const float4 u = WIDE ? stage.u : gdn_chunk32_load4(&in.u[ti][col0+cv]);
+        d = make_float4(u.x-d.x, u.y-d.y, u.z-d.z, u.w-d.w);
+        y = gdn_chunk32_mul4(WIDE ? stage.prefix : in.prefix[ti], y);
+    }
+    if constexpr (WIDE) {
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int t = tid/32+p*8, r = (tid%32)*4;
+            *(float4 *) &kd[t][r] = gdn_chunk32_mul4(stage.suffix[p], stage.k[p]);
+        }
+        *(float4 *) &m[ti][cv] = stage.m;
+    }
+    *(float4 *) &delta[ti][cv] = d;
+    __syncthreads();
+    if (ti < n) {
+        for (int j = 0; j <= ti; ++j) {
+            const float4 dj = *(const float4 *) &delta[j][cv];
+            gdn_chunk32_fma4(m[ti][j], dj, y);
+        }
+        *(float4 *) &dst[((int64_t) (t0+ti)*H+h)*128+col0+cv] = gdn_chunk32_mul4(scale, y);
+    }
+    __syncthreads();
+    if (t0+GDN_CHUNK < prefix_tokens && ti < min(GDN_CHUNK, prefix_tokens-t0-GDN_CHUNK)) {
+        const gdn_chunk32 & next = work[(t0/GDN_CHUNK+1)*H+h];
+#pragma unroll
+        for (int p = 0; p < SEED; ++p) {
+            look_w[p] = gdn_chunk32_load4(&next.w[ti][p*4]);
+            look_q[p] = gdn_chunk32_load4(q_head+(t0+GDN_CHUNK+ti)*sq2+p*4);
+        }
+    }
+    float4 x[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int sc = cv ^ (WIDE ? ((ti*4+r)&7)*4 : 0);
+        x[r] = gdn_chunk32_mul4(WIDE ? stage.last : in.prefix[n-1], *(const float4 *) &s[ti*4+r][sc]);
+    }
+    for (int j = 0; j < n; ++j) {
+        const float4 dj = *(const float4 *) &delta[j][cv];
+        const float4 kj = *(const float4 *) &kd[j][ti*4];
+        gdn_chunk32_fma4(kj.x, dj, x[0]); gdn_chunk32_fma4(kj.y, dj, x[1]);
+        gdn_chunk32_fma4(kj.z, dj, x[2]); gdn_chunk32_fma4(kj.w, dj, x[3]);
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int sc = cv ^ (WIDE ? ((ti*4+r)&7)*4 : 0);
+        *(float4 *) &s[ti*4+r][sc] = x[r];
+    }
+}
+
+template <bool ROW_ILP, bool PREFETCH, bool WIDE, bool HEAD_MAJOR>
+static __global__ void gdn_chunk32_scan(
+        const float * q, const float * k, const float * curr_state, float * dst, float * state,
+        const gdn_chunk32 * work, int H, int prefix_tokens, int64_t sq1, int64_t sq2,
+        uint3 neqk1_magic, float scale, int64_t slot_stride, int K, const int32_t * s_ids,
+        int64_t row_stride, int lazy, const float * zero_row, float zero_scale, float zero_bias) {
+    constexpr int C = GDN_CHUNK;
+    constexpr int KP = PREFETCH ? 132 : 129, MP = PREFETCH ? 36 : C+1;
+    constexpr int DV = WIDE ? 32 : 16, NT = WIDE ? 256 : 128;
+    static_assert(!WIDE || (PREFETCH && ROW_ILP), "wide scan needs vector/ILP path");
+    // Keep the four dv tiles of a head adjacent in the CTA launch order, so
+    // shared W/Q/K/M input lines can be reused in L2 by neighboring CTAs.
+    const int h = WIDE ? blockIdx.x/4 : blockIdx.x;
+    const int slice = WIDE ? blockIdx.x%4 : blockIdx.z;
+    const int lane = threadIdx.x, tid = threadIdx.y*32+lane;
+    const int col0 = slice*DV, col = col0+threadIdx.y*4;
+    const int vc = tid%16, tr = tid/16; // 8 token rows x 16 value columns
+    const int kh = fastmodulo(h, neqk1_magic);
+    __shared__ __align__(16) float s[128][DV], delta[C][DV], kd[C][KP], m[C][MP];
+    ggml_cuda_pdl_sync();
+    const int64_t in_row = s_ids ? (int64_t) s_ids[0]*row_stride : 0;
+    const bool zeroed = zero_row != nullptr && curr_state+in_row == zero_row;
+    curr_state += in_row+(int64_t) h*128*128;
+    state += (int64_t) h*128*128;
+    lazy = lazy && slot_stride > 0 && 2+(WIDE ? 8 : (int) gridDim.z) <= K;
+    float shard[4][4];
+    const bool replayed = lazy && !zeroed &&
+        gdn_lazy_replay<128, 32, 4, 4>(shard, curr_state, state, slot_stride, K, col, lane,
+            WIDE ? 2*slice+(int) threadIdx.y/4 : -1, WIDE ? (int) threadIdx.y%4 : -1, WIDE ? 8 : -1);
+    if constexpr (WIDE) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int row = r*32+lane;
+            float4 x;
+            x.x = replayed ? gdn_chunk32_replay_lane<HEAD_MAJOR>(shard[0][r], lane) : curr_state[(col+0)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)];
+            x.y = replayed ? gdn_chunk32_replay_lane<HEAD_MAJOR>(shard[1][r], lane) : curr_state[(col+1)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)];
+            x.z = replayed ? gdn_chunk32_replay_lane<HEAD_MAJOR>(shard[2][r], lane) : curr_state[(col+2)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)];
+            x.w = replayed ? gdn_chunk32_replay_lane<HEAD_MAJOR>(shard[3][r], lane) : curr_state[(col+3)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)];
+            if (zeroed) {
+                x.x = zero_scale*x.x+zero_bias; x.y = zero_scale*x.y+zero_bias;
+                x.z = zero_scale*x.z+zero_bias; x.w = zero_scale*x.w+zero_bias;
+            }
+            // Each eight-thread, 128-byte vector store visits all 32 banks.
+            *(float4 *) &s[row][(threadIdx.y*4) ^ ((row&7)*4)] = x;
+        }
+    } else {
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int row = r*32+lane;
+            float x = replayed ? gdn_chunk32_replay_lane<HEAD_MAJOR>(shard[c][r], lane) : curr_state[(col+c)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)];
+            if (zeroed) { x = zero_scale*x+zero_bias; }
+            s[row][threadIdx.y*4+c] = x;
+        }
+    }
+    }
+    float4 look_w[WIDE ? 3 : 1], look_q[WIDE ? 3 : 1];
+    if constexpr (PREFETCH) {
+        const int ti = tid/(DV/4);
+        if (ti < min(C, prefix_tokens)) {
+#pragma unroll
+            for (int p = 0; p < (WIDE ? 3 : 1); ++p) {
+                look_w[p] = gdn_chunk32_load4(&work[h].w[ti][p*4]);
+                look_q[p] = gdn_chunk32_load4(q+kh*sq1+ti*sq2+p*4);
+            }
+        }
+    }
+    __syncthreads();
+    for (int t0 = 0; t0 < prefix_tokens; t0 += C) {
+        const int n = min(C, prefix_tokens-t0);
+        const gdn_chunk32 & in = work[(t0/C)*H+h];
+        if constexpr (PREFETCH) {
+            gdn_chunk32_scan_stage stage;
+            if constexpr (WIDE) {
+                // Four independent K/suffix groups per thread, plus M/U/gates,
+                // all issued before their arithmetic consumers. The projection
+                // needs only S/W/Q; kd and M are first read after its barrier.
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    const int t = tid/32+p*8, r = (tid%32)*4;
+                    stage.k[p] = t < n ? gdn_chunk32_load4(k+kh*sq1+(t0+t)*sq2+r) : make_float4(0, 0, 0, 0);
+                    stage.suffix[p] = gdn_chunk32_load1(&in.suffix[t]);
+                }
+                const int ti = tid/8, cv = (tid%8)*4;
+                stage.m = gdn_chunk32_load4(&in.m[ti][cv]);
+                stage.u = ti < n ? gdn_chunk32_load4(&in.u[ti][col0+cv]) : make_float4(0, 0, 0, 0);
+                stage.prefix = gdn_chunk32_load1(&in.prefix[ti]);
+                stage.last = gdn_chunk32_load1(&in.prefix[n-1]);
+                asm volatile("" ::: "memory");
+            } else {
+            for (int i = tid; i < C*32; i += NT) {
+                const int t = i/32, r = (i%32)*4;
+                const float4 k4 = t < n ? gdn_chunk32_load4(k+kh*sq1+(t0+t)*sq2+r) : make_float4(0, 0, 0, 0);
+                *(float4 *) &kd[t][r] = gdn_chunk32_mul4(in.suffix[t], k4);
+            }
+            for (int i = tid; i < C*C/4; i += NT) {
+                *(float4 *) &m[i/(C/4)][(i%(C/4))*4] = gdn_chunk32_load4(&in.m[i/(C/4)][(i%(C/4))*4]);
+            }
+            }
+            gdn_chunk32_tile4<DV, WIDE>(q+kh*sq1, work, dst, H, h, prefix_tokens, t0, n, col0, tid, sq2, scale,
+                s, delta, kd, m, look_w, look_q, stage);
+        } else {
+        for (int i = tid; i < C*128; i += 128) {
+            const int t = i/128, r = i%128;
+            kd[t][r] = t < n ? k[kh*sq1+(t0+t)*sq2+r]*in.suffix[t] : 0.0f;
+        }
+        for (int i = tid; i < C*C; i += 128) { m[i/C][i%C] = in.m[i/C][i%C]; }
+        float d[4] = {}, y[4] = {};
+#pragma unroll
+        for (int r = 0; r < 128; ++r) {
+            const float sr = s[r][vc];
+#pragma unroll
+            for (int z = 0; z < 4; ++z) {
+                const int t = tr+z*8;
+                if (t < n) {
+                    d[z] = fmaf(in.w[t][r], sr, d[z]);
+                    y[z] = fmaf(q[kh*sq1+(t0+t)*sq2+r], sr, y[z]);
+                }
+            }
+        }
+#pragma unroll
+        for (int z = 0; z < 4; ++z) {
+            const int t = tr+z*8;
+            delta[t][vc] = t < n ? in.u[t][col0+vc]-d[z] : 0.0f;
+            y[z] *= in.prefix[t];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int z = 0; z < 4; ++z) {
+            const int t = tr+z*8;
+            if (t < n) {
+                for (int j = 0; j <= t; ++j) { y[z] = fmaf(m[t][j], delta[j][vc], y[z]); }
+                dst[((int64_t) (t0+t)*H+h)*128+col0+vc] = y[z]*scale;
+            }
+        }
+        // All Q*S reads must finish before any thread changes S.
+        __syncthreads();
+        if constexpr (ROW_ILP) {
+            // Sixteen independent row accumulators, rather than sixteen serial
+            // inner loops. Reuse each delta load across those rows. Each state
+            // element still sees the same initial multiply and ascending-t FMAs.
+            float x[16];
+#pragma unroll
+            for (int z = 0; z < 16; ++z) { x[z] = in.prefix[n-1]*s[tr+z*8][vc]; }
+            for (int t = 0; t < n; ++t) {
+                const float dv = delta[t][vc];
+#pragma unroll
+                for (int z = 0; z < 16; ++z) { x[z] = fmaf(kd[t][tr+z*8], dv, x[z]); }
+            }
+#pragma unroll
+            for (int z = 0; z < 16; ++z) { s[tr+z*8][vc] = x[z]; }
+        } else {
+#pragma unroll
+            for (int z = 0; z < 16; ++z) {
+                const int r = tr+z*8;
+                float x = in.prefix[n-1]*s[r][vc];
+                for (int t = 0; t < n; ++t) { x = fmaf(kd[t][r], delta[t][vc], x); }
+                s[r][vc] = x;
+            }
+        }
+        } // PREFETCH == false
+        __syncthreads();
+    }
+    if constexpr (WIDE) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const int row = r*32+lane;
+            const float4 x = *(const float4 *) &s[row][(threadIdx.y*4) ^ ((row&7)*4)];
+            state[(col+0)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)] = x.x; state[(col+1)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)] = x.y;
+            state[(col+2)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)] = x.z; state[(col+3)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)] = x.w;
+        }
+    } else {
+#pragma unroll
+    for (int z = 0; z < 16; ++z) {
+        const int r = tr+z*8;
+        state[(col0+vc)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(r)] = s[r][vc];
+    }
+    }
+}
+
+// Compact f32 form: A=diag(beta)*(V-diag(G)*K*S), D=(I+L)^-1*A.
+// Y and the carry use the original chunk equations. This adds one triangular
+// product but eliminates both W/U arrays and all global W projection loads.
+// K is staged raw and reused by both projections and the carry. Direct Q uses
+// five chunk barriers; staged Q adds three to reuse the matrix scratch safely.
+template <bool HEAD_MAJOR, bool QSTAGE>
+static __global__ void __launch_bounds__(256, 2) gdn_compact32_scan(
+        const float * q, const float * k, const float * v, const float * curr_state, float * dst, float * state,
+        const gdn_compact32 * work, int H, int prefix_tokens, int64_t sq1, int64_t sq2,
+        int64_t sv1, int64_t sv2, uint3 neqk1_magic, float scale, int64_t slot_stride, int K,
+        const int32_t * s_ids, int64_t row_stride, int lazy, const float * zero_row,
+        float zero_scale, float zero_bias) {
+    constexpr int C = GDN_CHUNK;
+    const int h = blockIdx.x/4, slice = blockIdx.x%4;
+    const int lane = threadIdx.x, tid = threadIdx.y*32+lane;
+    const int ti = tid/8, cv = (tid%8)*4, col0 = slice*32, col = col0+threadIdx.y*4;
+    const int kh = fastmodulo(h, neqk1_magic);
+    __shared__ __align__(16) float s[128][32], delta[C][32], ks[C][132];
+    // Q is needed only during projection; M/Inv only after it. The same
+    // 9 KiB holds either two matrices or a 32-token x 64-key Q tile.
+    union reuse_t {
+        struct { float m[C][36], inv[C][36]; } matrix;
+        float q[C][68];
+    };
+    static_assert(sizeof(reuse_t) == 2*C*36*sizeof(float), "shared reuse footprint");
+    __shared__ __align__(16) reuse_t reuse;
+    auto & m = reuse.matrix.m;
+    auto & inv = reuse.matrix.inv;
+    __shared__ float suffix[C];
+    ggml_cuda_pdl_sync();
+    const int64_t in_row = s_ids ? (int64_t) s_ids[0]*row_stride : 0;
+    const bool zeroed = zero_row != nullptr && curr_state+in_row == zero_row;
+    curr_state += in_row+(int64_t) h*128*128;
+    state += (int64_t) h*128*128;
+    lazy = lazy && slot_stride > 0 && 2+8 <= K;
+    float shard[4][4];
+    const bool replayed = lazy && !zeroed &&
+        gdn_lazy_replay<128, 32, 4, 4>(shard, curr_state, state, slot_stride, K, col, lane,
+            2*slice+(int) threadIdx.y/4, (int) threadIdx.y%4, 8);
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int row = r*32+lane;
+        float4 x;
+        x.x = replayed ? gdn_chunk32_replay_lane<HEAD_MAJOR>(shard[0][r], lane) : curr_state[(col+0)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)];
+        x.y = replayed ? gdn_chunk32_replay_lane<HEAD_MAJOR>(shard[1][r], lane) : curr_state[(col+1)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)];
+        x.z = replayed ? gdn_chunk32_replay_lane<HEAD_MAJOR>(shard[2][r], lane) : curr_state[(col+2)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)];
+        x.w = replayed ? gdn_chunk32_replay_lane<HEAD_MAJOR>(shard[3][r], lane) : curr_state[(col+3)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)];
+        if (zeroed) {
+            x.x = zero_scale*x.x+zero_bias; x.y = zero_scale*x.y+zero_bias;
+            x.z = zero_scale*x.z+zero_bias; x.w = zero_scale*x.w+zero_bias;
+        }
+        *(float4 *) &s[row][(threadIdx.y*4) ^ ((row&7)*4)] = x;
+    }
+    float4 look_q[QSTAGE ? 2 : 3];
+    if constexpr (QSTAGE) {
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const int i = tid+p*256, qt = i/16, qr = (i%16)*4;
+            look_q[p] = qt < min(C, prefix_tokens) ? gdn_chunk32_load4(q+kh*sq1+qt*sq2+qr) : make_float4(0, 0, 0, 0);
+        }
+    } else if (ti < min(C, prefix_tokens)) {
+#pragma unroll
+        for (int p = 0; p < 3; ++p) { look_q[p] = gdn_chunk32_load4(q+kh*sq1+ti*sq2+p*4); }
+    }
+    __syncthreads();
+    for (int t0 = 0; t0 < prefix_tokens; t0 += C) {
+        const int n = min(C, prefix_tokens-t0);
+        const gdn_compact32 & in = work[(t0/C)*H+h];
+        // Independent global reads, before arithmetic/stores use any of them.
+        float4 k_pre[4];
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const int t = tid/32+p*8, r = lane*4;
+            k_pre[p] = t < n ? gdn_chunk32_load4(k+kh*sq1+(t0+t)*sq2+r) : make_float4(0, 0, 0, 0);
+        }
+        float4 q_next[2];
+        if constexpr (QSTAGE) {
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                const int i = tid+p*256, qt = i/16, qr = (i%16)*4;
+                q_next[p] = qt < n ? gdn_chunk32_load4(q+kh*sq1+(t0+qt)*sq2+64+qr) : make_float4(0, 0, 0, 0);
+            }
+        }
+        const float4 mi = gdn_chunk32_load4(&in.m[ti][cv]);
+        const float4 ii = gdn_chunk32_load4(&in.inv[ti][cv]);
+        const float4 vi = ti < n ? gdn_chunk32_load4(v+h*sv1+(t0+ti)*sv2+col0+cv) : make_float4(0, 0, 0, 0);
+        const float gi = gdn_chunk32_load1(&in.prefix[ti]);
+        const float bi = gdn_chunk32_load1(&in.beta[ti]);
+        const float last = gdn_chunk32_load1(&in.prefix[n-1]);
+        const float sf = tid < C ? gdn_chunk32_load1(&in.suffix[tid]) : 1.0f;
+        asm volatile("" ::: "memory");
+#pragma unroll
+        for (int p = 0; p < 4; ++p) { *(float4 *) &ks[tid/32+p*8][lane*4] = k_pre[p]; }
+        if constexpr (QSTAGE) {
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                const int i = tid+p*256;
+                *(float4 *) &reuse.q[i/16][(i%16)*4] = look_q[p];
+            }
+        } else {
+            *(float4 *) &m[ti][cv] = mi;
+            *(float4 *) &inv[ti][cv] = ii;
+        }
+        if (tid < C) { suffix[tid] = sf; }
+        __syncthreads();
+        float4 a = make_float4(0, 0, 0, 0), y = a;
+        if constexpr (QSTAGE) {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                if (half == 1) {
+                    __syncthreads(); // finish every reader of the first Q half
+#pragma unroll
+                    for (int p = 0; p < 2; ++p) {
+                        const int i = tid+p*256;
+                        *(float4 *) &reuse.q[i/16][(i%16)*4] = q_next[p];
+                    }
+                    __syncthreads();
+                }
+                if (ti < n) {
+#pragma unroll
+                    for (int j4 = 0; j4 < 16; ++j4) {
+                        const int r4 = half*16+j4;
+                        const float4 qi = *(const float4 *) &reuse.q[ti][j4*4];
+                        const float4 ki = *(const float4 *) &ks[ti][r4*4];
+                        const float4 s0 = *(const float4 *) &s[r4*4+0][cv ^ (((r4*4+0)&7)*4)];
+                        const float4 s1 = *(const float4 *) &s[r4*4+1][cv ^ (((r4*4+1)&7)*4)];
+                        const float4 s2 = *(const float4 *) &s[r4*4+2][cv ^ (((r4*4+2)&7)*4)];
+                        const float4 s3 = *(const float4 *) &s[r4*4+3][cv ^ (((r4*4+3)&7)*4)];
+                        gdn_chunk32_fma4(ki.x, s0, a); gdn_chunk32_fma4(qi.x, s0, y);
+                        gdn_chunk32_fma4(ki.y, s1, a); gdn_chunk32_fma4(qi.y, s1, y);
+                        gdn_chunk32_fma4(ki.z, s2, a); gdn_chunk32_fma4(qi.z, s2, y);
+                        gdn_chunk32_fma4(ki.w, s3, a); gdn_chunk32_fma4(qi.w, s3, y);
+                    }
+                }
+            }
+            __syncthreads(); // all Q readers finish before M/Inv overwrite Q
+            *(float4 *) &m[ti][cv] = mi;
+            *(float4 *) &inv[ti][cv] = ii;
+        } else {
+            if (ti < n) {
+                float4 q4[4];
+#pragma unroll
+                for (int p = 0; p < 3; ++p) { q4[p] = look_q[p]; }
+#pragma unroll
+                for (int r4 = 0; r4 < 32; ++r4) {
+                    const int cur = r4%4, future = r4+3;
+                    if (future < 32) { q4[future%4] = gdn_chunk32_load4(q+kh*sq1+(t0+ti)*sq2+future*4); }
+                    const float4 ki = *(const float4 *) &ks[ti][r4*4];
+                    const float4 s0 = *(const float4 *) &s[r4*4+0][cv ^ (((r4*4+0)&7)*4)];
+                    const float4 s1 = *(const float4 *) &s[r4*4+1][cv ^ (((r4*4+1)&7)*4)];
+                    const float4 s2 = *(const float4 *) &s[r4*4+2][cv ^ (((r4*4+2)&7)*4)];
+                    const float4 s3 = *(const float4 *) &s[r4*4+3][cv ^ (((r4*4+3)&7)*4)];
+                    gdn_chunk32_fma4(ki.x, s0, a); gdn_chunk32_fma4(q4[cur].x, s0, y);
+                    gdn_chunk32_fma4(ki.y, s1, a); gdn_chunk32_fma4(q4[cur].y, s1, y);
+                    gdn_chunk32_fma4(ki.z, s2, a); gdn_chunk32_fma4(q4[cur].z, s2, y);
+                    gdn_chunk32_fma4(ki.w, s3, a); gdn_chunk32_fma4(q4[cur].w, s3, y);
+                }
+            }
+        }
+        if (ti < n) {
+            a = make_float4(bi*fmaf(-gi, a.x, vi.x), bi*fmaf(-gi, a.y, vi.y),
+                bi*fmaf(-gi, a.z, vi.z), bi*fmaf(-gi, a.w, vi.w));
+            y = gdn_chunk32_mul4(gi, y);
+        }
+        *(float4 *) &delta[ti][cv] = a;
+        __syncthreads(); // A and all S projection readers are complete.
+        float4 d = make_float4(0, 0, 0, 0);
+        if (ti < n) {
+            for (int j = 0; j <= ti; ++j) { gdn_chunk32_fma4(inv[ti][j], *(const float4 *) &delta[j][cv], d); }
+        }
+        __syncthreads(); // No reader may still use A when D overwrites it.
+        *(float4 *) &delta[ti][cv] = d;
+        __syncthreads();
+        if (ti < n) {
+            for (int j = 0; j <= ti; ++j) { gdn_chunk32_fma4(m[ti][j], *(const float4 *) &delta[j][cv], y); }
+            *(float4 *) &dst[((int64_t) (t0+ti)*H+h)*128+col0+cv] = gdn_chunk32_mul4(scale, y);
+        }
+        if constexpr (QSTAGE) {
+            if (t0+C < prefix_tokens) {
+#pragma unroll
+                for (int p = 0; p < 2; ++p) {
+                    const int i = tid+p*256, qt = i/16, qr = (i%16)*4;
+                    look_q[p] = qt < min(C, prefix_tokens-t0-C) ?
+                        gdn_chunk32_load4(q+kh*sq1+(t0+C+qt)*sq2+qr) : make_float4(0, 0, 0, 0);
+                }
+            }
+        } else if (t0+C < prefix_tokens && ti < min(C, prefix_tokens-t0-C)) {
+#pragma unroll
+            for (int p = 0; p < 3; ++p) { look_q[p] = gdn_chunk32_load4(q+kh*sq1+(t0+C+ti)*sq2+p*4); }
+        }
+        float4 x[4];
+#pragma unroll
+        for (int r = 0; r < 4; ++r) { x[r] = gdn_chunk32_mul4(last, *(const float4 *) &s[ti*4+r][cv ^ (((ti*4+r)&7)*4)]); }
+        for (int j = 0; j < n; ++j) {
+            const float4 dj = gdn_chunk32_mul4(suffix[j], *(const float4 *) &delta[j][cv]);
+            const float4 kj = *(const float4 *) &ks[j][ti*4];
+            gdn_chunk32_fma4(kj.x, dj, x[0]); gdn_chunk32_fma4(kj.y, dj, x[1]);
+            gdn_chunk32_fma4(kj.z, dj, x[2]); gdn_chunk32_fma4(kj.w, dj, x[3]);
+        }
+#pragma unroll
+        for (int r = 0; r < 4; ++r) { *(float4 *) &s[ti*4+r][cv ^ (((ti*4+r)&7)*4)] = x[r]; }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int row = r*32+lane;
+        const float4 x = *(const float4 *) &s[row][(threadIdx.y*4) ^ ((row&7)*4)];
+        state[(col+0)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)] = x.x; state[(col+1)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)] = x.y;
+        state[(col+2)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)] = x.z; state[(col+3)*128+gdn_chunk32_natural_key<HEAD_MAJOR>(row)] = x.w;
+    }
+}
+
+// Eligible only for S_v=128, one sequence, keep_rs, 1<K<T, and NVIDIA.
+// Work has H*ceil((T-K)/32) entries. No allocation, host readback or synchronization
+// here: the caller owns scratch through its stream/capture lifetime.
+template <bool RAW, bool G_PRECOMPUTED, bool HEAD_MAJOR = false>
+static void gdn_chunk32_launch(
+        const float * q, const float * k, const float * v, const float * g, const float * beta,
+        const float * raw_dt_bias, const float * raw_a, const float * curr_state, float * dst, float * state,
+        gdn_chunk32 * work, int H, int T, int64_t sq1, int64_t sq2, int64_t sq3,
+        int64_t sv1, int64_t sv2, int64_t sv3, int64_t sb1, int64_t sb2, int64_t sb3,
+        uint3 neqk1_magic, uint3 rq3_magic, float scale, int64_t slot_stride, int K,
+        const int32_t * s_ids, int64_t row_stride, int lazy, const float * zero_row,
+        float zero_scale, float zero_bias, cudaStream_t stream,
+        const cudaEvent_t * phase_events = nullptr, bool row_ilp = gdn_chunk32_scan_ilp_enabled(),
+        bool prefetch = gdn_chunk32_prefetch_enabled(), bool wide = gdn_chunk32_wide_enabled(),
+        bool compact = gdn_chunk32_compact_enabled(), bool qstage = gdn_chunk32_qstage_enabled()) {
+    const ggml_cuda_kernel_launch_params scan(dim3(H, 1, 8), dim3(32, 4), 0, stream);
+    if (!gdn_chunk32_enabled()) {
+        ggml_cuda_kernel_launch(gated_delta_net_l8_cuda<RAW, G_PRECOMPUTED, HEAD_MAJOR>, scan,
+            q, k, v, g, beta, raw_dt_bias, raw_a, curr_state, dst, state,
+            (int64_t) H, (int64_t) T, (int64_t) 1, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+            neqk1_magic, rq3_magic, scale, slot_stride, K, s_ids, row_stride, lazy, zero_row, zero_scale, zero_bias);
+        return;
+    }
+    // Global vector reads require aligned rows; unsupported layouts retain i2.
+    prefetch = prefetch && row_ilp && ((uintptr_t) q%16 == 0) && ((uintptr_t) k%16 == 0) &&
+        ((uintptr_t) dst%16 == 0) && ((uintptr_t) work%16 == 0) && sq1%4 == 0 && sq2%4 == 0;
+    wide = wide && prefetch;
+    compact = compact && wide && ((uintptr_t) v%16 == 0) && sv1%4 == 0 && sv2%4 == 0;
+    const int prefix = T-K;
+    const ggml_cuda_kernel_launch_params prep(dim3(H, (prefix+31)/32), dim3(256), 0, stream);
+    const ggml_cuda_kernel_launch_params wide_scan(dim3(H*4), dim3(32, 8), 0, stream);
+    // Optional standalone instrumentation only. The production caller supplies
+    // no events; normal graphs keep the original three kernel nodes.
+    if (phase_events) { CUDA_CHECK(cudaEventRecordWithFlags(phase_events[0], stream, cudaEventRecordExternal)); }
+#define GDN_CHUNK32_PREP(PREF_, QREG_) \
+    ggml_cuda_kernel_launch(gdn_chunk32_prepare<RAW, G_PRECOMPUTED, PREF_, QREG_>, prep, \
+        q, k, v, g, beta, raw_dt_bias, raw_a, work, H, prefix, sq1, sq2, sv1, sv2, sb1, sb2, neqk1_magic)
+    if (compact) {
+        ggml_cuda_kernel_launch(gdn_compact32_prepare<RAW, G_PRECOMPUTED>, prep,
+            q, k, g, beta, raw_dt_bias, raw_a, (gdn_compact32 *) work,
+            H, prefix, sq1, sq2, sb1, sb2, neqk1_magic);
+    }
+    else if (wide) { GDN_CHUNK32_PREP(true, true); }
+    else if (prefetch) { GDN_CHUNK32_PREP(true, false); }
+    else { GDN_CHUNK32_PREP(false, false); }
+#undef GDN_CHUNK32_PREP
+    if (phase_events) { CUDA_CHECK(cudaEventRecordWithFlags(phase_events[1], stream, cudaEventRecordExternal)); }
+#define GDN_CHUNK32_SCAN(ILP_, PREF_, WIDE_) \
+    ggml_cuda_kernel_launch(gdn_chunk32_scan<ILP_, PREF_, WIDE_, HEAD_MAJOR>, WIDE_ ? wide_scan : scan, q, k, curr_state, dst, state, work, \
+        H, prefix, sq1, sq2, neqk1_magic, scale, slot_stride, K, s_ids, row_stride, lazy, \
+        zero_row, zero_scale, zero_bias)
+    if (compact) {
+#define GDN_COMPACT_SCAN(QSTAGE_) \
+        ggml_cuda_kernel_launch(gdn_compact32_scan<HEAD_MAJOR, QSTAGE_>, wide_scan, q, k, v, curr_state, dst, state, \
+            (const gdn_compact32 *) work, H, prefix, sq1, sq2, sv1, sv2, neqk1_magic, scale, \
+            slot_stride, K, s_ids, row_stride, lazy, zero_row, zero_scale, zero_bias)
+        if (qstage) { GDN_COMPACT_SCAN(true); } else { GDN_COMPACT_SCAN(false); }
+#undef GDN_COMPACT_SCAN
+    }
+    else if (wide) { GDN_CHUNK32_SCAN(true, true, true); }
+    else if (prefetch) { GDN_CHUNK32_SCAN(true, true, false); }
+    else if (row_ilp) { GDN_CHUNK32_SCAN(true, false, false); }
+    else { GDN_CHUNK32_SCAN(false, false, false); }
+#undef GDN_CHUNK32_SCAN
+    if (phase_events) { CUDA_CHECK(cudaEventRecordWithFlags(phase_events[2], stream, cudaEventRecordExternal)); }
+    // The prefix just materialized slot0. Do not reinterpret it through the old
+    // NOFINAL record, even if two rounded state words happen to equal its mark.
+    ggml_cuda_kernel_launch(gated_delta_net_l8_cuda<RAW, G_PRECOMPUTED, HEAD_MAJOR, true>, scan,
+        q+prefix*sq2, k+prefix*sq2, v+prefix*sv2, g+prefix*sb2, beta+prefix*sb2,
+        raw_dt_bias, raw_a, state, dst+(int64_t) prefix*H*128, state,
+        (int64_t) H, (int64_t) K, (int64_t) 1, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+        neqk1_magic, rq3_magic, scale, slot_stride, K, (const int32_t *) nullptr, (int64_t) 0,
+        lazy, (const float *) nullptr, 0.0f, 0.0f);
+    if (phase_events) { CUDA_CHECK(cudaEventRecordWithFlags(phase_events[3], stream, cudaEventRecordExternal)); }
+}
+#endif

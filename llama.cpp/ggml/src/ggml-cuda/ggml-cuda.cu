@@ -706,6 +706,8 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+static void ggml_cuda_upload_state_free(const ggml_backend_cuda_context * cuda_ctx);
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -721,6 +723,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
     // pool blocks held across a graph go back to the pool before the pools are destroyed below
     fwht_q8_context.reset();
+
+    ggml_cuda_upload_state_free(this);
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -2871,6 +2875,73 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// Graph-input uploads on an auxiliary stream (ggml_backend_i::set_tensor_input_async). A graph's host inputs
+// (positions, masks, ...) come from pinned staging memory; queued on the backend's own stream they would run
+// after whatever was queued before them (the encoder before a drafter graph, the wait for the drafter's token
+// ids before a verify graph) and sit in the gap in front of the graph. On their own stream they run as soon as
+// the host issues them, and the join makes the backend's stream wait for them just before the graph: an event
+// that has long completed by then. The previous graph that read these inputs has completed on the host's
+// view already (the scheduler waits for the staging event first), so no wait on the way in.
+struct ggml_cuda_upload_state {
+    cudaStream_t stream  = nullptr;
+    cudaEvent_t  event   = nullptr;
+    bool         pending = false;
+};
+
+static std::mutex                                                              ggml_cuda_upload_mutex;
+static std::unordered_map<const ggml_backend_cuda_context *, ggml_cuda_upload_state> ggml_cuda_upload_states;
+
+static ggml_cuda_upload_state & ggml_cuda_upload_state_get(ggml_backend_cuda_context * cuda_ctx) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_upload_mutex);
+    ggml_cuda_upload_state & st = ggml_cuda_upload_states[cuda_ctx];
+    if (st.stream == nullptr) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&st.event, cudaEventDisableTiming));
+    }
+    return st;
+}
+
+static void ggml_cuda_upload_state_free(const ggml_backend_cuda_context * cuda_ctx) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_upload_mutex);
+    auto it = ggml_cuda_upload_states.find(cuda_ctx);
+    if (it == ggml_cuda_upload_states.end()) {
+        return;
+    }
+    if (it->second.event != nullptr) {
+        cudaEventDestroy(it->second.event);
+    }
+    if (it->second.stream != nullptr) {
+        cudaStreamDestroy(it->second.stream);
+    }
+    ggml_cuda_upload_states.erase(it);
+}
+
+static void ggml_backend_cuda_set_tensor_input_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    ggml_cuda_upload_state & st = ggml_cuda_upload_state_get(cuda_ctx);
+    ggml_cuda_wait_buffer_clears(cuda_ctx->device, st.stream);
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, st.stream));
+    ggml_cuda_gdn_dedup_written((char *) tensor->data + offset, size, st.stream);
+    ggml_cuda_dirty_mark((char *) tensor->data + offset, size, st.stream);
+    st.pending = true;
+}
+
+static void ggml_backend_cuda_input_upload_join(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_upload_state & st = ggml_cuda_upload_state_get(cuda_ctx);
+    if (!st.pending) {
+        return;
+    }
+    st.pending = false;
+    CUDA_CHECK(cudaEventRecord(st.event, st.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), st.event, 0));
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -2981,6 +3052,100 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         ggml_cuda_gdn_dedup_written(dst->data, ggml_nbytes(dst), cuda_ctx_src->stream());
     }
+    return true;
+}
+
+// Gather rows of several tensors into one interleaved matrix, in one launch on the backend's stream:
+// dst row i = [src[0] row row0[0]+i | src[1] row row0[1]+i | ...], all F32 with the same row length.
+// This is the DFlash encoder's input (the target layers' inputs side by side per token), which used to be one
+// device-to-device copy per source into a slab input followed by a permuting copy inside the encoder graph.
+// Only moves values: the caller orders it after the producers of the sources (an event wait).
+#define GGML_CUDA_GATHER_MAX_SRC 16
+
+struct ggml_cuda_gather_srcs {
+    const float * p[GGML_CUDA_GATHER_MAX_SRC];
+};
+
+// The pointer table is a __grid_constant__ parameter: indexed by the block, it is read from the parameter bank
+// (by value it is copied to a stack frame per thread, which made the kernel 2.5x slower). Four float4 per
+// thread are loaded before any is stored.
+template <bool VEC>
+static __global__ void ggml_cuda_gather_rows_kernel(const __grid_constant__ ggml_cuda_gather_srcs srcs, float * __restrict__ dst,
+                                                    const int n_src, const int64_t n_embd) {
+    const int64_t row  = blockIdx.x;
+    const int     slab = blockIdx.y;
+    const float * s    = srcs.p[slab] + row*n_embd;
+    float       * d    = dst + (row*n_src + slab)*n_embd;
+    if (VEC) {
+        const int64_t n4 = n_embd/4;
+        constexpr int U = 4;
+        for (int64_t j0 = 0; j0 < n4; j0 += (int64_t) U*blockDim.x) {
+            float4 v[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int64_t j = j0 + (int64_t) u*blockDim.x + threadIdx.x;
+                if (j < n4) {
+                    v[u] = __ldcs(((const float4 *) s) + j);
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int64_t j = j0 + (int64_t) u*blockDim.x + threadIdx.x;
+                if (j < n4) {
+                    ((float4 *) d)[j] = v[u];
+                }
+            }
+        }
+    } else {
+        for (int64_t j = threadIdx.x; j < n_embd; j += blockDim.x) {
+            d[j] = s[j];
+        }
+    }
+}
+
+static bool ggml_backend_cuda_gather_rows_async(ggml_backend_t backend, ggml_tensor * dst, const ggml_tensor * const * src,
+                                                const int64_t * row0, int n_src, int64_t n_rows) {
+    if (!ggml_backend_is_cuda(backend) || n_src <= 0 || n_src > GGML_CUDA_GATHER_MAX_SRC || n_rows <= 0) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || !ggml_backend_buffer_is_cuda(buf_dst) ||
+            dst->ne[1] < n_rows || dst->ne[0] != n_src*src[0]->ne[0]) {
+        return false;
+    }
+    if (((ggml_backend_cuda_buffer_context *) buf_dst->context)->device != cuda_ctx->device) {
+        return false;
+    }
+    const int64_t n_embd = src[0]->ne[0];
+    ggml_cuda_gather_srcs srcs = {};
+    bool aligned = ((uintptr_t) dst->data % 16 == 0) && n_embd % 4 == 0;
+    for (int k = 0; k < n_src; ++k) {
+        ggml_backend_buffer_t buf = src[k]->view_src ? src[k]->view_src->buffer : src[k]->buffer;
+        if (src[k]->type != GGML_TYPE_F32 || src[k]->ne[0] != n_embd || src[k]->nb[0] != sizeof(float) ||
+                src[k]->nb[1] != n_embd*sizeof(float) || !ggml_backend_buffer_is_cuda(buf) ||
+                row0[k] < 0 || row0[k] + n_rows > ggml_nrows(src[k]) ||
+                ((ggml_backend_cuda_buffer_context *) buf->context)->device != cuda_ctx->device) {
+            return false;
+        }
+        srcs.p[k] = (const float *) src[k]->data + row0[k]*n_embd;
+        aligned = aligned && ((uintptr_t) srcs.p[k] % 16 == 0);
+    }
+
+    cudaStream_t stream = cuda_ctx->stream();
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_wait_buffer_clears(cuda_ctx->device, stream);
+    ggml_cuda_gdn_dedup_written(dst->data, n_rows*dst->nb[1], stream);
+    ggml_cuda_dirty_mark(dst->data, n_rows*dst->nb[1], stream);
+
+    const dim3 grid((unsigned) n_rows, (unsigned) n_src, 1);
+    if (aligned) {
+        ggml_cuda_gather_rows_kernel<true><<<grid, 256, 0, stream>>>(srcs, (float *) dst->data, n_src, n_embd);
+    } else {
+        ggml_cuda_gather_rows_kernel<false><<<grid, 256, 0, stream>>>(srcs, (float *) dst->data, n_src, n_embd);
+    }
+    CUDA_CHECK(cudaGetLastError());
     return true;
 }
 
@@ -8778,6 +8943,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_register_prefill_glu_pair") == 0) {
         return (void *)ggml_backend_cuda_register_prefill_glu_pair;
+    }
+    if (strcmp(name, "ggml_backend_cuda_set_tensor_input_async") == 0) {
+        return (void *)ggml_backend_cuda_set_tensor_input_async;
+    }
+    if (strcmp(name, "ggml_backend_cuda_input_upload_join") == 0) {
+        return (void *)ggml_backend_cuda_input_upload_join;
+    }
+    if (strcmp(name, "ggml_backend_cuda_gather_rows_async") == 0) {
+        return (void *)ggml_backend_cuda_gather_rows_async;
     }
     if (strcmp(name, "ggml_backend_cuda_clear_ranges") == 0) {
         return (void *)ggml_backend_cuda_clear_ranges;

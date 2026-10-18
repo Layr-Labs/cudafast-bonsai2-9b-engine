@@ -19,7 +19,7 @@ static void launch_gated_delta_net(
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K,
         const int32_t * s_ids, int64_t s_row_stride, int lazy, const float * const zero[3], bool qk_packed, uint32_t * dedup_counter, cudaStream_t stream) {
-    //TODO: Add chunked kernel for even faster pre-fill
+    // Fallback dispatcher; eligible long prefills select N1 in the common launcher.
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int num_warps = 4;
@@ -110,7 +110,7 @@ static void launch_gated_delta_net(
     }
 }
 
-// Matches the long l8 dispatch exactly. No transformed producer may feed a different kernel.
+// Matches the long-recurrence layout gate. Both l8 and N1 consume the producer's permuted key coordinates and explicit outer strides.
 bool ggml_cuda_gdn_l8_layout_eligible(const ggml_tensor * dst) {
     const auto * v = dst->src[2];
     const auto & dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
@@ -341,6 +341,48 @@ static void ggml_cuda_op_gated_delta_net_impl(
             ggml_cuda_op_scale(ctx, const_cast<ggml_tensor *>(zero_node));
         }
     }
+
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // N1: both natural and the frontier's permuted Q/K use their existing strides.
+    static const bool chunk_l8 = !getenv("GGML_CUDA_GDN_L8") || atoi(getenv("GGML_CUDA_GDN_L8"));
+    if (gdn_chunk32_enabled() && chunk_l8 && !kda && keep_rs && S_v == 128 && n_seqs == 1 &&
+            n_tokens >= 64 && K < n_tokens &&
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+            ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32 &&
+            gdn_cols_per_warp(ggml_cuda_highest_compiled_arch(GGML_CUDA_CC_DGX_SPARK), 128, false) == 4) {
+        // Every N1 state writer is a compatible GD1 writer. Mark the cache's
+        // counter for the frontier's import/rehydrate pass before touching slot0;
+        // existing GD2 records remain readable, and neither shared parity is written.
+        const size_t attention_bytes = size_t(S_v*H*n_tokens)*sizeof(float);
+        const size_t slot_bytes = size_t(S_v*S_v*H)*sizeof(float);
+        ggml_cuda_gdn_dedup_written(dst_d, attention_bytes, stream);
+        ggml_cuda_gdn_dedup_written(state_d, slot_bytes, stream);
+        if (ggml_cuda_dirty_tracking()) {
+            ggml_cuda_dirty_mark(dst_d, attention_bytes, stream);
+            ggml_cuda_dirty_mark(state_d, slot_bytes, stream);
+        }
+        // The common frontier footprint above also covers every tail GD1 record,
+        // base, final state and eager snapshot. N1 never writes GD2 parity slots.
+        ggml_cuda_pool_alloc<gdn_chunk32> work(ctx.pool(), size_t(H)*((n_tokens-K+31)/32));
+#define GDN_CHUNK_LAUNCH(RAW_, PRE_, PACK_) \
+        gdn_chunk32_launch<RAW_, PRE_, PACK_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, work.ptr, \
+            int(H), int(n_tokens), sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, \
+            init_fastdiv_values(neqk1), init_fastdiv_values(rq3), scale, state_slot_stride, K, s_ids, \
+            s_row_stride, lazy, zero[0], zero[0] ? *zero[1] : 0.0f, zero[0] ? *zero[2] : 0.0f, stream)
+        if (qk_packed) {
+            if (raw_precomputed || g_precomputed) { GDN_CHUNK_LAUNCH(false, true, true); }
+            else if (raw) { GDN_CHUNK_LAUNCH(true, false, true); }
+            else { GDN_CHUNK_LAUNCH(false, false, true); }
+        } else {
+            if (raw_precomputed || g_precomputed) { GDN_CHUNK_LAUNCH(false, true, false); }
+            else if (raw) { GDN_CHUNK_LAUNCH(true, false, false); }
+            else { GDN_CHUNK_LAUNCH(false, false, false); }
+        }
+#undef GDN_CHUNK_LAUNCH
+        return;
+    }
+#endif
 
 #define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_)                                                       \
     launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, \
