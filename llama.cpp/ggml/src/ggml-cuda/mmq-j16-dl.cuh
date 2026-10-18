@@ -372,18 +372,24 @@ struct ggml_cuda_dl_q8_xstage {
 
 // The 8 qs bytes of (block, c) sit at a 2-byte aligned address: aligned 32-bit words + funnel shift
 // (the values equal the int8 bytes in memory order, as get_int_b2).
+template <bool NATURAL = false>
 static __device__ __forceinline__ void ggml_cuda_dl_q8_load_x(
         ggml_cuda_dl_q8_xstage & st, const char * __restrict__ xb, const int c) {
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-        const char     * qsi = xb + s*(int) sizeof(block_q8_0) + sizeof(ggml_half) + 8*c;
+        const char     * qsi = xb + s*(int) sizeof(block_q8_0) + sizeof(ggml_half) + (NATURAL ? 4 : 8)*c;
         const int        mis = (int) (reinterpret_cast<uintptr_t>(qsi) & 3); // 0 or 2
         const uint32_t * qwi = reinterpret_cast<const uint32_t *>(qsi - mis);
         const uint32_t   w0  = qwi[0];
         const uint32_t   w1  = qwi[1];
-        const uint32_t   w2  = qwi[1 + mis/2]; // w1 again when aligned
         st.q[s][0] = (int) __funnelshift_r(w0, w1, 8*mis);
-        st.q[s][1] = (int) __funnelshift_r(w1, w2, 8*mis);
+        if constexpr (NATURAL) {
+            // Apply the activation matrix loader's c,4+c permutation to B too.
+            st.q[s][1] = (int) __funnelshift_r(qwi[4], qwi[4 + mis/2], 8*mis);
+        } else {
+            const uint32_t w2 = qwi[1 + mis/2];
+            st.q[s][1] = (int) __funnelshift_r(w1, w2, 8*mis);
+        }
     }
     const uint32_t d0 = *(const uint16_t *) (xb + 0*sizeof(block_q8_0));
     const uint32_t d1 = *(const uint16_t *) (xb + 1*sizeof(block_q8_0));
@@ -398,13 +404,33 @@ struct ggml_cuda_dl_q8_ystage {
     float4 yd[2];    // D4 scales of column g + 8h
 };
 
+template <bool MATRIX = false>
 static __device__ __forceinline__ void ggml_cuda_dl_q8_load_y(ggml_cuda_dl_q8_ystage & st, const char * yb, const int c) {
+    if constexpr (MATRIX) {
+        static_assert(sizeof(block_q8_1_mmq) == 144, "Q8 MMQ row layout");
+        static_assert(offsetof(block_q8_1_mmq, qs) == 16, "Q8 MMQ quant offset");
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE && !defined(GGML_USE_HIP)
+        const int lane=threadIdx.x,m=lane/8;
+        const char * y0=yb-(lane/4)*sizeof(block_q8_1_mmq);
+#pragma unroll
+        for(int sub=0;sub<4;++sub) {
+            const char *p=y0+((lane&7)+8*(m&1))*sizeof(block_q8_1_mmq)+offsetof(block_q8_1_mmq,qs)+32*sub+16*(m/2);
+            const uint32_t addr=(uint32_t)__cvta_generic_to_shared(p);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                : "=r"(st.ya[sub][0].x),"=r"(st.ya[sub][1].x),
+                  "=r"(st.ya[sub][0].y),"=r"(st.ya[sub][1].y) : "r"(addr));
+        }
+#else
+        NO_DEVICE_CODE;
+#endif
+    } else {
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             st.ya[s][h] = *(const int2 *) (yb + h*8*sizeof(block_q8_1_mmq) + 4*sizeof(float) + 32*s + 8*c);
         }
+    }
     }
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
@@ -729,8 +755,8 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
     } else {
         ggml_cuda_dl_q8_xstage xs;
         ggml_cuda_dl_q8_ystage ys;
-        ggml_cuda_dl_q8_load_x(xs, sx, c);
-        ggml_cuda_dl_q8_load_y(ys, sy, c);
+        ggml_cuda_dl_q8_load_x<true>(xs, sx, c);
+        ggml_cuda_dl_q8_load_y<true>(ys, sy, c);
         ggml_cuda_dl_q8_compute(sum[0], xs, ys, c);
     }
 }
