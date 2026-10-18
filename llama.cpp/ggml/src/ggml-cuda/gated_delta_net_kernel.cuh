@@ -827,6 +827,8 @@ gated_delta_net_l8v_cuda(const float * q, const float * k, const float * v, cons
 
     // [C45 prefetch hook] an L2 prefetch of the next weights goes here (before the wait), as in gated_delta_net_cuda.
 
+    // Release successor setup early. Its dependency acquire still waits for our writes.
+    ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
     // bit 3 of lazy: state, base and record traffic with the streaming (evict-first) cache operators
     const bool evs = (lazy & 8) != 0;
