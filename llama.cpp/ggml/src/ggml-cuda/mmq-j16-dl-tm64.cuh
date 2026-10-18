@@ -110,7 +110,11 @@ static __global__ void mul_mat_q_q8_j16_dl_ring_tm64(
             if (j < n) {
                 const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
                 const char * sy = smem + s*SB + SPS*XB + j*YB + g*(int) sizeof(block_q8_1_mmq);
-                ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
+                ggml_cuda_dl_q8_xstage xs;
+                ggml_cuda_dl_q8_ystage ys;
+                ggml_cuda_dl_q8_load_native_x(xs, sx, c);
+                ggml_cuda_dl_q8_load_y(ys, sy, c);
+                ggml_cuda_dl_q8_compute(sum[0], xs, ys, c);
                 ++st;
                 const bool last = k*SPS + j == total - 1;
                 if (st == nst || last) { // end of a segment: the stores of the DL kernels

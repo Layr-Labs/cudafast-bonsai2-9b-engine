@@ -371,6 +371,29 @@ struct ggml_cuda_dl_q8_xstage {
     int d[2];    // half bits of row g: blocks 0,1 in d[0], blocks 2,3 in d[1]
 };
 
+// Private TM64-Q8 row-step format, generated once from four standard Q8_0
+// blocks. Quant words are in the exact lane/MMA order of the generic loader;
+// only the byte positions change. Generic TM128/WM copies keep block_q8_0.
+struct alignas(8) ggml_cuda_dl_q8_native_group {
+    int2 q[4][4];
+    uint32_t d[2];
+};
+static_assert(sizeof(ggml_cuda_dl_q8_native_group) == 4*sizeof(block_q8_0), "same byte footprint");
+static_assert(offsetof(ggml_cuda_dl_q8_native_group, d) == 128, "packed scales after quants");
+
+static __device__ __forceinline__ void ggml_cuda_dl_q8_load_native_x(
+        ggml_cuda_dl_q8_xstage & st, const char * __restrict__ xb, const int c) {
+    const auto * group = reinterpret_cast<const ggml_cuda_dl_q8_native_group *>(xb);
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        const int2 q = group->q[s][c];
+        st.q[s][0] = q.x;
+        st.q[s][1] = q.y;
+    }
+    st.d[0] = group->d[0];
+    st.d[1] = group->d[1];
+}
+
 // The 8 qs bytes of (block, c) sit at a 2-byte aligned address: aligned 32-bit words + funnel shift
 // (the values equal the int8 bytes in memory order, as get_int_b2).
 static __device__ __forceinline__ void ggml_cuda_dl_q8_load_x(
@@ -563,10 +586,23 @@ static __global__ void ggml_cuda_dl_repack_kernel(const char * __restrict__ src,
     }
     const int64_t sidx = ggml_cuda_dl_src_index<LAYOUT, G>(d, nkb);
     const uint16_t * ps = (const uint16_t *) (src + sidx*BB);
-    uint16_t       * pd = (uint16_t       *) (dst + d*BB);
+    if constexpr (LAYOUT == GGML_CUDA_DL_TM64 && G == 4 && BB == sizeof(block_q8_0)) {
+        // d indexes the conventional TM64 block sequence. Within each group,
+        // move all128quant bytes ahead of the four unchanged half-scale bits.
+        char * group = dst + (d/4)*sizeof(ggml_cuda_dl_q8_native_group);
+        uint16_t * codes = reinterpret_cast<uint16_t *>(group + (d%4)*32);
+        uint16_t * scale = reinterpret_cast<uint16_t *>(group + offsetof(ggml_cuda_dl_q8_native_group, d));
+        scale[d%4] = ps[0];
 #pragma unroll
-    for (int k = 0; k < BB/2; ++k) {
-        pd[k] = ps[k];
+        for (int k = 0; k < 16; ++k) {
+            codes[k] = ps[k + 1];
+        }
+    } else {
+        uint16_t * pd = reinterpret_cast<uint16_t *>(dst + d*BB);
+#pragma unroll
+        for (int k = 0; k < BB/2; ++k) {
+            pd[k] = ps[k];
+        }
     }
 }
 
