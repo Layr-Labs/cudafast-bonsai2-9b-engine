@@ -1438,7 +1438,7 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
-template <ggml_type type, int J, bool fallback, int GRID = 0>
+template <ggml_type type, int J, bool fallback, int GRID = 0, bool DL_COLS = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * ids_dst, const int32_t * expert_bounds, float * dst,
@@ -1451,6 +1451,11 @@ static __global__ void mul_mat_q_stream_k_fixup(
     ggml_cuda_pdl_sync();
     ggml_cuda_pdl_lc();
 #endif
+    // The DL launcher guarantees one column tile and no indexed destination.
+    // A warp owns columns threadIdx.y + j0; no owned column can be valid here.
+    if constexpr (DL_COLS) {
+        if ((int) threadIdx.y >= ncols_dst) { return; }
+    }
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
