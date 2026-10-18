@@ -1499,6 +1499,11 @@ static __global__ void mul_mat_q_stream_k_fixup(
     // tile boundary terminates the same descending reduction as div/mod.
     const int tile_begin = PARTITION_TABLE ? kbc0 - fastmodulo(kbc0, blocks_per_ne00) : 0;
     int bidx = bidx0 - 1;
+    // Q8 DL48: one exact per-thread partial address, stepped in the same
+    // descending predecessor order. Other fixup instantiations are unchanged.
+    constexpr bool STRIDE_PARTIAL = type == GGML_TYPE_Q8_0 && GRID == 48 && !PARTITION_TABLE;
+    const float * partial = tmp_last_tile;
+    if constexpr (STRIDE_PARTIAL) partial += int64_t(bidx)*(J*I) + threadIdx.y*I + i;
     int kbc_stop = kbc0;
     while(true) {
         int kbc;
@@ -1513,6 +1518,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
 
         if (kbc == kbc_stop) { // Did not have any data.
             bidx--;
+            if constexpr (STRIDE_PARTIAL) partial -= J*I;
             kbc_stop = kbc;
             continue;
         }
@@ -1524,7 +1530,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
         for (int j0 = 0; j0 < J; j0 += nwarps) {
             const int j = j0 + threadIdx.y;
 
-            sum[j0/nwarps] += tmp_last_tile[bidx*(J*I) + j*I + i];
+            if constexpr (STRIDE_PARTIAL) sum[j0/nwarps] += partial[j0*I];
+            else sum[j0/nwarps] += tmp_last_tile[bidx*(J*I) + j*I + i];
         }
 
         // If this block started in a previous tile we are done and don't need to combine additional partial results.
@@ -1533,6 +1540,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
             break;
         }
         bidx--;
+        if constexpr (STRIDE_PARTIAL) partial -= J*I;
         kbc_stop = kbc;
     }
 
