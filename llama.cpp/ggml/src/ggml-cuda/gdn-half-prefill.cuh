@@ -3,6 +3,7 @@
 // remain F32; TF32 Gram and explicitly rounded F16 MMA views change internal
 // arithmetic. Derived from tested f1b386e packed/early-V research implementation.
 // The original scalar final16 kernel remains the sole cache-record writer.
+#include <type_traits>
 namespace gdn_half_c16 {
 constexpr int C=16,D=128,H=32,HK=16,VC=16,QK_STRIDE=132;
 struct Frame { const float *q,*k,*v,*g,*b,*bias,*a; int nt; bool head_major; int64_t sq1; int64_t sq2; int64_t sv1; int64_t sv2; };
@@ -27,6 +28,10 @@ __device__ __forceinline__ void stage_qk_async(Frame f,int first,int h,int tid,f
     }
 }
 struct Coeff { float a[C*C], m[C*C], p[C], last[C]; };
+// These coefficients are rounded to half by every carry CTA in the baseline.
+// Round once at their producer, preserving the exact same conversion and bits.
+struct HalfCoeff { __half a[C*C], m[C*C]; float p[C], last[C]; };
+static_assert(sizeof(HalfCoeff)==1152);
 __device__ __forceinline__ unsigned tf(float x) {
     unsigned y; asm("cvt.rn.tf32.f32 %0, %1;" : "=r"(y) : "f"(x)); return y;
 }
@@ -79,7 +84,7 @@ __device__ __forceinline__ void gates(Frame f,int t,int h,float &g,float &b) {
 } // namespace gdn_half_c16
 namespace gdn_half_prefill {
 using gdn_half_c16::C;using gdn_half_c16::D;using gdn_half_c16::H;using gdn_half_c16::HK;
-using gdn_half_c16::VC;using gdn_half_c16::Frame;using gdn_half_c16::Coeff;
+using gdn_half_c16::VC;using gdn_half_c16::Frame;using gdn_half_c16::Coeff;using gdn_half_c16::HalfCoeff;
 constexpr int QK=136,SMALL=24;
 
 template<bool TRANS> __device__ __forceinline__ void load_a(unsigned *r,const __half *p,int ld,int m,int k) {
@@ -113,7 +118,7 @@ template<bool AT,bool BT,int K> __device__ __forceinline__ void dot(float *c,con
     }
 }
 
-template<bool RAW,bool OPT_INVERSE=false> __global__ __launch_bounds__(128) void prepare_packed(Frame f,Coeff*out,__half*packed) {
+template<bool RAW,bool OPT_INVERSE=false,class CoeffType=Coeff> __global__ __launch_bounds__(128) void prepare_packed(Frame f,CoeffType*out,__half*packed) {
     ggml_cuda_pdl_sync();
     const int h=blockIdx.x,ch=blockIdx.y,warp=threadIdx.y,tid=warp*32+threadIdx.x,first=ch*C;
     __shared__ float q[C*gdn_half_c16::QK_STRIDE],k[C*gdn_half_c16::QK_STRIDE],kk[C*C],qk[C*C],ai[C*C],gg[C],bb[C];
@@ -164,16 +169,18 @@ template<bool RAW,bool OPT_INVERSE=false> __global__ __launch_bounds__(128) void
 #pragma unroll
         for(int r=0;r<C;++r)ai[r*C+j]=inv[r];
     }
-    __syncthreads();Coeff*c=out+ch*H+h;
+    __syncthreads();CoeffType*c=out+ch*H+h;
     for(int e=tid;e<C*C;e+=128){const int i=e/C,j=e%C;float decay=1;
         if(j<=i)for(int r=j+1;r<=i;++r)decay*=gg[r];else decay=0;
-        c->a[e]=(ai[e]*decay)*bb[j];c->m[e]=qk[e]*decay;
+        if constexpr(std::is_same<CoeffType,HalfCoeff>::value) {
+            c->a[e]=__float2half_rn((ai[e]*decay)*bb[j]);c->m[e]=__float2half_rn(qk[e]*decay);
+        } else { c->a[e]=(ai[e]*decay)*bb[j];c->m[e]=qk[e]*decay; }
     }
     if(tid<C){float p=1,last=1;for(int i=0;i<=tid;++i)p*=gg[i];for(int i=tid+1;i<C;++i)last*=gg[i];c->p[tid]=p;c->last[tid]=last;}
 }
 
-template<bool EARLY_V=false,bool WARP_R=false>
-__global__ __launch_bounds__(128) void carry_packed(Frame f,const Coeff*coef,const __half*packed,
+template<bool EARLY_V=false,bool WARP_R=false,class CoeffType=Coeff>
+__global__ __launch_bounds__(128) void carry_packed(Frame f,const CoeffType*coef,const __half*packed,
         const float*initial,float*output,float*final_state,float*boundary,float scale) {
     ggml_cuda_pdl_sync();
     const int h=blockIdx.x,v0=blockIdx.y*VC,w=threadIdx.y,tid=w*32+threadIdx.x;
@@ -185,7 +192,7 @@ __global__ __launch_bounds__(128) void carry_packed(Frame f,const Coeff*coef,con
 #pragma unroll
         for(int j=0;j<4;++j)s[t][j]=initial[(h*D+v0+n+gdn_half_c16::cc(j))*D+mr+gdn_half_c16::cr(j)];
     }
-    for(int ch=0;ch<(f.nt+C-1)/C;++ch){const int first=ch*C;const Coeff*c=coef+ch*H+h;
+    for(int ch=0;ch<(f.nt+C-1)/C;++ch){const int first=ch*C;const CoeffType*c=coef+ch*H+h;
         const __half*pq=packed+(ch*HK+h%HK)*2*C*D,*pk=pq+C*D;
 #pragma unroll
         for(int i=tid*8;i<C*D;i+=128*8){const int dst=(i/D)*QK+i%D;
@@ -208,7 +215,11 @@ __global__ __launch_bounds__(128) void carry_packed(Frame f,const Coeff*coef,con
                     asm volatile("ld.global.v2.f32 {%0,%1}, [%2];":"=f"(early_v[j]),"=f"(early_v[j+1]):"l"(vp):"memory");}
             }
         }
-        for(int i=tid;i<C*C;i+=128){a[(i/C)*SMALL+i%C]=__float2half_rn(c->a[i]);m[(i/C)*SMALL+i%C]=__float2half_rn(c->m[i]);}
+        for(int i=tid;i<C*C;i+=128){
+            if constexpr(std::is_same<CoeffType,HalfCoeff>::value) {
+                a[(i/C)*SMALL+i%C]=c->a[i];m[(i/C)*SMALL+i%C]=c->m[i];
+            } else {a[(i/C)*SMALL+i%C]=__float2half_rn(c->a[i]);m[(i/C)*SMALL+i%C]=__float2half_rn(c->m[i]);}
+        }
         if(tid<C){p[tid]=c->p[tid];last[tid]=c->last[tid];}
 #pragma unroll
         for(int t=0;t<4;++t){const int tile=w+t*4,mr=(tile/2)*16,n=(tile%2)*8;
@@ -295,16 +306,16 @@ static void gdn_half_prefill_launch(
     static_assert(!RAW && PRE,"first production experiment requires precomputed gates");
     const int prefix=T-16;
     ggml_cuda_pool_alloc<float> initial(ctx.pool(),size_t(32)*128*128);
-    ggml_cuda_pool_alloc<gdn_half_c16::Coeff> coefficients(ctx.pool(),size_t(32)*(prefix/16));
+    ggml_cuda_pool_alloc<gdn_half_c16::HalfCoeff> coefficients(ctx.pool(),size_t(32)*(prefix/16));
     ggml_cuda_pool_alloc<__half> packed(ctx.pool(),size_t(prefix)*16*128*2);
     const ggml_cuda_kernel_launch_params mat(dim3(32,1,8),dim3(32,4),0,stream);
     ggml_cuda_kernel_launch(gdn_half_initial_state,mat,current,state,initial.ptr,slot_stride,
         ids,row_stride,lazy,zero_row,zero_scale,zero_bias);
     const gdn_half_c16::Frame frame{q,k,v,g,beta,bias,a,prefix,PACKED,sq1,sq2,sv1,sv2};
     const ggml_cuda_kernel_launch_params prep(dim3(32,prefix/16),dim3(32,4),0,stream);
-    ggml_cuda_kernel_launch(gdn_half_prefill::prepare_packed<false>,prep,frame,coefficients.ptr,packed.ptr);
+    ggml_cuda_kernel_launch(gdn_half_prefill::prepare_packed<false,false,gdn_half_c16::HalfCoeff>,prep,frame,coefficients.ptr,packed.ptr);
     const ggml_cuda_kernel_launch_params carry(dim3(32,8),dim3(32,4),0,stream);
-    ggml_cuda_kernel_launch(gdn_half_prefill::carry_packed<true,false>,carry,frame,coefficients.ptr,packed.ptr,
+    ggml_cuda_kernel_launch(gdn_half_prefill::carry_packed<true,false,gdn_half_c16::HalfCoeff>,carry,frame,coefficients.ptr,packed.ptr,
         initial.ptr,output,state,(float *)nullptr,scale);
     // Same scalar tail as N1. It creates every snapshot/header/checksum from
     // the new rounded boundary; later rollback readers retain their protocol.
