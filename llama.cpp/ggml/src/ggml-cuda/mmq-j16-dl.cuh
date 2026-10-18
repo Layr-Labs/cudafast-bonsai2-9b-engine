@@ -911,6 +911,7 @@ static __global__ void mul_mat_q_j16_dl_ring(
 
 // ---------------------------------------------------------------------------------------------
 #include "mmq-j16-dl-tm64.cuh"
+#include "mmq-j16-fixup-pair.cuh"
 
 // Host side (included by mmq.cuh after mmq_args and mmq-pq2-j16.cuh). GB10 only.
 //
@@ -1109,6 +1110,15 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
         }
     }
     if (!tiling) {
+        if constexpr (type == GGML_TYPE_Q8_0) {
+            const int BPI=ggml_cuda_mmq_get_K_vram(type,16,false,GGML_CUDA_CC_DGX_SPARK)/QK8_0;
+            if (grid==48 && args.nrows_x==4096 && nkb>=16*BPI && nkb%BPI==0) {
+                ggml_cuda_kernel_launch(mul_mat_q_q8_dl_fixup_pair,
+                    ggml_cuda_kernel_launch_params(dim3(32,4),dim3(32,4),0,stream),
+                    args.dst,(const float *)tmp_fixup,(int)args.nrows_dst,(int)args.ncols_dst);
+                return;
+            }
+        }
         const uint3 blocks_per_ne00_fd = init_fastdiv_values(nkb);
         const uint3 one_fd             = init_fastdiv_values(1);
         // Compile the48-SM partition divisor into the DL-only fixup; generic MMQ launches stay unchanged.
