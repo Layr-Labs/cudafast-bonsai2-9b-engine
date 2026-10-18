@@ -372,6 +372,7 @@ struct ggml_cuda_dl_q8_xstage {
 
 // The 8 qs bytes of (block, c) sit at a 2-byte aligned address: aligned 32-bit words + funnel shift
 // (the values equal the int8 bytes in memory order, as get_int_b2).
+template <bool RING_REUSE_D = false>
 static __device__ __forceinline__ void ggml_cuda_dl_q8_load_x(
         ggml_cuda_dl_q8_xstage & st, const char * __restrict__ xb, const int c) {
 #pragma unroll
@@ -384,13 +385,24 @@ static __device__ __forceinline__ void ggml_cuda_dl_q8_load_x(
         const uint32_t   w2  = qwi[1 + mis/2]; // w1 again when aligned
         st.q[s][0] = (int) __funnelshift_r(w0, w1, 8*mis);
         st.q[s][1] = (int) __funnelshift_r(w1, w2, 8*mis);
+        if constexpr (RING_REUSE_D) {
+            static_assert(sizeof(block_q8_0) == 34, "frozen Q8 ring packing");
+            if ((s & 1) == 0) {
+                // Ring rows are 4-byte aligned. Even-block lane 0 owns d[s]
+                // in w0; lane 3's boundary word already contains d[s+1].
+                const uint32_t dhi = __shfl_sync(0xffffffffu, w2 >> 16, 3, 4);
+                st.d[s/2] = c == 0 ? (int) ((w0 & 0xffffu) | (dhi << 16)) : 0;
+            }
+        }
     }
-    const uint32_t d0 = *(const uint16_t *) (xb + 0*sizeof(block_q8_0));
-    const uint32_t d1 = *(const uint16_t *) (xb + 1*sizeof(block_q8_0));
-    const uint32_t d2 = *(const uint16_t *) (xb + 2*sizeof(block_q8_0));
-    const uint32_t d3 = *(const uint16_t *) (xb + 3*sizeof(block_q8_0));
-    st.d[0] = (int) (d0 | (d1 << 16));
-    st.d[1] = (int) (d2 | (d3 << 16));
+    if constexpr (!RING_REUSE_D) {
+        const uint32_t d0 = *(const uint16_t *) (xb + 0*sizeof(block_q8_0));
+        const uint32_t d1 = *(const uint16_t *) (xb + 1*sizeof(block_q8_0));
+        const uint32_t d2 = *(const uint16_t *) (xb + 2*sizeof(block_q8_0));
+        const uint32_t d3 = *(const uint16_t *) (xb + 3*sizeof(block_q8_0));
+        st.d[0] = (int) (d0 | (d1 << 16));
+        st.d[1] = (int) (d2 | (d3 << 16));
+    }
 }
 
 struct ggml_cuda_dl_q8_ystage {
@@ -729,7 +741,7 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
     } else {
         ggml_cuda_dl_q8_xstage xs;
         ggml_cuda_dl_q8_ystage ys;
-        ggml_cuda_dl_q8_load_x(xs, sx, c);
+        ggml_cuda_dl_q8_load_x<true>(xs, sx, c);
         ggml_cuda_dl_q8_load_y(ys, sy, c);
         ggml_cuda_dl_q8_compute(sum[0], xs, ys, c);
     }
