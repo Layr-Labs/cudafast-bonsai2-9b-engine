@@ -789,12 +789,13 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
 // Same arguments as mul_mat_q_*_j16_dl (TM copy; mode 0 stream-k or mode 1 contiguous whole tiles), dynamic
 // shared memory ggml_cuda_dl_ring_smem<FMT, SPS>(S). Stage layout: weights of the SPS steps, then SPS x 16
 // activation blocks.
-template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false>
+template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false, int NKB = 0>
 __launch_bounds__(16*32, MIN_CTAS)
 static __global__ void mul_mat_q_j16_dl_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
-        const int nrows_x, const int nkb, const int ncols_y, const int stride_col_dst, const int ncols_dst,
+        const int nrows_x, const int nkb_arg, const int ncols_y, const int stride_col_dst, const int ncols_dst,
         const int mode, float * dst_hi, const int nrows_lo) {
+    const int nkb = NKB ? NKB : nkb_arg;
     static_assert(!JIT || FMT == GGML_CUDA_DL_FMT_PTQ1S, "JIT operands require signed PTQ1");
     using F = ggml_cuda_dl_fmt<FMT>;
     constexpr int GB = F::GB;
@@ -978,10 +979,15 @@ static void ggml_cuda_mmq_dl_launch(Kernel kernel, bool * attr_set, const mmq_ar
         (int) (args.dst_hi ? args.nrows_lo : args.nrows_x));
 }
 
-template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false>
+template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false, int NKB = 0>
 static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
                                          const int nkb, float * tmp_fixup, cudaStream_t stream) {
-    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS, JIT, MIN_CTAS, PURE>;
+    if constexpr (NKB == 0 && FMT == GGML_CUDA_DL_FMT_PTQ1S && S == 3 && SPS == 2 && !JIT) {
+        if (nkb == 16) return ggml_cuda_mmq_dl_launch_ring<FMT,S,SPS,JIT,MIN_CTAS,PURE,16>(args,e,grid,mode,nkb,tmp_fixup,stream);
+        if (nkb == 32) return ggml_cuda_mmq_dl_launch_ring<FMT,S,SPS,JIT,MIN_CTAS,PURE,32>(args,e,grid,mode,nkb,tmp_fixup,stream);
+        if (nkb == 96) return ggml_cuda_mmq_dl_launch_ring<FMT,S,SPS,JIT,MIN_CTAS,PURE,96>(args,e,grid,mode,nkb,tmp_fixup,stream);
+    }
+    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS, JIT, MIN_CTAS, PURE, NKB>;
     constexpr size_t smem = ggml_cuda_dl_ring_smem<FMT, SPS>(S);
     static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
     const int device = ggml_cuda_get_device();
