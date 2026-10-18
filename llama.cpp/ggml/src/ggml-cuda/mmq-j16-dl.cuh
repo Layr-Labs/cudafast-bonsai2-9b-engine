@@ -738,7 +738,7 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
 // Same arguments as mul_mat_q_*_j16_dl (TM copy; mode 0 stream-k or mode 1 contiguous whole tiles), dynamic
 // shared memory ggml_cuda_dl_ring_smem<FMT, SPS>(S). Stage layout: weights of the SPS steps, then SPS x 16
 // activation blocks.
-template <int FMT, int S, int SPS>
+template <int FMT, int S, int SPS, bool POW2_NST = false>
 __launch_bounds__(16*32, 1)
 static __global__ void mul_mat_q_j16_dl_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
@@ -792,7 +792,7 @@ static __global__ void mul_mat_q_j16_dl_ring(
         for (int k = 0; k < S && k < nstages; ++k) {
             const int n = min(SPS, total - k*SPS);
             for (int j = 0; j < n; ++j) {
-                const int stj = (gs0 + k*SPS + j) % nst;
+                const int stj = POW2_NST ? ((gs0 + k*SPS + j) & (nst - 1)) : (gs0 + k*SPS + j) % nst;
                 ggml_cuda_dl_bulk_g2s(smem + k*SB + SPS*XB + j*YB, (const char *) y + (int64_t) stj*yb_bytes, yb_bytes, &full[k]);
             }
         }
@@ -847,7 +847,7 @@ static __global__ void mul_mat_q_j16_dl_ring(
             ggml_cuda_dl_mbar_expect_tx(&full[s], (uint32_t) nn*(XB + yb_bytes));
             ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + (int64_t) gsk*XB, (uint32_t) nn*XB, &full[s], wpol);
             for (int j = 0; j < nn; ++j) {
-                ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB, (const char *) y + (int64_t) ((gsk + j) % nst)*yb_bytes, yb_bytes, &full[s]);
+                ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB, (const char *) y + (int64_t) (POW2_NST ? ((gsk + j) & (nst - 1)) : (gsk + j) % nst)*yb_bytes, yb_bytes, &full[s]);
             }
         }
     }
@@ -904,10 +904,10 @@ static void ggml_cuda_mmq_dl_launch(Kernel kernel, bool * attr_set, const mmq_ar
         (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
 }
 
-template <int FMT, int S, int SPS>
-static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
+template <int FMT, int S, int SPS, bool POW2_NST>
+static void ggml_cuda_mmq_dl_launch_ring_pow2_impl(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
                                          const int nkb, float * tmp_fixup, cudaStream_t stream) {
-    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS>;
+    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS, POW2_NST>;
     constexpr size_t smem = ggml_cuda_dl_ring_smem<FMT, SPS>(S);
     static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
     const int device = ggml_cuda_get_device();
@@ -919,6 +919,19 @@ static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_
     ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, 16, 1), smem, stream),
         (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
         (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
+}
+
+template <int FMT, int S, int SPS>
+static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
+                                         const int nkb, float * tmp_fixup, cudaStream_t stream) {
+    const int nst = nkb / ggml_cuda_dl_fmt<FMT>::G;
+    if constexpr (FMT == GGML_CUDA_DL_FMT_Q8) {
+        ggml_cuda_mmq_dl_launch_ring_pow2_impl<FMT, S, SPS, false>(args, e, grid, mode, nkb, tmp_fixup, stream);
+    } else if (nst > 0 && (nst & (nst - 1)) == 0) {
+        ggml_cuda_mmq_dl_launch_ring_pow2_impl<FMT, S, SPS, true>(args, e, grid, mode, nkb, tmp_fixup, stream);
+    } else {
+        ggml_cuda_mmq_dl_launch_ring_pow2_impl<FMT, S, SPS, false>(args, e, grid, mode, nkb, tmp_fixup, stream);
+    }
 }
 
 static int ggml_cuda_dl_env_int(const char * name, const int dflt) {
