@@ -1639,6 +1639,15 @@ struct ggml_cuda_glu_pair {
 const ggml_cuda_glu_pair * ggml_cuda_glu_pair_find(const void * gate);
 size_t ggml_cuda_glu_pair_register(const void * gate, const void * up, int64_t nrows, int64_t ncols, ggml_type type);
 
+// Attention Q+gate | K | V: verbatim concatenation of existing TM128 copies.
+struct ggml_cuda_dod_qkv {
+    const void * src[3];
+    char * dl;
+};
+bool ggml_cuda_dod_qkv_enabled();
+const ggml_cuda_dod_qkv * ggml_cuda_dod_qkv_find(const void * q);
+size_t ggml_cuda_dod_qkv_register(const void * q, const void * k, const void * v);
+
 // C74: the residual ADD after a matmul whose kernel does not fold it, with k_bin_bcast's op_add expression.
 static __global__ void ggml_cuda_mmq_add_residual(const float * dst, const float * res, float * add_dst,
         const int nrows, const int ncols, const int stride_col) {
@@ -1997,6 +2006,9 @@ size_t ggml_cuda_mul_mat_q_q8_size(const ggml_tensor * src0, const ggml_tensor *
 // launches and the SWIGLU node compute. Returns false (nothing launched) otherwise.
 bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * src1,
                              ggml_tensor * gate_dst, const void * stacked, void * external_q8);
+
+bool ggml_cuda_mul_mat_q_dod_qkv(ggml_backend_cuda_context & ctx, const ggml_tensor * q,
+        const ggml_tensor * k, const ggml_tensor * v, const void * q8);
 
 
 void ggml_cuda_mul_mat_q_fused_two(

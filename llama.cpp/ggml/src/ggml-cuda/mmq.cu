@@ -602,6 +602,127 @@ const ggml_cuda_dl_entry * ggml_cuda_dl_find(const void * src) {
     return it == m.end() ? nullptr : &it->second;
 }
 
+bool ggml_cuda_dod_qkv_enabled() {
+    static const bool enabled = ggml_cuda_dl_env_int("GGML_CUDA_DOD_QKV", 1) != 0;
+    return enabled;
+}
+
+static std::unordered_map<const void *, ggml_cuda_dod_qkv> & ggml_cuda_dod_qkv_map() {
+    static std::unordered_map<const void *, ggml_cuda_dod_qkv> m;
+    return m;
+}
+
+const ggml_cuda_dod_qkv * ggml_cuda_dod_qkv_find(const void * q) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
+    const auto & m = ggml_cuda_dod_qkv_map();
+    const auto it = m.find(q);
+    return it == m.end() ? nullptr : &it->second;
+}
+
+size_t ggml_cuda_dod_qkv_register(const void * q, const void * k, const void * v) {
+    if (!ggml_cuda_dod_qkv_enabled() || !q || !k || !v || q == k || q == v || k == v ||
+            ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_DGX_SPARK) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
+    auto & m = ggml_cuda_dl_map();
+    auto & groups = ggml_cuda_dod_qkv_map();
+    if (groups.count(q)) { return 0; }
+    const void * keys[] = {q, k, v};
+    const int rows[] = {8192, 1024, 1024};
+    for (int s = 0; s < 3; ++s) {
+        const auto it = m.find(keys[s]);
+        if (it == m.end() || !it->second.dl || it->second.dl_owner || it->second.dl_tm64 ||
+                it->second.type != GGML_TYPE_PQ2_0 || it->second.dl_type != GGML_TYPE_PTQ1_0 ||
+                it->second.nrows != rows[s] || it->second.ncols != 4096) {
+            return 0;
+        }
+    }
+    constexpr size_t row_bytes = (4096/QK_PQ2_0)*sizeof(block_ptq1_0);
+    constexpr size_t bytes = 10240*row_bytes;
+    char * dl = nullptr;
+    if (cudaMalloc(&dl, bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0; // all original entries remain usable
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    size_t offset = 0;
+    for (int s = 0; s < 3; ++s) {
+        CUDA_CHECK(cudaMemcpy(dl + offset, m.at(keys[s]).dl, rows[s]*row_bytes, cudaMemcpyDeviceToDevice));
+        offset += rows[s]*row_bytes;
+    }
+    const int device = ggml_cuda_get_device();
+    auto owner = std::shared_ptr<char>(dl, [device](char * p) {
+        const int previous = ggml_cuda_get_device();
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(p));
+        ggml_cuda_set_device(previous);
+    });
+    groups.emplace(q, ggml_cuda_dod_qkv{{q, k, v}, dl});
+    offset = 0;
+    for (int s = 0; s < 3; ++s) {
+        auto & e = m.at(keys[s]);
+        CUDA_CHECK(cudaFree(e.dl));
+        e.dl = dl + offset;
+        e.dl_owner = owner;
+        offset += rows[s]*row_bytes;
+    }
+    return bytes; // replaces exactly this many bytes; no steady-state increase
+}
+
+bool ggml_cuda_mul_mat_q_dod_qkv(ggml_backend_cuda_context & ctx, const ggml_tensor * q,
+        const ggml_tensor * k, const ggml_tensor * v, const void * q8) {
+#if defined(GGML_USE_HOPPER_Q1)
+    return false;
+#endif
+    static const bool grouped = ggml_cuda_dl_env_int("GGML_CUDA_DOD_QKV_EXACT", 1) != 0;
+    static const bool ring = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_PT", 1) != 0;
+    static const bool signed_mma = ggml_cuda_dl_env_int("GGML_CUDA_PTQ1_SIGNED", 1) != 0;
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    if (!ggml_cuda_dod_qkv_enabled() || !ring || !signed_mma || !q8 || uintptr_t(q8)%16 != 0 ||
+            device.cc != GGML_CUDA_CC_DGX_SPARK || device.nsm != 48 || !q || !k || !v ||
+            !q->src[0] || !k->src[0] || !v->src[0] || !q->src[1] ||
+            q->src[1] != k->src[1] || q->src[1] != v->src[1]) {
+        return false;
+    }
+    const auto * group = ggml_cuda_dod_qkv_find(q->src[0]->data);
+    if (!group || group->src[1] != k->src[0]->data || group->src[2] != v->src[0]->data) { return false; }
+    const int rows[] = {8192, 1024, 1024};
+    const ggml_tensor * outputs[] = {q, k, v};
+    const ggml_tensor * input = q->src[1];
+    // J=16 only: J=8/MMVQ and every prefill shape keep their original route.
+    if (input->type != GGML_TYPE_F32 || input->ne[0] != 4096 || input->ne[1] < 9 || input->ne[1] > 16 ||
+            input->ne[2] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input)) { return false; }
+    ggml_cuda_dod_qkv_args a = {};
+    a.x = group->dl;
+    a.y = (const int *)q8;
+    a.ncols = int(input->ne[1]);
+    for (int s = 0; s < 3; ++s) {
+        const auto * out = outputs[s];
+        const auto * w = out->src[0];
+        const auto * e = ggml_cuda_dl_find(w->data);
+        if (out->op != GGML_OP_MUL_MAT || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
+                out->ne[0] != rows[s] || out->ne[1] != a.ncols || out->ne[2] != 1 || out->ne[3] != 1 ||
+                uintptr_t(out->data)%8 != 0 || w->type != GGML_TYPE_PQ2_0 || !ggml_is_contiguous(w) ||
+                w->ne[0] != 4096 || w->ne[1] != rows[s] || w->ne[2] != 1 || w->ne[3] != 1 ||
+                !e || e->dl_type != GGML_TYPE_PTQ1_0 || !e->dl_owner) { return false; }
+        a.stride[s] = int(out->nb[1]/sizeof(float));
+    }
+    a.dst = (float *)q->data;
+    a.dst_hi = (float *)k->data;
+    a.dst_hi2 = (float *)v->data;
+    ggml_cuda_pool_alloc<float> partials(ctx.pool(), (grouped ? 144 : 48)*128*16);
+    if (grouped) { ggml_cuda_dod_qkv_launch<true>(a, partials.get(), ctx.stream()); }
+    else         { ggml_cuda_dod_qkv_launch<false>(a, partials.get(), ctx.stream()); }
+    static bool logged = false;
+    if (!logged) {
+        GGML_LOG_INFO("%s: Q+gate|K|V 8192|1024|1024 x 4096, %s partitions, one fixup\n", __func__,
+                      grouped ? "separate exact" : "combined fp32");
+        logged = true;
+    }
+    return true;
+}
+
 // Copy of a contiguous [nrows][ncols] PQ2_0 / Q8_0 weight in the decode layout (TM), on the current
 // device. Returns the bytes allocated (0: not eligible, disabled, or out of memory: the weight then keeps
 // the regular kernels). GGML_CUDA_DECODE_LAYOUT=0 disables it. A PQ2_0 weight gets PTQ1_0 groups (C51,
@@ -933,6 +1054,17 @@ size_t ggml_cuda_glu_pair_register(const void * gate, const void * up, const int
 void ggml_cuda_dl_unregister_range(const void * base, const size_t size) {
     std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
     {
+        auto & groups = ggml_cuda_dod_qkv_map();
+        const uintptr_t first = uintptr_t(base);
+        for (auto it = groups.begin(); it != groups.end();) {
+            bool remove = false;
+            for (const void * src : it->second.src) {
+                remove |= uintptr_t(src) >= first && uintptr_t(src) - first < size;
+            }
+            if (remove) { it = groups.erase(it); } else { ++it; }
+        }
+    }
+    {
         auto & g = ggml_cuda_glu_map();
         const auto in_range = [&](const void * p) {
             return (const char *) p >= (const char *) base && (const char *) p < (const char *) base + size;
@@ -957,7 +1089,7 @@ void ggml_cuda_dl_unregister_range(const void * base, const size_t size) {
     for (auto it = m.begin(); it != m.end();) {
         const char * p = (const char *) it->first;
         if (p >= (const char *) base && p < (const char *) base + size) {
-            CUDA_CHECK(cudaFree(it->second.dl));
+            if (!it->second.dl_owner) { CUDA_CHECK(cudaFree(it->second.dl)); }
             if (it->second.dl_tm64 != nullptr) {
                 CUDA_CHECK(cudaFree(it->second.dl_tm64));
             }

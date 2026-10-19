@@ -22,9 +22,22 @@ constexpr int D=128,H=32,HK=16,K=16,TMAX=512,G=64;
 constexpr size_t ROW=size_t(D)*D*H,CACHE=ROW*(K+1);
 constexpr uint32_t CANARY=0x46a98700u,GD1=0x4744314cu,GD2=0x4744324cu,REHYDRATE=0x80000000u;
 int checks=0;
+bool g1_suite=false;
+int g1_captured=0;
+double g1_max_abs=0, g1_max_rel=0;
 void need(bool b,const char* why){if(!b){std::fprintf(stderr,"FAIL %s\n",why);std::exit(1);}}
 void check(cudaError_t e){if(e!=cudaSuccess){std::fprintf(stderr,"CUDA %s\n",cudaGetErrorString(e));std::exit(2);}}
 void equal(const char* label,const std::vector<uint32_t>& a,const std::vector<uint32_t>& b){need(a.size()==b.size(),"same comparison extent");for(size_t i=0;i<a.size();++i)if(a[i]!=b[i]){std::fprintf(stderr,"FAIL %s at=%zu %08x/%08x\n",label,i,a[i],b[i]);std::exit(1);}}
+// G1 i2 changes memory scheduling only: tolerance metrics are still printed,
+// but every output and cache word must also be bit-identical to the old path.
+void outputs(const char* label,const std::vector<uint32_t>& a,const std::vector<uint32_t>& b,bool g1){
+    need(a.size()==b.size(),"same output extent");double ma=0,mr=0;size_t failed=0;
+    for(size_t i=0;i<a.size();++i){float ref,got;std::memcpy(&ref,&a[i],4);std::memcpy(&got,&b[i],4);const double e=std::fabs(double(got)-ref);ma=std::max(ma,e);mr=std::max(mr,e/std::max(1e-6,std::fabs(double(ref))));failed+=!std::isfinite(ref)||!std::isfinite(got)||e>2e-5+2e-4*std::fabs(double(ref));}
+    std::printf("G1_OUTPUT case=%s g1=%d max_abs=%.9g max_rel_floor_1e-6=%.9g failed=%zu\n",label,int(g1),ma,mr,failed);
+    g1_max_abs=std::max(g1_max_abs,ma);g1_max_rel=std::max(g1_max_rel,mr);
+    need(failed==0,"finite outputs inside atol=2e-5 rtol=2e-4");
+    equal(label,a,b);
+}
 uint32_t bits(float x){uint32_t b;std::memcpy(&b,&x,4);return b;}
 std::vector<uint32_t> read(ggml_tensor* t){std::vector<uint32_t> b(ggml_nelements(t));ggml_backend_tensor_get(t,b.data(),0,b.size()*4);return b;}
 struct Backend {
@@ -102,7 +115,21 @@ struct Graph {
     uint32_t* counter(){flag();return ggml_cuda_gdn_dedup_counter(backend.cuda(),state.data(),ROW,H,K);}
     std::vector<uint32_t> counts(){auto* p=counter();std::vector<uint32_t>b(H,REHYDRATE);if(p)check(cudaMemcpy(b.data(),p,H*4,cudaMemcpyDeviceToHost));return b;}
     cudaGraph_t captured(){return ::captured(backend,graph);}
-    void inspect(bool wanted){auto gr=captured();size_t n=0;check(cudaGraphGetNodes(gr,nullptr,&n));std::vector<cudaGraphNode_t> nodes(n);check(cudaGraphGetNodes(gr,nodes.data(),&n));int gdns=0,prepares=0,scans=0,resets=0,half_prepares=0,half_scans=0,materializers=0;for(auto node:nodes){cudaGraphNodeType type;check(cudaGraphNodeGetType(node,&type));if(type!=cudaGraphNodeTypeKernel)continue;cudaKernelNodeParams p={};check(cudaGraphKernelNodeGetParams(node,&p));const char* name=nullptr;check(cudaFuncGetName(&name,p.func));prepares+=std::strstr(name,"gdn_compact32_prepare")||std::strstr(name,"gdn_chunk32_prepare");scans+=std::strstr(name,"gdn_compact32_scan")||std::strstr(name,"gdn_chunk32_scan");half_prepares+=std::strstr(name,"prepare_packed")!=nullptr;half_scans+=std::strstr(name,"carry_packed")!=nullptr;materializers+=std::strstr(name,"gdn_half_initial_state")!=nullptr;resets+=std::strstr(name,"rehydrate")!=nullptr;if(!std::strstr(name,"gated_delta_net_"))continue;++gdns;const bool dedup=std::strstr(name,"gated_delta_net_dedup_l8v_cuda");need(dedup==wanted,"captured positive/negative GD2 dispatch identity");need(p.gridDim.x==H&&p.gridDim.y==1&&p.gridDim.z==8&&p.blockDim.x==32&&p.blockDim.y==4,"actual GDN geometry");need(*static_cast<float**>(p.kernelParams[9])==state.data(),"actual fused cache destination");if(dedup)need(*static_cast<uint32_t**>(p.kernelParams[30])==counter(),"actual stable counter pointer");}
+    void inspect(bool wanted){auto gr=captured();size_t n=0;check(cudaGraphGetNodes(gr,nullptr,&n));std::vector<cudaGraphNode_t> nodes(n);check(cudaGraphGetNodes(gr,nodes.data(),&n));int gdns=0,prepares=0,scans=0,resets=0,half_prepares=0,half_scans=0,materializers=0;for(auto node:nodes){cudaGraphNodeType type;check(cudaGraphNodeGetType(node,&type));if(type!=cudaGraphNodeTypeKernel)continue;cudaKernelNodeParams p={};check(cudaGraphKernelNodeGetParams(node,&p));const char* name=nullptr;check(cudaFuncGetName(&name,p.func));prepares+=std::strstr(name,"gdn_compact32_prepare")||std::strstr(name,"gdn_chunk32_prepare");scans+=std::strstr(name,"gdn_compact32_scan")||std::strstr(name,"gdn_chunk32_scan");half_prepares+=std::strstr(name,"prepare_packed")!=nullptr;half_scans+=std::strstr(name,"carry_packed")!=nullptr;materializers+=std::strstr(name,"gdn_half_initial_state")!=nullptr;resets+=std::strstr(name,"rehydrate")!=nullptr;if(!std::strstr(name,"gated_delta_net_"))continue;++gdns;const bool dedup=std::strstr(name,"gated_delta_net_dedup_l8v_cuda");need(dedup==wanted,"captured positive/negative GD2 dispatch identity");need(p.gridDim.x==H&&p.gridDim.y==1&&p.gridDim.z==8&&p.blockDim.x==32&&p.blockDim.y==4,"actual GDN geometry");need(*static_cast<float**>(p.kernelParams[9])==state.data(),"actual fused cache destination");if(dedup){
+            need(*static_cast<uint32_t**>(p.kernelParams[30])==counter(),"actual stable counter pointer");
+            const bool new_name=std::strstr(name,"ELb1EEv")||std::strstr(name,", true>");
+            const bool old_name=std::strstr(name,"ELb0EEv")||std::strstr(name,", false>");
+            need(new_name||old_name,"recognized final G1 template argument");
+            const char* flag=std::getenv("GGML_CUDA_G1");
+            const bool enabled=!flag||std::atoi(flag)!=0;
+            need(new_name==(enabled&&t==16),"captured G1 on/off identity");
+            const char* q=std::getenv("GGML_CUDA_GDN_QUOTIENT_REUSE");
+            const bool reuse=!q||std::atoi(q)!=0;
+            const char* signature=mode ? (reuse?"ILb1ELb0ELb1ELb1E":"ILb1ELb0ELb1ELb0E")
+                                       : (reuse?"ILb0ELb0ELb1ELb1E":"ILb0ELb0ELb1ELb0E");
+            need(std::strstr(name,signature),"captured RAW/PRE/LAZY/REUSE_QUOTIENT identity");
+            if(new_name)++g1_captured;
+        }}
         need(gdns==1,"one native recurrence or N1 tail");const char* half_env=std::getenv("GGML_CUDA_GDN_HALF_PREFILL");const bool half=n1()&&(!half_env||std::atoi(half_env)!=0);need(prepares==int(n1()&&!half)&&scans==int(n1()&&!half),"captured C32 prepare/scan selection");need(half_prepares==int(half)&&half_scans==int(half)&&materializers==int(half),"captured C16 prepare/carry/materializer selection");if(n1()&&counter())need(resets>0,"captured N1 cache invalidation");
 #ifdef GGML_CUDA_USE_PDL
         size_t edges=0;check(cudaGraphGetEdges(gr,nullptr,nullptr,nullptr,&edges));std::vector<cudaGraphNode_t> from(edges),to(edges);std::vector<cudaGraphEdgeData> data(edges);check(cudaGraphGetEdges(gr,from.data(),to.data(),data.data(),&edges));bool pdl=false;for(auto e:data)pdl|=e.type==cudaGraphDependencyTypeProgrammatic;need(pdl,"actual programmatic-dependency capture edges");
@@ -126,7 +153,7 @@ Before before(Graph& g,uint32_t* owner_counter=nullptr){
 }
 // N1 marks every long compatible cache write; the next GD2 verify must rehydrate.
 void compare(Graph& reference,Graph& got,const Before& old,const char* label,bool writer,bool eager=false,bool reset=false){
-    equal(label,read(reference.out),read(got.out));const auto ref=reference.state.get(),actual=got.state.get();auto expected=old.cache;const int w=std::min(got.t,K);const bool verify=got.t>=8&&got.t<=16;
+    outputs(label,read(reference.out),read(got.out),g1_suite&&got.t==16&&writer&&!eager&&!reset&&!got.zero);const auto ref=reference.state.get(),actual=got.state.get();auto expected=old.cache;const int w=std::min(got.t,K);const bool verify=got.t>=8&&got.t<=16;
     if(eager){equal(label,ref,actual);++checks;return;}
     std::copy_n(ref.begin()+G+ROW,ROW,expected.begin()+G+ROW);
     if(!verify||got.zero)std::copy_n(ref.begin()+G,ROW,expected.begin()+G);
@@ -198,6 +225,8 @@ void main_cases(){
         Graph other(candidate,in,gs,16,mode,true);for(int i=0;i<3;++i)step(ref,other,440+i,8,"same-context-independent-graph");need(other.counter()==got.counter(),"same-context graph counter identity");other.inspect(true);
         {Backend second;Graph foreign(second,in,gs,16,mode,true);for(int i=0;i<3;++i)step(ref,foreign,450+i,8,"serialized-second-context",true,false,false,got.counter());need(foreign.counter()==got.counter(),"two live contexts share cache counter");foreign.inspect(true);}
         step(ref,got,460,15,"surviving-owner-after-other-context-destruction");
+        // Short verifies keep the exact template even with G1 enabled.
+        for(int t:{8,15}){Graph sr(control,in,rs,t,mode,false),sg(candidate,in,gs,t,mode,true);for(int rb:{0,8,16}){seed(ref,got,1200+t+rb);step(sr,sg,1300+t+rb,rb,"short-verify-exact-G1-fallback");}sg.inspect(true);}
         auto eager_seed=State::initial(470);rs.put(eager_seed);gs.put(eager_seed);
         std::vector<uint32_t> wrap(H,0x7ffffff8u);check(cudaMemcpy(got.counter(),wrap.data(),H*4,cudaMemcpyHostToDevice));
         step(ref,got,471,0,"last-owned-counter-generation");step(ref,got,472,8,"owned-counter-wrap-rehydrate");step(ref,got,473,0,"owned-counter-wrap-restart");
@@ -236,4 +265,11 @@ void main_cases(){
     }
 }
 }
-int main(){unsetenv("GGML_CUDA_GDN_DEDUP");need(ggml_cuda_gdn_dedup_enabled(),"default-on flag");setenv("GGML_CUDA_GDN_DEDUP","0",1);need(!ggml_cuda_gdn_dedup_enabled(),"explicit opt-out");setenv("GGML_CUDA_PDL","1",1);setenv("GGML_CUDA_GDN_L8","1",1);setenv("GGML_CUDA_GDN_LAZY_ROLLBACK","1",1);setenv("GGML_CUDA_GDN_GATHER_FUSION","1",1);unsetenv("GGML_CUDA_DISABLE_GRAPHS");writer_lifecycle();main_cases();std::printf("GD2L production route PASS checks=%d all_cache_words=1 import_hooks=1 same_context=1 cross_context=1 pdl=1 graph_clone=1 deferred_zero=1 early_reader=1\n",checks);}
+int main(int argc,char** argv){
+    need(argc==1||(argc==2&&std::strcmp(argv[1],"--g1")==0),"usage: gdn-dedup-route [--g1]");
+    g1_suite=argc==2;setenv("GGML_CUDA_G1",g1_suite?"1":"0",1);
+    unsetenv("GGML_CUDA_GDN_DEDUP");need(ggml_cuda_gdn_dedup_enabled(),"default-on flag");setenv("GGML_CUDA_GDN_DEDUP","0",1);need(!ggml_cuda_gdn_dedup_enabled(),"explicit opt-out");setenv("GGML_CUDA_PDL","1",1);setenv("GGML_CUDA_GDN_L8","1",1);setenv("GGML_CUDA_GDN_LAZY_ROLLBACK","1",1);setenv("GGML_CUDA_GDN_GATHER_FUSION","1",1);unsetenv("GGML_CUDA_DISABLE_GRAPHS");writer_lifecycle();main_cases();
+    if(g1_suite)need(g1_captured>0,"positive captured G1 dispatches");
+    std::printf("GD2L production route PASS checks=%d g1=%d g1_captured=%d max_abs=%.9g max_rel_floor_1e-6=%.9g all_cache_words=1 cache_max_abs=0 cache_max_rel=0 import_hooks=1 same_context=1 cross_context=1 pdl=1 graph_clone=1 deferred_zero=1 early_reader=1\n",checks,int(g1_suite),g1_captured,g1_max_abs,g1_max_rel);
+    return 0;
+}

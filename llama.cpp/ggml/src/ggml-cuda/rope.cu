@@ -1169,3 +1169,229 @@ void ggml_cuda_op_rms_norm_mul_mrope_fused(ggml_backend_cuda_context & ctx, ggml
             is_imrope, row_indices, set_rows_stride, v_d, v_s1, (half *) vdst_d, v_row_indices, v_set_rows_stride, stream);
     }
 }
+
+// D1 Q/K pair: the original C62 entry point above remains unchanged.
+struct ggml_cuda_mrope_args {
+    const float * x;
+    void * dst;
+    int ncols;
+    int64_t s01, s02, s1, s2;
+    float eps;
+    const float * mul;
+    int n_dims;
+    const int32_t * pos;
+    float freq_scale, ext_factor, attn_factor;
+    rope_corr_dims corr_dims;
+    float theta_scale;
+    mrope_sections sections;
+    const int64_t * row_indices;
+    int64_t set_rows_stride;
+    const float * v;
+    int64_t v_s1;
+    void * vdst;
+    const int64_t * v_row_indices;
+    int64_t v_set_rows_stride;
+};
+
+#define DOD_MROPE_ARGS(a, D) (a).x, (D *)(a).dst, (a).ncols, (a).s01, (a).s02, (a).s1, (a).s2, \
+    (a).eps, (a).mul, (a).n_dims, (a).pos, (a).freq_scale, (a).ext_factor, (a).attn_factor, (a).corr_dims, \
+    (a).theta_scale, (a).sections, (a).row_indices, (a).set_rows_stride, (a).v, (a).v_s1, (D *)(a).vdst, \
+    (a).v_row_indices, (a).v_set_rows_stride
+
+template <int block_size, bool imrope, typename D>
+static __device__ __forceinline__ void rms_norm_mul_mrope_row(
+        const float * x, D * dst, const int ncols,
+        const int64_t s01, const int64_t s02, const int64_t s1, const int64_t s2,
+        const float eps, const float * mul,
+        const int n_dims, const int32_t * pos,
+        const float freq_scale, const float ext_factor, const float attn_factor,
+        const rope_corr_dims corr_dims, const float theta_scale, const mrope_sections sections,
+        const int64_t * row_indices, const int64_t set_rows_stride,
+        const float * v, const int64_t v_s1, D * vdst, const int64_t * v_row_indices, const int64_t v_set_rows_stride, const int row, const int channel, const int ne02) {
+    ggml_cuda_pdl_lc();
+    const int tid     = threadIdx.x;
+
+    x += channel*s02 + row*s01;
+
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    // the normalized row, as rms_norm_f32 stores it (the rope below then reads it as rope_multi reads its input,
+    // so both form the rotation from loaded values in the same expressions)
+    float * s_row = s_sum + 32;
+    for (int col = tid; col < ncols; col += block_size) {
+        s_row[col] = scale * x[col] * mul[col];
+    }
+    __syncthreads();
+
+    int64_t idst = channel*s2 + row*s1;
+    if (row_indices != nullptr) {
+        idst = row*s1 + row_indices[channel]*set_rows_stride;
+    }
+    dst += idst;
+
+    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+    const int sec_w     = sections.v[1] + sections.v[0];
+
+    for (int i0 = 2*tid; i0 < ncols; i0 += 2*block_size) {
+        if (i0 >= n_dims) {
+            dst[i0 + 0] = ggml_cuda_cast<D>(s_row[i0 + 0]);
+            dst[i0 + 1] = ggml_cuda_cast<D>(s_row[i0 + 1]);
+            continue;
+        }
+
+        const int iw     = i0;
+        const int sector = (iw / 2) % sect_dims;
+
+        float theta_base = 0.0;
+        if (imrope) {
+            if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
+                theta_base = pos[channel + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+            } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
+                theta_base = pos[channel + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+            } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
+                theta_base = pos[channel] * powf(theta_scale, iw / 2.0f);
+            } else {
+                theta_base = pos[channel + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+            }
+        } else {
+            if (sector < sections.v[0]) {
+                theta_base = pos[channel] * powf(theta_scale, iw / 2.0f);
+            } else if (sector >= sections.v[0] && sector < sec_w) {
+                theta_base = pos[channel + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+            } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+                theta_base = pos[channel + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+            } else if (sector >= sec_w + sections.v[2]) {
+                theta_base = pos[channel + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+            }
+        }
+
+        const float freq_factor = 1.0f;
+
+        float cos_theta;
+        float sin_theta;
+
+        rope_yarn<true>(theta_base/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor, cos_theta, sin_theta);
+
+        const float x0 = s_row[i0/2 + 0];
+        const float x1 = s_row[i0/2 + n_dims/2];
+
+        const float r0 = x0*cos_theta - x1*sin_theta;
+        const float r1 = x0*sin_theta + x1*cos_theta;
+        dst[i0/2 + 0]        = ggml_cuda_cast<D>(r0);
+        dst[i0/2 + n_dims/2] = ggml_cuda_cast<D>(r1);
+    }
+
+    if (v != nullptr) {
+        const float * vrow = v + channel*v_s1 + row*ncols;
+        D * vd = vdst + v_row_indices[channel]*v_set_rows_stride + row*ncols;
+        for (int col = tid; col < ncols; col += block_size) {
+            vd[col] = ggml_cuda_cast<D>(vrow[col]);
+        }
+    }
+}
+
+// Every CTA executes the original C62 row body, with its original block size.
+// Q stays f32; K/V are cast only at the existing SET_ROWS destination.
+template <int block_size, bool imrope, typename D>
+static __global__ void rms_norm_mul_mrope_qk(ggml_cuda_mrope_args q, ggml_cuda_mrope_args k, int qheads) {
+    if (int(blockIdx.x) < qheads) {
+        rms_norm_mul_mrope_row<block_size, imrope, float>(DOD_MROPE_ARGS(q, float), blockIdx.x, blockIdx.y, gridDim.y);
+    } else {
+        rms_norm_mul_mrope_row<block_size, imrope, D>(DOD_MROPE_ARGS(k, D), blockIdx.x - qheads, blockIdx.y, gridDim.y);
+    }
+}
+#undef DOD_MROPE_ARGS
+
+static ggml_cuda_mrope_args ggml_cuda_mrope_pack(ggml_tensor * rms_norm, ggml_tensor * mul,
+        ggml_tensor * rope, ggml_tensor * set_rows, ggml_tensor * v_view, ggml_tensor * v_set_rows) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int n_dims     = ((const int32_t *) rope->op_params)[1];
+    const int mode       = ((const int32_t *) rope->op_params)[2];
+    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    mrope_sections sections;
+    memcpy(&freq_base,   (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) rope->op_params + 10, sizeof(float));
+    memcpy(&sections.v,  (const int32_t *) rope->op_params + 11, sizeof(int)*4);
+    GGML_UNUSED(mode);
+
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
+
+    const int64_t s01 = x->nb[1] / sizeof(float);
+    const int64_t s02 = x->nb[2] / sizeof(float);
+    const int64_t s1  = rope->nb[1] / sizeof(float);
+    const int64_t s2  = rope->nb[2] / sizeof(float);
+
+    void *          dst_d           = rope->data;
+    ggml_type       dst_type        = rope->type;
+    const int64_t * row_indices     = nullptr;
+    int64_t         set_rows_stride = 0;
+    if (set_rows != nullptr) {
+        dst_d           = set_rows->data;
+        dst_type        = set_rows->type;
+        row_indices     = (const int64_t *) set_rows->src[1]->data;
+        set_rows_stride = set_rows->nb[1] / ggml_type_size(set_rows->type);
+    }
+    const float *   v_d              = nullptr;
+    int64_t         v_s1             = 0;
+    void *          vdst_d           = nullptr;
+    const int64_t * v_row_indices    = nullptr;
+    int64_t         v_set_rows_stride = 0;
+    if (v_set_rows != nullptr) {
+        GGML_ASSERT(set_rows != nullptr && v_set_rows->type == dst_type);
+        v_d               = (const float *) v_view->data;
+        v_s1              = v_view->nb[1] / sizeof(float);
+        vdst_d            = v_set_rows->data;
+        v_row_indices     = (const int64_t *) v_set_rows->src[1]->data;
+        v_set_rows_stride = v_set_rows->nb[1] / ggml_type_size(v_set_rows->type);
+    }
+    return {(const float *)x->data, dst_d, int(x->ne[0]), s01, s02, s1, s2, eps, (const float *)w->data,
+        n_dims, (const int32_t *)rope->src[1]->data, freq_scale, ext_factor, attn_factor, corr_dims,
+        powf(freq_base, -2.0f/n_dims), sections, row_indices, set_rows_stride,
+        v_d, v_s1, vdst_d, v_row_indices, v_set_rows_stride};
+}
+
+
+void ggml_cuda_op_rms_norm_mul_mrope_qk(ggml_backend_cuda_context & ctx,
+        ggml_tensor * qrms, ggml_tensor * qmul, ggml_tensor * qrope,
+        ggml_tensor * krms, ggml_tensor * kmul, ggml_tensor * krope,
+        ggml_tensor * kstore, ggml_tensor * vview, ggml_tensor * vstore) {
+    const auto q = ggml_cuda_mrope_pack(qrms, qmul, qrope, nullptr, nullptr, nullptr);
+    const auto k = ggml_cuda_mrope_pack(krms, kmul, krope, kstore, vview, vstore);
+    const auto * qx = qrms->src[0];
+    const auto * kx = krms->src[0];
+    GGML_ASSERT(q.ncols == 256 && k.ncols == 256 && qx->ne[2] == kx->ne[2]);
+    const bool imrope = ((const int32_t *)qrope->op_params)[2] == GGML_ROPE_TYPE_IMROPE;
+    const auto type = kstore ? kstore->type : krope->type;
+#define DOD_QK_LAUNCH(IM, D) ggml_cuda_kernel_launch(rms_norm_mul_mrope_qk<256, IM, D>, \
+    ggml_cuda_kernel_launch_params(dim3(qx->ne[1] + kx->ne[1], qx->ne[2]), dim3(256), \
+        (32 + q.ncols)*sizeof(float), ctx.stream()), q, k, int(qx->ne[1]))
+#define DOD_QK_TYPE(IM) do { if (type == GGML_TYPE_F32) { DOD_QK_LAUNCH(IM, float); } \
+    else { GGML_ASSERT(type == GGML_TYPE_F16); DOD_QK_LAUNCH(IM, half); } } while (0)
+    if (imrope) { DOD_QK_TYPE(true); } else { DOD_QK_TYPE(false); }
+#undef DOD_QK_TYPE
+#undef DOD_QK_LAUNCH
+}

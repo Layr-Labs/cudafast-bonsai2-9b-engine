@@ -9,6 +9,7 @@
 #include "gated_delta_net_kernel.cuh"
 #ifdef GGML_CUDA_GDN_N1_TEST
 #include "gated_delta_net_dedup.cuh"
+#include <cuda_profiler_api.h>
 #endif
 
 #include <cmath>
@@ -402,6 +403,208 @@ static void dedup_verify(const Dev & d, int mode, float * cache, uint32_t * coun
     else if (mode >= 2) { dedup_verify_t<false, true>(d, cache, counter); }
     else { dedup_verify_t<false, false>(d, cache, counter); }
 }
+// G1 standalone stress/graph comparator. Compile with the existing N1 test
+// define, then select --g1 (or --g1 --bench); the N1 modes are unchanged.
+static bool g1_reuse_quotient() {
+    static const bool on=!std::getenv("GGML_CUDA_GDN_QUOTIENT_REUSE") ||
+                         std::atoi(std::getenv("GGML_CUDA_GDN_QUOTIENT_REUSE"))!=0;
+    return on;
+}
+template <bool RAW, bool PRE, bool G1>
+static void g1_launch_t(const Dev & d, int T, float * cache, uint32_t * counter, cudaStream_t stream) {
+    const auto hk = init_fastdiv_values(HK), seq = init_fastdiv_values(1);
+    const int64_t sq1 = d.layout == 2 ? int64_t(T)*128 : 128;
+    const int64_t sq2 = d.layout == 2 ? 128 : int64_t(128)*HK, sv2 = int64_t(128)*H;
+    const ggml_cuda_kernel_launch_params lp(dim3(H,1,8), dim3(32,4), 0, stream);
+    const auto kernel=g1_reuse_quotient()
+        ? gated_delta_net_dedup_l8v_cuda<RAW, PRE, true, true, G1>
+        : gated_delta_net_dedup_l8v_cuda<RAW, PRE, true, false, G1>;
+    ggml_cuda_kernel_launch(kernel, lp,
+        d.q, d.k, d.v, d.g, d.beta, g_raw_dt_bias, g_raw_a, cache, d.dst, cache,
+        int64_t(H), int64_t(T), int64_t(1), sq1, sq2, int64_t(128)*HK*T,
+        int64_t(128), sv2, sv2*T, int64_t(1), int64_t(H), int64_t(H*T),
+        hk, seq, 1.0f/std::sqrt(128.0f), D, K, g_ids, D, 1, counter);
+}
+static void g1_launch(const Dev & d, int T, int mode, float * cache, uint32_t * counter,
+                      bool candidate, cudaStream_t stream = nullptr) {
+#define G1_TYPED(RAW_, PRE_) \
+    if (candidate) { g1_launch_t<RAW_, PRE_, true>(d,T,cache,counter,stream); } \
+    else { g1_launch_t<RAW_, PRE_, false>(d,T,cache,counter,stream); }
+    if (mode == 1) { G1_TYPED(true, false); }
+    else if (mode >= 2) { G1_TYPED(false, true); }
+    else { G1_TYPED(false, false); }
+#undef G1_TYPED
+    CHECK(cudaGetLastError());
+}
+__global__ void g1_layout_probe(const float * base, float * natural_out, float * l8_out, uint32_t * hashes) {
+    const int lane=threadIdx.x, grp=lane/8, n=lane%8;
+    const int col=(blockIdx.z*4+threadIdx.y)*4;
+    base+=blockIdx.x*128*128;natural_out+=blockIdx.x*128*128;l8_out+=blockIdx.x*128*128;
+    float s[GDN_L8_ROWS];
+    const uint32_t ref=gdn_l8_base_checksum(base,col,lane);
+    const uint32_t loaded=gdn_g1_load_base(base,col,false,s);
+#pragma unroll
+    for(int m=0;m<4;++m) {
+#pragma unroll
+        for(int r=0;r<4;++r) l8_out[(col+grp)*128+r*32+n+8*m]=s[m*4+r];
+    }
+    const uint32_t stored=gdn_g1_store_base(natural_out,col,false,s);
+    if(lane==0){const int at=((blockIdx.x*8+blockIdx.z)*4+threadIdx.y)*3;hashes[at]=ref;hashes[at+1]=loaded;hashes[at+2]=stored;}
+}
+__global__ void g1_corrupt_checksums(float * cache) {
+    const int h=blockIdx.x, z=blockIdx.z;
+    if(threadIdx.x==0){auto * hdr=reinterpret_cast<uint32_t *>(cache+(2+z)*D+h*128*128);hdr[4+threadIdx.y]^=1u;}
+}
+static void g1_layout_test() {
+    std::vector<uint32_t> words(D);
+    std::mt19937 rng(7319);
+    const uint32_t special[]={0u,0x80000000u,1u,0x80000001u,0x7f800000u,0xff800000u,0x7fc12345u,0xffc54321u};
+    for(size_t i=0;i<words.size();++i) words[i]=i%17==0?special[(i/17)%8]:rng();
+    float * base=alloc<float>(D), * natural=alloc<float>(D), * l8=alloc<float>(D);
+    const size_t nh=H*8*4*3;uint32_t * hashes=alloc<uint32_t>(nh);
+    CHECK(cudaMemcpy(base,words.data(),D*sizeof(float),cudaMemcpyHostToDevice));
+    g1_layout_probe<<<dim3(H,1,8),dim3(32,4)>>>(base,natural,l8,hashes);
+    CHECK(cudaGetLastError());CHECK(cudaDeviceSynchronize());
+    if(fetch(natural,D)!=words||fetch(l8,D)!=words){++bad;fprintf(stderr,"G1 layout bits FAIL\n");}
+    std::vector<uint32_t> h(nh);CHECK(cudaMemcpy(h.data(),hashes,nh*sizeof(uint32_t),cudaMemcpyDeviceToHost));
+    for(size_t i=0;i<nh;i+=3) if(h[i]!=h[i+1]||h[i]!=h[i+2]){++bad;fprintf(stderr,"G1 base hash FAIL at %zu\n",i/3);break;}
+    printf("G1_LAYOUT %s words=%lld hashes=%zu raw_bits_include_nan_inf_signed_zero_subnormal=1\n",bad?"FAIL":"PASS",(long long)D,nh/3);
+    cudaFree(base);cudaFree(natural);cudaFree(l8);cudaFree(hashes);
+}
+static void g1_test() {
+    g1_layout_test();
+    const size_t count = size_t(D)*(K+1);
+    float * exact = alloc<float>(count), * candidate = alloc<float>(count);
+    uint32_t * ec = alloc<uint32_t>(H), * cc = alloc<uint32_t>(H);
+    // Modes cover log/activated gates, raw gates, exp gates, and the production
+    // raw-gate precompute. Profiles cover weak/strong/underflow decays and beta
+    // zero/one. No decay product is ever divided or clipped in the candidate.
+    for (int mode = 0; mode < 4; ++mode) for (int profile = 0; profile < 3; ++profile) {
+        printf("G1_STRESS mode=%d profile=%d quotient=%d\n", mode, profile, int(g1_reuse_quotient()));
+        CHECK(cudaMemset(exact, 0, count*sizeof(float)));
+        if (profile != 0) {
+            std::vector<float> state(D);
+            for (size_t i = 0; i < state.size(); ++i) state[i] = .03f*std::sin(float(i%113));
+            CHECK(cudaMemcpy(exact, state.data(), D*sizeof(float), cudaMemcpyHostToDevice));
+        }
+        CHECK(cudaMemcpy(candidate, exact, count*sizeof(float), cudaMemcpyDeviceToDevice));
+        std::vector<uint32_t> rehydrate(H, GDN_DEDUP_REHYDRATE);
+        CHECK(cudaMemcpy(ec, rehydrate.data(), H*sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CHECK(cudaMemcpy(cc, rehydrate.data(), H*sizeof(uint32_t), cudaMemcpyHostToDevice));
+        Dev ref = device_inputs(16,mode,profile), got = device_inputs(16,mode,profile);
+        // Warm the GD1 compatibility writer and the first two GD2 generations.
+        // Then every rollback, including the all-window rollback to the base.
+        for (int step = -3; step <= 16; ++step) {
+            const int rb = std::max(0, step);
+            CHECK(cudaMemcpy(g_ids, &rb, sizeof(rb), cudaMemcpyHostToDevice));
+            CHECK(cudaMemset(ref.dst, 0xff, 128*H*16*sizeof(float)));
+            CHECK(cudaMemset(got.dst, 0xff, 128*H*16*sizeof(float)));
+            g1_launch(ref,16,mode,exact,ec,false);
+            g1_launch(got,16,mode,candidate,cc,true);
+            CHECK(cudaDeviceSynchronize());
+            char label[120]; std::snprintf(label,sizeof(label),"G1_m%d_p%d_rb%d_output",mode,profile,rb);
+            close(label, floats(got.dst,128*H*16), floats(ref.dst,128*H*16));
+            bits("G1 exact outputs",got.dst,ref.dst,128*H*16);
+            // The entire cache is a stronger check than a tolerance on records:
+            // bases (state after rollback), GD1/GD2 records, untouched areas,
+            // NOFINAL marks, parity buffers, headers and checksums must match.
+            bits("G1 all records and rollback base",candidate,exact,count);
+            if (fetch(reinterpret_cast<const float *>(cc),H) != fetch(reinterpret_cast<const float *>(ec),H)) ++bad;
+        }
+        // Metadata remains valid, but every old base hash is stale. Reading
+        // slot 0 avoids record/eager-column aliasing. The new path must drain
+        // its speculative record copies and reproduce the old exact fallback.
+        {
+            float * a=alloc<float>(count), * b=alloc<float>(count);
+            uint32_t * ac=alloc<uint32_t>(H), * bc=alloc<uint32_t>(H);
+            CHECK(cudaMemcpy(a,exact,count*sizeof(float),cudaMemcpyDeviceToDevice));
+            CHECK(cudaMemcpy(b,candidate,count*sizeof(float),cudaMemcpyDeviceToDevice));
+            CHECK(cudaMemcpy(ac,ec,H*sizeof(uint32_t),cudaMemcpyDeviceToDevice));
+            CHECK(cudaMemcpy(bc,cc,H*sizeof(uint32_t),cudaMemcpyDeviceToDevice));
+            g1_corrupt_checksums<<<dim3(H,1,8),dim3(32,4)>>>(a);
+            g1_corrupt_checksums<<<dim3(H,1,8),dim3(32,4)>>>(b);
+            const int rb=0;CHECK(cudaMemcpy(g_ids,&rb,sizeof(rb),cudaMemcpyHostToDevice));
+            g1_launch(ref,16,mode,a,ac,false);g1_launch(got,16,mode,b,bc,true);
+            CHECK(cudaDeviceSynchronize());
+            bits("G1 stale-checksum fallback outputs",got.dst,ref.dst,128*H*16);
+            bits("G1 stale-checksum fallback cache",b,a,count);
+            cudaFree(a);cudaFree(b);cudaFree(ac);cudaFree(bc);
+        }
+        // A short exact consumer materializes state from the new writer's GD2
+        // records. The existing generic kernel is intentionally not modified.
+        for (int rb : {0,1,4,8,12,15,16}) {
+            float * a = alloc<float>(count), * b = alloc<float>(count);
+            CHECK(cudaMemcpy(a,exact,count*sizeof(float),cudaMemcpyDeviceToDevice));
+            CHECK(cudaMemcpy(b,candidate,count*sizeof(float),cudaMemcpyDeviceToDevice));
+            Dev da = device_inputs(1,mode,profile), db = device_inputs(1,mode,profile);
+            const auto hk=init_fastdiv_values(HK), seq=init_fastdiv_values(1);
+            const ggml_cuda_kernel_launch_params lp(dim3(H,1,8),dim3(32,4),0,nullptr);
+            CHECK(cudaMemcpy(g_ids,&rb,sizeof(rb),cudaMemcpyHostToDevice));
+#define G1_MATERIALIZE(RAW_, PRE_, INPUT_, CACHE_) \
+            ggml_cuda_kernel_launch(gated_delta_net_cuda<128,false,true,RAW_,PRE_>,lp, \
+                INPUT_.q,INPUT_.k,INPUT_.v,INPUT_.g,INPUT_.beta,g_raw_dt_bias,g_raw_a,CACHE_,INPUT_.dst,CACHE_, \
+                int64_t(H),int64_t(1),int64_t(1),int64_t(128),int64_t(128*HK),int64_t(128*HK), \
+                int64_t(128),int64_t(128*H),int64_t(128*H),int64_t(1),int64_t(H),int64_t(H), \
+                hk,seq,1.0f/std::sqrt(128.0f),D,K,g_ids,D,1)
+            if(mode==1){G1_MATERIALIZE(true,false,da,a);G1_MATERIALIZE(true,false,db,b);}
+            else if(mode>=2){G1_MATERIALIZE(false,true,da,a);G1_MATERIALIZE(false,true,db,b);}
+            else{G1_MATERIALIZE(false,false,da,a);G1_MATERIALIZE(false,false,db,b);}
+#undef G1_MATERIALIZE
+            CHECK(cudaDeviceSynchronize());
+            bits("G1 exact short-reader outputs",da.dst,db.dst,128*H);
+            bits("G1 materialized rollback state",a,b,D);
+            release(da);release(db);cudaFree(a);cudaFree(b);
+        }
+        release(ref);release(got);
+    }
+    cudaFree(exact);cudaFree(candidate);cudaFree(ec);cudaFree(cc);
+    printf("G1_STRESS %s failures=%d cache_and_materialized_state_bitwise=1 (no model-fidelity claim)\n",bad?"FAIL":"PASS",bad);
+}
+static void g1_bench(int iters) {
+    const size_t count=size_t(D)*(K+1);
+    float * cache=alloc<float>(count);uint32_t * counter=alloc<uint32_t>(H);
+    Dev d=device_inputs(16,1,0);cudaStream_t stream;CHECK(cudaStreamCreate(&stream));
+    cudaGraph_t graph[2];cudaGraphExec_t exec[2];
+    for(int i=0;i<2;++i){CHECK(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal));g1_launch(d,16,1,cache,counter,i!=0,stream);CHECK(cudaStreamEndCapture(stream,&graph[i]));CHECK(cudaGraphInstantiate(&exec[i],graph[i],nullptr,nullptr,0));}
+    cudaEvent_t begin,end;CHECK(cudaEventCreate(&begin));CHECK(cudaEventCreate(&end));
+    for(int rb=0;rb<=16;++rb){
+        CHECK(cudaMemcpy(g_ids,&rb,sizeof(rb),cudaMemcpyHostToDevice));
+        double total[2]={},low[2]={1e30,1e30};
+        // Same cache/input/output/counter addresses; alternating ABBA samples.
+        for(int sample=0;sample<8;++sample){const int arm=(sample%4==1||sample%4==2)?1:0;
+            CHECK(cudaMemsetAsync(cache,0,count*sizeof(float),stream));CHECK(cudaMemsetAsync(counter,0,H*sizeof(uint32_t),stream));
+            // Fresh eager input is slot 0; only then switch to the timed rb.
+            const int zero=0;CHECK(cudaMemcpyAsync(g_ids,&zero,sizeof(zero),cudaMemcpyHostToDevice,stream));
+            for(int j=0;j<5;++j)CHECK(cudaGraphLaunch(exec[arm],stream));
+            CHECK(cudaMemcpyAsync(g_ids,&rb,sizeof(rb),cudaMemcpyHostToDevice,stream));
+            CHECK(cudaEventRecord(begin,stream));for(int j=0;j<iters;++j)CHECK(cudaGraphLaunch(exec[arm],stream));CHECK(cudaEventRecord(end,stream));CHECK(cudaEventSynchronize(end));
+            float ms=0;CHECK(cudaEventElapsedTime(&ms,begin,end));const double us=ms*1000/iters;total[arm]+=us;low[arm]=std::min(low[arm],us);
+            printf("G1_SAMPLE rb=%d arm=%s sample=%d us=%.6f\n",rb,arm?"replay":"exact",sample,us);
+        }
+        printf("G1_BENCH rb=%d iters=%d exact_us=%.6f g1_us=%.6f min_exact_us=%.6f min_g1_us=%.6f saved_us=%.6f ratio=%.6f same_addresses=1 quotient=%d\n",rb,iters,total[0]/4,total[1]/4,low[0],low[1],(total[0]-total[1])/4,total[0]/total[1],int(g1_reuse_quotient()));
+    }
+    CHECK(cudaDeviceSynchronize());
+    for(int i=0;i<2;++i){CHECK(cudaGraphExecDestroy(exec[i]));CHECK(cudaGraphDestroy(graph[i]));}
+    cudaEventDestroy(begin);cudaEventDestroy(end);cudaStreamDestroy(stream);cudaFree(cache);cudaFree(counter);release(d);
+}
+static void g1_profile(int rb, bool candidate, int iters) {
+    const size_t count=size_t(D)*(K+1);
+    float * cache=alloc<float>(count);uint32_t * counter=alloc<uint32_t>(H);
+    Dev d=device_inputs(16,1,0);
+    CHECK(cudaMemset(cache,0,count*sizeof(float)));CHECK(cudaMemset(counter,0,H*sizeof(uint32_t)));
+    const int zero=0;CHECK(cudaMemcpy(g_ids,&zero,sizeof(zero),cudaMemcpyHostToDevice));
+    // Common mature GD2 state, prepared before profiling starts, never timed.
+    for(int j=0;j<4;++j)g1_launch(d,16,1,cache,counter,false);
+    CHECK(cudaDeviceSynchronize());CHECK(cudaMemcpy(g_ids,&rb,sizeof(rb),cudaMemcpyHostToDevice));
+    CHECK(cudaProfilerStart());
+    for(int j=0;j<iters;++j)g1_launch(d,16,1,cache,counter,candidate);
+    CHECK(cudaDeviceSynchronize());CHECK(cudaProfilerStop());
+    const auto out=floats(d.dst,128*H*16);
+    for(float x:out)if(!std::isfinite(x)){++bad;break;}
+    printf("G1_PROFILE %s rb=%d arm=%s iters=%d direct_launch=1 mature_GD2=1 finite_only=1 quotient=%d\n",bad?"FAIL":"DONE",rb,candidate?"replay":"exact",iters,int(g1_reuse_quotient()));
+    cudaFree(cache);cudaFree(counter);release(d);
+}
+
 static void row(int r) { CHECK(cudaMemcpy(g_ids, &r, sizeof(r), cudaMemcpyHostToDevice)); }
 static void reset(float * p, bool fresh) {
     CHECK(cudaMemset(p, 0xcd, (size_t) D*K*sizeof(float))); // finite poison, including old headers
@@ -732,15 +935,22 @@ static void bench(int T, int iters) {
 } // namespace n1
 
 int main(int argc, char ** argv) {
-    bool benchmark = false, ncu_friendly = false; int only = 0, iters = 50;
+    bool benchmark = false, ncu_friendly = false, g1 = false; int only = 0, iters = 50, g1_profile_arm=-1, g1_rb=0;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--bench") { benchmark = true; }
+        else if (arg == "--g1") { g1 = true; }
+        else if (arg == "--g1-profile" && i+1<argc) {
+            const std::string arm=argv[++i];
+            if(arm!="exact"&&arm!="new")return 2;
+            g1=true;g1_profile_arm=arm=="new"?1:0;
+        }
+        else if (arg == "--rb" && i+1<argc) { g1_rb=std::atoi(argv[++i]); }
         else if (arg == "--ncu-friendly") { ncu_friendly = true; }
         else if (arg == "--layout" && i+1 < argc) { n1::input_layout = std::atoi(argv[++i]); }
         else if (arg == "--tokens" && i+1 < argc) { only = std::atoi(argv[++i]); }
         else if (arg == "--iters" && i+1 < argc) { iters = std::atoi(argv[++i]); }
-        else { fprintf(stderr, "usage: %s [--bench | --ncu-friendly] [--tokens 64..1024] [--layout 0|1|2] [--iters N]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s [--g1 [--bench] | --g1-profile exact|new --rb 0..16 | --ncu-friendly] [--tokens 64..1024] [--layout 0|1|2] [--iters N]\n", argv[0]); return 2; }
     }
     if ((only && (only < 64 || only > 1024)) || iters < 1 || n1::input_layout < 0 || n1::input_layout > 2) { return 2; }
     if (ncu_friendly && (benchmark || !gdn_chunk32_enabled())) {
@@ -756,6 +966,14 @@ int main(int argc, char ** argv) {
     for (int h = 0; h < H; ++h) { bias[h] = .01f*h; }
     CHECK(cudaMemcpy(g_raw_dt_bias, bias.data(), H*sizeof(float), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(g_raw_a, a.data(), H*sizeof(float), cudaMemcpyHostToDevice));
+    if (g1) {
+        if (only || ncu_friendly || n1::input_layout || g1_rb<0 || g1_rb>16 || (benchmark&&g1_profile_arm>=0)) return 2;
+        if (g1_profile_arm>=0) n1::g1_profile(g1_rb,g1_profile_arm!=0,iters);
+        else if (benchmark) n1::g1_bench(iters); else n1::g1_test();
+        CHECK(cudaDeviceSynchronize());
+        cudaFree(g_ids);cudaFree(g_raw_dt_bias);cudaFree(g_raw_a);
+        return n1::bad ? 1 : 0;
+    }
     const std::vector<int> lengths = only ? std::vector<int>{ only } : std::vector<int>{ 64, 65, 80, 95, 128, 256, 512, 1024 };
     for (int T : lengths) {
         if (ncu_friendly) { n1::profile_once(T); continue; }

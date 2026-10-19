@@ -73,9 +73,15 @@ static void launch_gated_delta_net(
                         // to retain the original remainder-then-quotient path for A/B runs.
                         static const bool reuse_quotient = getenv("GGML_CUDA_GDN_QUOTIENT_REUSE") == nullptr ||
                                                           atoi(getenv("GGML_CUDA_GDN_QUOTIENT_REUSE")) != 0;
+                        // G1 changes only the exact memory-side prologue. Explicit 0
+                        // keeps the accepted verify, with its quotient choice intact.
+                        static const bool g1_enabled = getenv("GGML_CUDA_G1") == nullptr || atoi(getenv("GGML_CUDA_G1")) != 0;
+                        const bool g1 = g1_enabled && n_tokens == 16;
                         const auto kernel = reuse_quotient
-                            ? gated_delta_net_dedup_l8v_cuda<RAW, G_PRECOMPUTED, true, true>
-                            : gated_delta_net_dedup_l8v_cuda<RAW, G_PRECOMPUTED, true, false>;
+                            ? (g1 ? gated_delta_net_dedup_l8v_cuda<RAW, G_PRECOMPUTED, true, true, true>
+                                  : gated_delta_net_dedup_l8v_cuda<RAW, G_PRECOMPUTED, true, true, false>)
+                            : (g1 ? gated_delta_net_dedup_l8v_cuda<RAW, G_PRECOMPUTED, true, false, true>
+                                  : gated_delta_net_dedup_l8v_cuda<RAW, G_PRECOMPUTED, true, false, false>);
                         ggml_cuda_kernel_launch(kernel, launch_params,
                             q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,

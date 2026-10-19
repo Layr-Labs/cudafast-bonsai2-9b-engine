@@ -236,11 +236,13 @@ static __device__ __forceinline__ float ssm_conv_front_input(const float * st, c
 // - With qk, the channels [0, c_v0) are 128-channel heads whose SILU output is only read by an L2_NORM: a qk block
 //   computes head h, tokens [ch*qk_tt, (ch+1)*qk_tt) into shared memory and writes them l2-normalized to qk (same
 //   per-row arithmetic as l2_norm_f32<32>); y is not written for those channels, nor does qk overlap x.
+//   With qk_regs (short batches), each warp owns a token range and holds columns l, l+32, l+64, l+96 in registers.
+//   It computes the same convolution and L2 tree without the shared-memory output transpose or a second launch.
 // A block stages the conv states of its channels before the first barrier and writes the snapshots of its channels
 // after it, so a snapshot may land on the gathered conv-state row (states = gather_base + gather_ids[0]*gather_row);
 // only the block that owns a channel reads its conv states (v blocks; qk blocks of chunk 0). x rows that qk lands on
 // are read from a copy (xs.x_tail).
-template <bool apply_silu, int n_seg, int unroll, int qk_tt, int qk_layout = 0>
+template <bool apply_silu, int n_seg, int unroll, int qk_tt, int qk_layout = 0, bool qk_regs = false>
 static __global__ void __launch_bounds__(32 * n_seg) ssm_conv_front_f32(const float * states, const int32_t * gather_ids,
         const int64_t gather_row, const float * w, const float * bias, float * y, float * qk,
         const ggml_cuda_ssm_conv_snaps snaps, const int64_t C, const int64_t c_v0, const int n_vblocks,
@@ -254,7 +256,6 @@ static __global__ void __launch_bounds__(32 * n_seg) ssm_conv_front_f32(const fl
     static_assert(n_seg % 4 == 0, "a qk block needs 128-thread groups");
     __shared__ float held[n_seg][GGML_CUDA_SSM_CONV_MAX_HOLD][WARP_SIZE];
     __shared__ float st[head * n_prev];
-    __shared__ float buf[qk_tt][head];
 
     ggml_cuda_pdl_sync();
     ggml_cuda_pdl_lc();
@@ -265,6 +266,11 @@ static __global__ void __launch_bounds__(32 * n_seg) ssm_conv_front_f32(const fl
     // the gathered row is the one a deferred in-place SCALE would have rewritten: apply it (scale_f32's expression)
     const bool zeroed = zero_row != nullptr && states == zero_row;
     const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
+    // Give the q/k heads the first CTAs in the short-batch grid. Only chunk 0 reads the cached conv state
+    // and writes snapshots; later chunks start beyond n_prev and read x only, as in the prefill path.
+    const int n_qkblocks = (int) (c_v0 / head) * n_chunks;
+    const int block = qk_regs ? ((int) blockIdx.x < n_qkblocks ? n_vblocks + (int) blockIdx.x :
+                                                                (int) blockIdx.x - n_qkblocks) : (int) blockIdx.x;
 
     // conv output (before SILU) for token t from the window and x(t); the window then moves by one column
     float wr[d_conv];
@@ -285,9 +291,9 @@ static __global__ void __launch_bounds__(32 * n_seg) ssm_conv_front_f32(const fl
         return apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
     };
 
-    if ((int) blockIdx.x < n_vblocks) {
+    if (block < n_vblocks) {
         const int     seg = threadIdx.y;
-        const int64_t c0  = c_v0 + (int64_t) blockIdx.x * WARP_SIZE;
+        const int64_t c0  = c_v0 + (int64_t) block * WARP_SIZE;
         const int64_t c   = c0 + threadIdx.x;
         const int64_t t0  = (int64_t) seg * seg_len;
         const int64_t t1  = min(n_t, t0 + seg_len);
@@ -367,7 +373,7 @@ static __global__ void __launch_bounds__(32 * n_seg) ssm_conv_front_f32(const fl
 
     // qk block: head h, chunk ch
     constexpr int n_sub = threads / head;
-    const int     q     = blockIdx.x - n_vblocks;
+    const int     q     = block - n_vblocks;
     const int     h     = q / n_chunks;
     const int     ch    = q % n_chunks;
     const int64_t c0    = (int64_t) h * head;
@@ -397,54 +403,295 @@ static __global__ void __launch_bounds__(32 * n_seg) ssm_conv_front_f32(const fl
         }
     }
 
-    if (t0 < t1) {
+    if constexpr (qk_regs) {
+        static_assert(qk_layout == 0, "short-batch q/k keep the ordinary token-major layout");
+        static_assert(qk_tt >= n_prev, "later chunks must not read snapshotted conv states");
+        static_assert(qk_tt == n_seg, "one warp per short-batch head/token row");
+        constexpr int cols = head / WARP_SIZE;
+        const int64_t t = tc0 + threadIdx.y;
+        if (t < tc1) {
+            float values[cols];
 #pragma unroll
-        for (int j = 0; j < d_conv; ++j) {
-            wr[j] = w[c * w_c + j];
-        }
-        b = bias != nullptr ? bias[c] : 0.0f;
-        float win[n_prev];
+            for (int i = 0; i < cols; ++i) {
+                const int64_t ci = c0 + i * WARP_SIZE + threadIdx.x;
+                float sumf = 0.0f;
 #pragma unroll
-        for (int j = 0; j < n_prev; ++j) {
-            win[j] = ssm_conv_front_input(st, c0, xs, c, t0 + j, n_prev);
-        }
-        int64_t t = t0;
-        for (; t + unroll <= t1; t += unroll) {
-            float xu[unroll];
-#pragma unroll
-            for (int u = 0; u < unroll; ++u) {
-                xu[u] = xs(t + u, c);
+                for (int j = 0; j < n_prev; ++j) {
+                    sumf += ssm_conv_front_input(st, c0, xs, ci, t + j, n_prev) * w[ci * w_c + j];
+                }
+                sumf += xs(t, ci) * w[ci * w_c + n_prev];
+                sumf += bias != nullptr ? bias[ci] : 0.0f;
+                values[i] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
             }
+            // Identical to l2_norm_f32<32>: ordered per-lane accumulation, XOR 16/8/4/2/1,
+            // the same eps clamp, rsqrtf and final multiply. No new reduced-precision intermediate.
+            float tmp = 0.0f;
 #pragma unroll
-            for (int u = 0; u < unroll; ++u) {
-                buf[t + u - tc0][cl] = conv(win, xu[u]);
+            for (int i = 0; i < cols; ++i) {
+                const float xi = values[i];
+                tmp += xi * xi;
+            }
+            tmp = warp_reduce_sum(tmp);
+            const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+#pragma unroll
+            for (int i = 0; i < cols; ++i) {
+                qk[t * c_v0 + c0 + i * WARP_SIZE + threadIdx.x] = scale * values[i];
             }
         }
-        for (; t < t1; ++t) {
-            buf[t - tc0][cl] = conv(win, xs(t, c));
+    } else {
+        __shared__ float buf[qk_tt][head];
+        if (t0 < t1) {
+#pragma unroll
+            for (int j = 0; j < d_conv; ++j) {
+                wr[j] = w[c * w_c + j];
+            }
+            b = bias != nullptr ? bias[c] : 0.0f;
+            float win[n_prev];
+#pragma unroll
+            for (int j = 0; j < n_prev; ++j) {
+                win[j] = ssm_conv_front_input(st, c0, xs, c, t0 + j, n_prev);
+            }
+            int64_t t = t0;
+            for (; t + unroll <= t1; t += unroll) {
+                float xu[unroll];
+#pragma unroll
+                for (int u = 0; u < unroll; ++u) {
+                    xu[u] = xs(t + u, c);
+                }
+#pragma unroll
+                for (int u = 0; u < unroll; ++u) {
+                    buf[t + u - tc0][cl] = conv(win, xu[u]);
+                }
+            }
+            for (; t < t1; ++t) {
+                buf[t - tc0][cl] = conv(win, xs(t, c));
+            }
+        }
+        __syncthreads();
+
+        // l2_norm_f32<32> per (token, head) row: lane l adds the squares of columns l, l + 32, l + 64, l + 96 in order,
+        // then the warp sums the lanes
+        for (int64_t t = tc0 + tid / WARP_SIZE; t < tc1; t += n_seg) {
+            float tmp = 0.0f;
+#pragma unroll
+            for (int i = 0; i < head / WARP_SIZE; ++i) {
+                const float xi = buf[t - tc0][i * WARP_SIZE + threadIdx.x];
+                tmp += xi * xi;
+            }
+            tmp = warp_reduce_sum(tmp);
+            const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+#pragma unroll
+            for (int i = 0; i < head / WARP_SIZE; ++i) {
+                // The permutation changes addresses only. Each warp still writes the same 32 consecutive words.
+                const int col = qk_layout ? i * WARP_SIZE + (threadIdx.x % 8) * 4 + threadIdx.x / 8
+                                          : i * WARP_SIZE + threadIdx.x;
+                const int64_t row = qk_layout == 2 ? ((int64_t) h * n_t + t) * head : t * c_v0 + c0;
+                qk[row + col] = scale * buf[t - tc0][i * WARP_SIZE + threadIdx.x];
+            }
         }
     }
-    __syncthreads();
+}
 
-    // l2_norm_f32<32> per (token, head) row: lane l adds the squares of columns l, l + 32, l + 64, l + 96 in order,
-    // then the warp sums the lanes
-    for (int64_t t = tc0 + tid / WARP_SIZE; t < tc1; t += n_seg) {
+// Short-batch snapshot ownership is input-independent metadata. An alias of the gathered cache row is the
+// sole exception: chunk 0 takes it over at run time, after reading all of that head's cached state.
+struct ssm_conv_front_short_snaps {
+    ggml_cuda_ssm_conv_snaps snaps;
+    uint32_t mask[16];  // at most ceil(63 / 4) q/k chunks
+};
+
+// I2: cooperative, channel-major input loads instead of I1's four serial global-load/FMA/SFU chains per lane.
+// A q/k CTA owns four token rows. Snapshot work follows those rows, including on nonzero chunks. Mode 2
+// (warp_rows=false) computes four convolutions/channel from seven prefetched inputs and transposes only
+// the SiLU results. Mode 1 keeps the warp/token arithmetic, reading the cooperatively staged inputs.
+template <bool warp_rows>
+static __global__ void __launch_bounds__(128) ssm_conv_front_l2_short_f32(
+        const float * states, const int32_t * gather_ids, const int64_t gather_row, const float * w,
+        float * y, float * qk, const __grid_constant__ ssm_conv_front_short_snaps plan,
+        const int64_t C, const int64_t c_v0, const int n_chunks, const int64_t n_t,
+        const __grid_constant__ ssm_conv_front_x xs,
+        const int64_t w_c, const int64_t y_t, const int hold, const float eps,
+        const float * zero_row, const float zero_scale, const float zero_bias) {
+    constexpr int tile = 4, head = 128, prev = 3, threads = 128;
+    union storage {
+        struct { float state[32 * prev]; float held[4][GGML_CUDA_SSM_CONV_MAX_HOLD][32]; } v;
+        struct { float input[tile + prev][head]; float alias[prev][head]; float out[warp_rows ? 1 : tile][head]; } q;
+    };
+    __shared__ storage sm;
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+    if (gather_ids) states += (int64_t) gather_ids[0] * gather_row;
+    const bool zeroed = zero_row && states == zero_row;
+    const int lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
+    // Like ggml_cuda_gather_rows_kernel: indexed parameter tables must not become a private stack copy.
+    const auto & snaps = plan.snaps;
+    const int n_qkb = (int) (c_v0 / head) * n_chunks;
+
+    if ((int) blockIdx.x >= n_qkb) {
+        // The existing v algorithm: one owner per 32 channels, staged state/snapshots and the same alias holds.
+        const int64_t c0 = c_v0 + ((int) blockIdx.x - n_qkb) * 32;
+        const int64_t c = c0 + lane, seg_len = (n_t + 3) / 4;
+        const int64_t t0 = warp * seg_len, t1 = min(n_t, t0 + seg_len);
+        const bool run = c < C && t0 < t1;
+        for (int e = tid; e < 32 * prev; e += threads) {
+            if (c0 + e / prev < C) {
+                const float a = states[c0 * prev + e];
+                sm.v.state[e] = zeroed ? zero_scale * a + zero_bias : a;
+            }
+        }
+        __syncthreads();
+        for (int e = tid; e < snaps.n * 32 * prev; e += threads) {
+            const int k = e / (32 * prev), r = e % (32 * prev);
+            const int64_t cs = c0 + r / prev;
+            if (cs < C) snaps.dst[k][cs * prev + r % prev] =
+                ssm_conv_front_input(sm.v.state, c0, xs, cs, snaps.col[k] + r % prev, prev);
+        }
+        float wr[4], win[prev];
+        if (run) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) wr[j] = w[c * w_c + j];
+#pragma unroll
+            for (int j = 0; j < prev; ++j)
+                win[j] = ssm_conv_front_input(sm.v.state, c0, xs, c, t0 + j, prev);
+        }
+        __syncthreads();
+        const auto step = [&](const int64_t t, const float xt) {
+            float sumf = 0.0f;
+#pragma unroll
+            for (int j = 0; j < prev; ++j) sumf += win[j] * wr[j];
+            sumf += xt * wr[prev];
+            sumf += 0.0f;
+#pragma unroll
+            for (int j = 0; j < prev - 1; ++j) win[j] = win[j + 1];
+            win[prev - 1] = xt;
+            const float a = ggml_cuda_op_silu_single(sumf);
+            if (t - t0 < hold) sm.v.held[warp][t - t0][lane] = a;
+            else y[t * y_t + c] = a;
+        };
+        if (run) {
+            int64_t t = t0;
+            for (; t + 8 <= t1; t += 8) {
+                float xu[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) xu[u] = xs(t + u, c);
+#pragma unroll
+                for (int u = 0; u < 8; ++u) step(t + u, xu[u]);
+            }
+            for (; t < t1; ++t) step(t, xs(t, c));
+        }
+        if (hold > 0) {
+            __syncthreads();
+            if (run) for (int h = 0; h < hold && t0 + h < t1; ++h)
+                y[(t0 + h) * y_t + c] = sm.v.held[warp][h][lane];
+        }
+        return;
+    }
+
+    const int h = blockIdx.x / n_chunks, ch = blockIdx.x % n_chunks;
+    const int64_t c0 = (int64_t) h * head, c = c0 + tid, tc0 = ch * tile;
+    const int nt = (int) min((int64_t) tile, n_t - tc0);
+    // Every later chunk starts at conv-input column >=4: it never reads cached state, even for snapshots.
+    float xin[tile + prev];
+#pragma unroll
+    for (int j = 0; j < tile + prev; ++j) {
+        const int64_t col = tc0 + j;
+        float a = 0.0f;
+        if (col < prev) {
+            const float v = states[c * prev + col];
+            a = zeroed ? zero_scale * v + zero_bias : v;
+        } else if (col < n_t + prev) a = xs(col - prev, c);
+        xin[j] = a;
+    }
+    // Only chunk 0 needs the extra alias slot. Ballot distributes the pointer comparisons over a warp;
+    // no block barrier or global counter is needed to discover which cache row is being overwritten.
+    uint32_t alias_mask = 0;
+    int alias_idx = -1, alias_col = -1;
+    if (ch == 0) {
+        alias_mask = __ballot_sync(0xffffffff, lane < snaps.n && snaps.dst[lane] == states);
+        alias_idx = __ffs(alias_mask) - 1;
+        if (alias_idx >= 0) alias_col = snaps.col[alias_idx];
+        if (alias_col > tile) {
+#pragma unroll
+            for (int j = 0; j < prev; ++j) sm.q.alias[j][tid] = xs(alias_col + j - prev, c);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < tile + prev; ++j) sm.q.input[j][tid] = xin[j];
+
+    // All global input/weight loads are issued before the first convolution FMA.
+    float wr[warp_rows ? 4 : 1][4];
+    if constexpr (warp_rows) {
+        if (warp < nt) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) wr[i][j] = w[(c0 + i * 32 + lane) * w_c + j];
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) wr[0][j] = w[c * w_c + j];
+#pragma unroll
+        for (int t = 0; t < tile; ++t) {
+            if (t < nt) {
+                float sumf = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) sumf += xin[t + j] * wr[0][j];
+                sumf += 0.0f;
+                sm.q.out[t][tid] = ggml_cuda_op_silu_single(sumf);
+            }
+        }
+    }
+    // One rendezvous for the q/k CTA: publish input/SiLU tiles and finish every cached-state read before
+    // any alias snapshot store. There is no block-wide barrier between the L2 and snapshot phases.
+    __syncthreads();
+    if (warp < nt) {
+        float values[4];
+        if constexpr (warp_rows) {
+            float xrow[4][4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) xrow[i][j] = sm.q.input[warp + j][i * 32 + lane];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                float sumf = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) sumf += xrow[i][j] * wr[i][j];
+                sumf += 0.0f;
+                values[i] = ggml_cuda_op_silu_single(sumf);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) values[i] = sm.q.out[warp][i * 32 + lane];
+        }
         float tmp = 0.0f;
 #pragma unroll
-        for (int i = 0; i < head / WARP_SIZE; ++i) {
-            const float xi = buf[t - tc0][i * WARP_SIZE + threadIdx.x];
-            tmp += xi * xi;
-        }
+        for (int i = 0; i < 4; ++i) { const float xi = values[i]; tmp += xi * xi; }
         tmp = warp_reduce_sum(tmp);
         const float scale = rsqrtf(fmaxf(tmp, eps * eps));
 #pragma unroll
-        for (int i = 0; i < head / WARP_SIZE; ++i) {
-            // The permutation changes addresses only. Each warp still writes the same 32 consecutive words.
-            const int col = qk_layout ? i * WARP_SIZE + (threadIdx.x % 8) * 4 + threadIdx.x / 8
-                                      : i * WARP_SIZE + threadIdx.x;
-            const int64_t row = qk_layout == 2 ? ((int64_t) h * n_t + t) * head : t * c_v0 + c0;
-            qk[row + col] = scale * buf[t - tc0][i * WARP_SIZE + threadIdx.x];
+        for (int i = 0; i < 4; ++i)
+            qk[(tc0 + warp) * c_v0 + c0 + i * 32 + lane] = scale * values[i];
+    }
+
+    uint32_t todo = plan.mask[ch] | alias_mask;
+    int last_col = -1;
+    float sv[prev];
+    while (todo) {
+        const int k = __ffs(todo) - 1;
+        todo &= todo - 1;
+        if (ch != 0 && snaps.dst[k] == states) continue;  // chunk 0 owns the alias slot
+        const int col = snaps.col[k];
+        if (col != last_col) {
+#pragma unroll
+            for (int u = 0; u < prev; ++u) {
+                const int e = tid + u * threads, cs = e / prev, j = e % prev;
+                sv[u] = ch == 0 && col > tile ? sm.q.alias[j][cs] : sm.q.input[col - tc0 + j][cs];
+            }
+            last_col = col;
         }
+        // Coalesced stores, and reuse the three loaded values for repeated columns (15 identical slots at T=1).
+#pragma unroll
+        for (int u = 0; u < prev; ++u) snaps.dst[k][c0 * prev + tid + u * threads] = sv[u];
     }
 }
 
@@ -492,27 +739,61 @@ void ggml_cuda_ssm_conv_front(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int64_t c_v0 = ext.qk ? ext.qk_channels : 0;
     const int     n_vb = (int) ((C - c_v0 + WARP_SIZE - 1) / WARP_SIZE);
 
+    if (n_t < 64 && apply_silu && ext.qk) {
+        // Read at graph construction/capture. Timed launchers may not forward this env: the source default
+        // selects the packaged variant. 0 = measured I1, 1 = staged warp rows, 2 = prefetched channel rows.
+        const char * env = getenv("GGML_CUDA_DOD_CONVL2_MODE");
+        constexpr int default_mode = 2;  // D2 packaged mode; change this one line for timed mode-1 builds.
+        const int mode = env ? atoi(env) : default_mode;
+        if (mode == 1 || mode == 2) {
+            GGML_ASSERT(snaps.width == 3 && n_t >= 1);
+            ssm_conv_front_short_snaps plan = {};
+            plan.snaps = snaps;
+            const int chunks = (int) ((n_t + 3) / 4);
+            for (int k = 0; k < snaps.n; ++k) {
+                const int owner = snaps.col[k] > 0 ? (snaps.col[k] - 1) / 4 : 0;
+                GGML_ASSERT(owner < chunks);
+                plan.mask[owner] |= uint32_t(1) << k;
+            }
+            const int blocks = n_vb + (int) (c_v0 / 128) * chunks;
+            const auto launch_short = [&](auto row_mode) {
+                ggml_cuda_kernel_launch_gb10(cc, ssm_conv_front_l2_short_f32<decltype(row_mode)::value>,
+                    ggml_cuda_kernel_launch_params(dim3(blocks), dim3(32, 4), 0, stream),
+                    states_d, ext.gather_ids, ext.gather_row, w_d, y_d, ext.qk, plan, C, c_v0,
+                    chunks, n_t, xs, w_c, y_t, ext.hold, ext.eps, ext.zero_row, ext.zero_scale, ext.zero_bias);
+            };
+            if (mode == 1) launch_short(std::true_type{});
+            else launch_short(std::false_type{});
+            return;
+        }
+    }
+
     constexpr int unroll = 8;
-    auto launch = [&](auto silu_c, auto seg_c, auto tt_c, auto layout_c) {
+    auto launch = [&](auto silu_c, auto seg_c, auto tt_c, auto layout_c, auto regs_c) {
         constexpr bool silu     = decltype(silu_c)::value;
         constexpr int  n_seg    = decltype(seg_c)::value;
         constexpr int  qk_tt    = decltype(tt_c)::value;
+        constexpr bool regs     = decltype(regs_c)::value;
         const int64_t  seg_len  = (n_t + n_seg - 1) / n_seg;
         const int      n_chunks = (int) ((n_t + qk_tt - 1) / qk_tt);
         const int      n_qkb    = ext.qk ? (int) (c_v0 / 128) * n_chunks : 0;
-        ggml_cuda_kernel_launch_gb10(cc, ssm_conv_front_f32<silu, n_seg, unroll, qk_tt, decltype(layout_c)::value>,
+        ggml_cuda_kernel_launch_gb10(cc, ssm_conv_front_f32<silu, n_seg, unroll, qk_tt, decltype(layout_c)::value, regs>,
             ggml_cuda_kernel_launch_params(dim3((unsigned int) (n_vb + n_qkb)), dim3(WARP_SIZE, n_seg), 0, stream),
             states_d, ext.gather_ids, ext.gather_row, w_d, (const float *) nullptr, y_d, ext.qk, snaps, C, c_v0,
             n_vb, n_chunks, n_t, seg_len, xs, w_c, y_t, ext.hold, ext.eps, ext.zero_row, ext.zero_scale, ext.zero_bias);
     };
-    // Only the prefill SILU/L2 producer has experimental layouts; every unmatched path is the original template.
-    if (n_t >= 64 && apply_silu && ext.qk && ext.qk_layout == 2) {
-        launch(std::true_type{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 2>{});
+    // The short register path has 4 warps/CTA, no q/k output shared-memory buffer, and 4 tokens per q/k CTA.
+    // V blocks, snapshots, deferred zeroing, alias holds and copies use the original code above.
+    if (n_t < 64 && apply_silu && ext.qk) {
+        launch(std::true_type{}, std::integral_constant<int, 4>{}, std::integral_constant<int, 4>{},
+               std::integral_constant<int, 0>{}, std::true_type{});
+    } else if (n_t >= 64 && apply_silu && ext.qk && ext.qk_layout == 2) {
+        launch(std::true_type{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 2>{}, std::false_type{});
     } else if (n_t >= 64) {
-        if (apply_silu) launch(std::true_type{},  std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 0>{});
-        else            launch(std::false_type{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 0>{});
+        if (apply_silu) launch(std::true_type{},  std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 0>{}, std::false_type{});
+        else            launch(std::false_type{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 0>{}, std::false_type{});
     } else {
-        if (apply_silu) launch(std::true_type{},  std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 0>{});
-        else            launch(std::false_type{}, std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 0>{});
+        if (apply_silu) launch(std::true_type{},  std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 0>{}, std::false_type{});
+        else            launch(std::false_type{}, std::integral_constant<int, 4>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 0>{}, std::false_type{});
     }
 }

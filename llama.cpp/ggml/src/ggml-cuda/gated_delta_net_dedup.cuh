@@ -24,7 +24,142 @@ static __device__ __forceinline__ void gdn_dedup_store_header(
     }
 }
 
-template <bool RAW, bool G_PRECOMPUTED, bool LAZY, bool REUSE_QUOTIENT = false>
+// G1 i2: the original FP recurrence with a single-read base/hash path and
+// warp-private, two-token cp.async replay staging. No FP arithmetic is reordered.
+// A 4x4 register transpose swaps the column register with lane bits 3/4.
+// It is self-inverse: natural [column][r] <-> l8 [old lane group][r].
+static __device__ __forceinline__ void gdn_g1_transpose(float (&s)[GDN_L8_ROWS]) {
+    const int lane = threadIdx.x;
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        float x0=s[r], x1=s[4+r], x2=s[8+r], x3=s[12+r];
+        float a=__shfl_xor_sync(0xffffffff, (lane&8) ? x0 : x1, 8, 32);
+        float b=__shfl_xor_sync(0xffffffff, (lane&8) ? x2 : x3, 8, 32);
+        if (lane&8) { x0=a; x2=b; } else { x1=a; x3=b; }
+        a=__shfl_xor_sync(0xffffffff, (lane&16) ? x0 : x2, 16, 32);
+        b=__shfl_xor_sync(0xffffffff, (lane&16) ? x1 : x3, 16, 32);
+        if (lane&16) { x0=a; x1=b; } else { x2=a; x3=b; }
+        s[r]=x0; s[4+r]=x1; s[8+r]=x2; s[12+r]=x3;
+    }
+}
+
+// Read each base word once, hashing it in the original c/r order, then put the
+// same bits into the recurrence's register layout. Guard failure still falls
+// back to curr_state; the checksum is neither skipped nor weakened.
+static __device__ __forceinline__ uint32_t gdn_g1_load_base(
+        const float * base, int col, bool evs, float (&s)[GDN_L8_ROWS]) {
+    const int lane=threadIdx.x;
+    uint32_t h=0x811c9dc5u ^ uint32_t(lane);
+#pragma unroll
+    for (int c=0; c<4; ++c) {
+#pragma unroll
+        for (int r=0; r<4; ++r) {
+            const float x=gdn_ld(evs, &base[(col+c)*128+r*32+lane]);
+            s[c*4+r]=x;
+            h=gdn_lazy_mix(h, __float_as_uint(x));
+        }
+    }
+    h=gdn_lazy_warp_hash<32>(h);
+    gdn_g1_transpose(s);
+    return h;
+}
+
+// Hash the actual values being stored, in the old hash order. There is no
+// store->syncwarp->global reload. Preserve the l8 registers for the main loop.
+static __device__ __forceinline__ uint32_t gdn_g1_store_base(
+        float * base, int col, bool evs, const float (&s)[GDN_L8_ROWS]) {
+    const int lane=threadIdx.x;
+    float old[GDN_L8_ROWS];
+#pragma unroll
+    for (int j=0; j<GDN_L8_ROWS; ++j) old[j]=s[j];
+    gdn_g1_transpose(old);
+    uint32_t h=0x811c9dc5u ^ uint32_t(lane);
+#pragma unroll
+    for (int c=0; c<4; ++c) {
+#pragma unroll
+        for (int r=0; r<4; ++r) {
+            const float x=old[c*4+r];
+            gdn_st(evs, &base[(col+c)*128+r*32+lane], x);
+            h=gdn_lazy_mix(h, __float_as_uint(x));
+        }
+    }
+    return gdn_lazy_warp_hash<32>(h);
+}
+
+static __device__ __forceinline__ void gdn_g1_copy4(float * dst, const float * src) {
+    const unsigned int sm=static_cast<unsigned int>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(sm), "l"(src) : "memory");
+}
+
+// One warp cooperatively copies its K row, four V columns and two gates.
+// GD1 and GD2 remain unchanged, including odd (130-float) GD2 token strides.
+// Four-byte copies require no new alignment or repacking of either format.
+static __device__ __forceinline__ void gdn_g1_stage_replay(
+        float * dst, const float * rec, const float * shared_rec, bool v2, int t) {
+    const int lane=threadIdx.x;
+    const float * tok=v2 ? shared_rec+GDN_LAZY_HDR+t*130 : rec+GDN_LAZY_HDR+t*146;
+    const float * tv=v2 ? rec+GDN_LAZY_HDR+t*16 : tok+128;
+#pragma unroll
+    for (int r=0; r<4; ++r) {
+        const int i=r*32+lane;
+        gdn_g1_copy4(&dst[(r*8+lane%8)*4+lane/8], &tok[i]);
+    }
+    if (lane<4) gdn_g1_copy4(&dst[128+lane], &tv[threadIdx.y*4+lane]);
+    if (lane<2) gdn_g1_copy4(&dst[132+lane], &tok[(v2 ? 128 : 144)+lane]);
+    asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+static __device__ __forceinline__ bool gdn_g1_replay(
+        float (&s)[GDN_L8_ROWS], const float * base, int col, bool evs, uint32_t checksum,
+        const float * rec, const float * shared_rec, bool v2, int count) {
+    // 4352 B total. Private warp buffers preserve the old per-warp checksum
+    // fallback behavior without adding a CTA barrier inside the replay loop.
+    __shared__ __align__(16) float buffer[4][2][136];
+    const int lane=threadIdx.x, n=lane%8, grp=lane/8;
+    if (count>0) gdn_g1_stage_replay(buffer[threadIdx.y][0],rec,shared_rec,v2,0);
+    if (count>1) gdn_g1_stage_replay(buffer[threadIdx.y][1],rec,shared_rec,v2,1);
+    // Metadata was checked by the caller. Prefetch the first two payloads
+    // while the base and its full old checksum are loaded and transposed.
+    if (gdn_g1_load_base(base,col,evs,s)!=checksum) {
+        asm volatile("cp.async.wait_all;" ::: "memory");
+        __syncwarp();
+        return false;
+    }
+    if (count==0) return true;
+#pragma unroll 1
+    for (int t=0; t<count; ++t) {
+        // Wait for the current token, leaving only the following token in flight.
+        // The earlier current-input copy group is also completed by this wait.
+        if (t+1<count) { asm volatile("cp.async.wait_group 1;" ::: "memory"); }
+        else { asm volatile("cp.async.wait_all;" ::: "memory"); }
+        __syncwarp();
+        const float * tok=buffer[threadIdx.y][t&1];
+        const float g_val=tok[132], beta_val=tok[133];
+        float kr[GDN_L8_ROWS];
+        float p[4];
+#pragma unroll
+        for (int r=0; r<4; ++r) {
+            const float4 k4=*(const float4 *)&tok[(r*8+n)*4];
+            kr[r]=k4.x; kr[4+r]=k4.y; kr[8+r]=k4.z; kr[12+r]=k4.w;
+        }
+#pragma unroll
+        for (int m=0; m<4; ++m) {
+            p[m]=0.0f;
+#pragma unroll
+            for (int r=0; r<4; ++r) p[m]+=s[m*4+r]*kr[m*4+r];
+        }
+        const float kv_col=gdn_l8_reduce(p);
+        const float delta_col=(tok[128+grp]-g_val*kv_col)*beta_val;
+#pragma unroll
+        for (int j=0; j<GDN_L8_ROWS; ++j) s[j]=g_val*s[j]+kr[j]*delta_col;
+        // All shared reads finish before this buffer is recycled for token t+2.
+        __syncwarp();
+        if (t+2<count) gdn_g1_stage_replay(buffer[threadIdx.y][t&1],rec,shared_rec,v2,t+2);
+    }
+    return true;
+}
+
+template <bool RAW, bool G_PRECOMPUTED, bool LAZY, bool REUSE_QUOTIENT = false, bool G1 = false>
 __global__ void __launch_bounds__(128, 6)
 gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v, const float * g, const float * beta,
                         const float * raw_dt_bias, const float * raw_a, const float * curr_state, float * dst,
@@ -139,8 +274,10 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
             const bool v2_ok = shared_rec && sh[0] == GDN_DEDUP_MAGIC && sh[1] == uint32_t(W) && sh[3] == rgen &&
                                (!dedup || rgen + 1u == gen);
             if ((hdr[0] == GDN_LAZY_MAGIC || v2_ok) && W >= 1 && W <= K && rb <= W && 2 + (int) gridDim.z <= K &&
-                    (rb > 0 || (hdr[2] == GDN_LAZY_NOFINAL && gdn_lazy_slot0_marked(curr_state, col, S_v))) &&
-                    gdn_l8_base_checksum(base, col, lane) == hdr[4 + threadIdx.y]) {
+                    (rb > 0 || (hdr[2] == GDN_LAZY_NOFINAL && gdn_lazy_slot0_marked(curr_state, col, S_v)))) {
+                if constexpr (G1) {
+                    replayed=gdn_g1_replay(s,base,col,evs,hdr[4+threadIdx.y],rec,shared_rec,v2,W-int(rb));
+                } else if (gdn_l8_base_checksum(base, col, lane) == hdr[4 + threadIdx.y]) {
 #pragma unroll
                 for (int m = 0; m < 4; ++m) {
 #pragma unroll
@@ -175,6 +312,7 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
                     }
                 }
                 replayed = true;
+                }
             }
         }
     }
@@ -217,6 +355,9 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
         // gdn_lazy_store_base at token 0, and gdn_lazy_store_inputs of every token from the staged inputs, before
         // the recurrence: the loop below then stores nothing to global memory
         float * base = state + state_slot_stride;
+        if constexpr (G1) {
+            lazy_cs=gdn_g1_store_base(base,col,evs,s);
+        } else {
 #pragma unroll
         for (int m = 0; m < 4; ++m) {
 #pragma unroll
@@ -226,6 +367,7 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
         }
         __syncwarp();
         lazy_cs = gdn_l8_base_checksum(base, col, lane);
+        }
 
         float * rec = state + (2 + blockIdx.z) * state_slot_stride + GDN_LAZY_HDR;
         if (dedup) {

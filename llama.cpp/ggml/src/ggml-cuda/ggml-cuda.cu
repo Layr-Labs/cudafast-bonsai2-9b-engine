@@ -4749,12 +4749,15 @@ static const ggml_tensor * ggml_cuda_gdn_prefill_layout_consumer(const ggml_cgra
 // With gather, conv_states come from the cache row of a skipped GET_ROWS. The early writes (SILU output, L2_NORM
 // output, snapshots) must not touch memory any other node up to the last skipped one reads or writes.
 // dry_run only checks. GGML_CUDA_CONV_FRONT_FUSION=0 disables it, GGML_CUDA_CONV_FRONT_L2=0 the L2_NORM part.
+// GGML_CUDA_DOD_CONVL2=0 restores the separate L2_NORM for batches below 64 tokens.
 static bool ggml_cuda_try_conv_front(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx,
                                      std::vector<char> & skip, const ggml_cuda_conv_gather * gather, bool dry_run) {
     static const bool disabled = getenv("GGML_CUDA_CONV_FRONT_FUSION") != nullptr &&
                                  atoi(getenv("GGML_CUDA_CONV_FRONT_FUSION")) == 0;
     static const bool l2_disabled = getenv("GGML_CUDA_CONV_FRONT_L2") != nullptr &&
                                     atoi(getenv("GGML_CUDA_CONV_FRONT_L2")) == 0;
+    static const bool short_l2_disabled = getenv("GGML_CUDA_DOD_CONVL2") != nullptr &&
+                                          atoi(getenv("GGML_CUDA_DOD_CONVL2")) == 0;
     if (disabled || ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_DGX_SPARK) {
         return false;
     }
@@ -4878,9 +4881,9 @@ static bool ggml_cuda_try_conv_front(ggml_backend_cuda_context & ctx, const ggml
     int                 l2_idx = -1;
     int64_t             qk_channels = 0;
     int64_t             x_tail_t0   = INT64_MAX;
-    // prefill-sized batches only: for a 16-token verify the per-head blocks (16 dependent steps, all of the head's
-    // snapshots) take longer than the l2_norm launch they save
-    if (!l2_disabled && n_t >= 64 && !(silu->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    // Short batches use a four-token producer with distributed snapshots (DOD_CONVL2_MODE selects its
+    // channel-prefetch or warp-row variant). All of the existing allocation/lifetime checks still apply.
+    if (!l2_disabled && (n_t >= 64 || !short_l2_disabled) && !(silu->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         std::vector<std::pair<const ggml_tensor *, int>> silu_views;
         const int silu_uses = ggml_node_get_use_count(cgraph, silu_idx);
         bool      ok        = true;
@@ -6714,6 +6717,28 @@ static void ggml_cuda_dirty_mark_graph(const ggml_cgraph * cgraph, cudaStream_t 
     }
 }
 
+// D1: all three independent attention projections keep their own outputs. The
+// graph builder places them together, so no write moves across an intervening
+// operation or across the allocator's lifetime boundaries.
+static int ggml_cuda_try_dod_qkv(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int i) {
+    if (!ggml_cuda_dod_qkv_enabled() || i + 2 >= graph->n_nodes) { return 0; }
+    ggml_tensor * out[3] = {graph->nodes[i], graph->nodes[i + 1], graph->nodes[i + 2]};
+    for (int s = 0; s < 3; ++s) {
+        if (out[s]->op != GGML_OP_MUL_MAT || !(out[s]->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                out[s]->view_src || !out[s]->src[0] || !out[s]->src[1] ||
+                out[s]->src[1] != out[0]->src[1]) { return 0; }
+        for (int t = 0; t < s; ++t) {
+            const uintptr_t a = uintptr_t(out[s]->data), b = uintptr_t(out[t]->data);
+            if (a < b + ggml_nbytes(out[t]) && b < a + ggml_nbytes(out[s])) { return 0; }
+        }
+    }
+    const auto * pre = ctx.fwht_q8().find(out[0]->src[1]);
+    if (!pre || !pre->mmq_d4 || pre->ne0 != 4096 || pre->ncols != out[0]->src[1]->ne[1]) { return 0; }
+    const int outputs[] = {i, i + 1, i + 2};
+    if (!ggml_cuda_check_fusion_memory_ranges(graph, i, 3, outputs, 3)) { return 0; }
+    return ggml_cuda_mul_mat_q_dod_qkv(ctx, out[0], out[1], out[2], pre->data) ? 3 : 0;
+}
+
 // C62 (attention glue). Q / K path of the multi-section RoPE models (Qwen3.5 target: IMROPE, DFlash2 drafter: MROPE):
 //   RMS_NORM -> MUL(w) -> ROPE                                   (Q)
 //   RMS_NORM -> MUL(w) -> ROPE -> VIEW -> SET_ROWS [-> VIEW(V) -> SET_ROWS(V)]   (K, and the V store that follows it)
@@ -6721,7 +6746,16 @@ static void ggml_cuda_dirty_mark_graph(const ggml_cgraph * cgraph, cudaStream_t 
 // norm/neox modes only. Consecutive nodes; the norm, the product and the rope are read only inside the chain; the
 // V view is read only by its SET_ROWS and its source was computed before the chain. Returns the nodes consumed
 // after node i, or -1. GGML_CUDA_MROPE_FUSION=0 disables it.
-static int ggml_cuda_try_rms_norm_mul_mrope(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+struct ggml_cuda_mrope_fusion {
+    ggml_tensor * rms;
+    ggml_tensor * mul;
+    ggml_tensor * rope;
+    ggml_tensor * set_rows;
+    ggml_tensor * v_view;
+    ggml_tensor * v_set_rows;
+};
+
+static int ggml_cuda_plan_rms_norm_mul_mrope(ggml_cgraph * cgraph, int i, ggml_cuda_mrope_fusion & plan) {
     static const bool disabled = getenv("GGML_CUDA_MROPE_FUSION") != nullptr && atoi(getenv("GGML_CUDA_MROPE_FUSION")) == 0;
     if (disabled || i + 2 >= cgraph->n_nodes) {
         return -1;
@@ -6791,16 +6825,85 @@ static int ggml_cuda_try_rms_norm_mul_mrope(ggml_backend_cuda_context & ctx, ggm
             return -1;
         }
     }
-    ggml_cuda_op_rms_norm_mul_mrope_fused(ctx, rms, mul, rope, set_rows, v_view, v_set_rows);
+    plan = {rms, mul, rope, set_rows, v_view, v_set_rows};
+    return set_rows == nullptr ? 2 : (v_set_rows == nullptr ? 4 : 6);
+}
+
+static int ggml_cuda_try_rms_norm_mul_mrope(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_cuda_mrope_fusion p;
+    const int skip = ggml_cuda_plan_rms_norm_mul_mrope(cgraph, i, p);
+    if (skip < 0) { return -1; }
+    ggml_cuda_op_rms_norm_mul_mrope_fused(ctx, p.rms, p.mul, p.rope, p.set_rows, p.v_view, p.v_set_rows);
     static uint32_t logged = 0;
-    const int kind = set_rows == nullptr ? 0 : (v_set_rows == nullptr ? 1 : 2);
-    const int bit  = kind*8 + (int) std::min<int64_t>(rms->src[0]->ne[2] > 16 ? 2 : (rms->src[0]->ne[2] > 1 ? 1 : 0), 7);
+    const int kind = p.set_rows == nullptr ? 0 : (p.v_set_rows == nullptr ? 1 : 2);
+    const int bit = kind*8 + int(p.rms->src[0]->ne[2] > 16 ? 2 : (p.rms->src[0]->ne[2] > 1 ? 1 : 0));
     if (!(logged & (1u << bit))) {
         logged |= 1u << bit;
-        GGML_LOG_INFO("%s: %s [%" PRId64 ", %" PRId64 ", %" PRId64 "] mode %d%s%s\n", __func__, rope->name, rope->ne[0], rope->ne[1],
-                      rope->ne[2], ((const int32_t *) rope->op_params)[2], set_rows ? " + K store" : "", v_set_rows ? " + V store" : "");
+        GGML_LOG_INFO("%s: %s [%" PRId64 ", %" PRId64 ", %" PRId64 "] mode %d%s%s\n", __func__, p.rope->name,
+                      p.rope->ne[0], p.rope->ne[1], p.rope->ne[2], ((const int32_t *)p.rope->op_params)[2],
+                      p.set_rows ? " + K store" : "", p.v_set_rows ? " + V store" : "");
     }
-    return set_rows == nullptr ? 2 : (v_set_rows == nullptr ? 4 : 6);
+    return skip;
+}
+
+// The only nodes crossed are metadata views of values produced before Q's
+// norm. All outputs are checked against both chains' external inputs, because
+// the ordinary sequential graph allocator may reuse a norm temporary.
+static int ggml_cuda_try_dod_qk_mrope(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    static const bool enabled = getenv("GGML_CUDA_DOD_QKV_MROPE") == nullptr || atoi(getenv("GGML_CUDA_DOD_QKV_MROPE")) != 0;
+    if (!enabled || !ggml_cuda_dod_qkv_enabled() || ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_DGX_SPARK) { return -1; }
+    ggml_cuda_mrope_fusion q, k;
+    const int qs = ggml_cuda_plan_rms_norm_mul_mrope(graph, i, q);
+    if (qs != 2) { return -1; }
+    const auto * qx = q.rms->src[0];
+    if (qx->ne[0] != 256 || qx->ne[1] != 16 || qx->ne[2] < 9 || qx->ne[2] > 16) { return -1; }
+    int j = i + 3;
+    while (j < graph->n_nodes && j <= i + 6 && ggml_cuda_is_view_or_noop(graph->nodes[j])) {
+        if (graph->nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT) { return -1; }
+        ++j;
+    }
+    const int ks = ggml_cuda_plan_rms_norm_mul_mrope(graph, j, k);
+    if (ks < 0 || k.rms->src[0]->ne[0] != 256 || k.rms->src[0]->ne[1] != 4 ||
+            k.rms->src[0]->ne[2] != qx->ne[2] ||
+            ((const int32_t *)q.rope->op_params)[2] != ((const int32_t *)k.rope->op_params)[2]) { return -1; }
+    // Only pair the registered layer's QG and K, with all three projections
+    // before this chain. This also keeps short/serial/prefill graphs untouched.
+    const ggml_tensor * qr = qx->view_src ? qx->view_src : qx;
+    const auto * kx = k.rms->src[0];
+    const ggml_tensor * kr = kx->view_src ? kx->view_src : kx;
+    if (qr->op != GGML_OP_MUL_MAT || kr->op != GGML_OP_MUL_MAT || !qr->src[0] || !kr->src[0]) { return -1; }
+    const auto * group = ggml_cuda_dod_qkv_find(qr->src[0]->data);
+    if (!group || group->src[1] != kr->src[0]->data) { return -1; }
+    const auto * qw = q.mul->src[0] == q.rms ? q.mul->src[1] : q.mul->src[0];
+    const auto * kw = k.mul->src[0] == k.rms ? k.mul->src[1] : k.mul->src[0];
+    const ggml_tensor * inputs[] = {qx, kx, qw, kw, q.rope->src[1], k.rope->src[1],
+        k.set_rows ? k.set_rows->src[1] : nullptr, k.v_view,
+        k.v_set_rows ? k.v_set_rows->src[1] : nullptr};
+    const ggml_tensor * outputs[] = {q.rope, k.set_rows ? k.set_rows : k.rope, k.v_set_rows};
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t x = uintptr_t(a->data), y = uintptr_t(b->data);
+        return x < y + ggml_nbytes(b) && y < x + ggml_nbytes(a);
+    };
+    for (int o = 0; o < 3; ++o) {
+        if (!outputs[o]) { continue; }
+        for (const auto * in : inputs) { if (in && overlap(outputs[o], in)) { return -1; } }
+        for (int p = 0; p < o; ++p) { if (outputs[p] && overlap(outputs[o], outputs[p])) { return -1; } }
+    }
+    // No crossed metadata node may depend on either chain's elided values.
+    for (int n = i + 3; n < j; ++n) {
+        const auto * node = graph->nodes[n];
+        const auto * root = node->view_src ? node->view_src : node->src[0];
+        for (int t = i; t <= i + 2; ++t) { if (root == graph->nodes[t]) { return -1; } }
+    }
+    ggml_cuda_op_rms_norm_mul_mrope_qk(ctx, q.rms, q.mul, q.rope, k.rms, k.mul, k.rope,
+                                     k.set_rows, k.v_view, k.v_set_rows);
+    static bool logged = false;
+    if (!logged) {
+        GGML_LOG_INFO("%s: Q/K norm+MROPE together%s%s; original per-row arithmetic\n", __func__,
+                      k.set_rows ? " + K store" : "", k.v_set_rows ? " + V store" : "");
+        logged = true;
+    }
+    return j + ks - i;
 }
 
 // C62: the attention output gate MUL(attn, SIGMOID(CONT(view of the joint Q|gate projection))) in front of the signed
@@ -7330,7 +7433,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // attention: RMS_NORM * w + MROPE (+ K and V cache stores) as one kernel (C62)
                 if (node->op == GGML_OP_RMS_NORM && !is_concurrent_event_active) {
-                    const int skip = ggml_cuda_try_rms_norm_mul_mrope(*cuda_ctx, cgraph, i);
+                    const int pair_skip = stream_ctx.concurrent_events.empty() ? ggml_cuda_try_dod_qk_mrope(*cuda_ctx, cgraph, i) : -1;
+                    const int skip = pair_skip >= 0 ? pair_skip : ggml_cuda_try_rms_norm_mul_mrope(*cuda_ctx, cgraph, i);
                     if (skip >= 0) {
                         i += skip;
                         continue;
@@ -7365,6 +7469,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 // prefill gate/up pair as one GEMM writing the SWIGLU value (its GLU is then prefused)
                 if (node->op == GGML_OP_MUL_MAT && !is_concurrent_event_active && stream_ctx.concurrent_events.empty()) {
+                    const int qkv_consumed = ggml_cuda_try_dod_qkv(*cuda_ctx, cgraph, i);
+                    if (qkv_consumed > 0) {
+                        i += qkv_consumed - 1;
+                        continue;
+                    }
                     const int glu_consumed = ggml_cuda_try_prefill_glu(*cuda_ctx, cgraph, i);
                     if (glu_consumed > 0) {
                         i += glu_consumed - 1;
@@ -8968,6 +9077,21 @@ static size_t ggml_backend_cuda_register_decode_layout(const ggml_tensor * tenso
     return ggml_cuda_dl_register(tensor->data, tensor->ne[1], tensor->ne[0], tensor->type);
 }
 
+static size_t ggml_backend_cuda_register_dod_qkv(const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v) {
+    if (!ggml_cuda_dod_qkv_enabled()) { return 0; }
+    const ggml_tensor * weights[] = {q, k, v};
+    int device = -1;
+    for (const auto * w : weights) {
+        if (!w || !w->buffer || !w->data || w->view_src || !ggml_backend_buffer_is_cuda(w->buffer) ||
+                w->type != GGML_TYPE_PQ2_0 || !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1) { return 0; }
+        const auto * ctx = (const ggml_backend_cuda_buffer_context *)w->buffer->context;
+        if (device >= 0 && device != ctx->device) { return 0; }
+        device = ctx->device;
+    }
+    ggml_cuda_set_device(device);
+    return ggml_cuda_dod_qkv_register(q->data, k->data, v->data);
+}
+
 // GB10: row-interleaved prefill copy of a layer's ffn_gate/ffn_up (ggml_cuda_glu_pair). Returns the bytes allocated.
 static size_t ggml_backend_cuda_register_prefill_glu_pair(const ggml_tensor * gate, const ggml_tensor * up) {
     if (gate == nullptr || up == nullptr || gate->buffer == nullptr || up->buffer == nullptr || gate->data == nullptr ||
@@ -8990,6 +9114,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_cuda_register_decode_layout") == 0) {
         return (void *)ggml_backend_cuda_register_decode_layout;
+    }
+    if (strcmp(name, "ggml_backend_cuda_register_dod_qkv") == 0) {
+        return (void *)ggml_backend_cuda_register_dod_qkv;
     }
     if (strcmp(name, "ggml_backend_cuda_register_prefill_glu_pair") == 0) {
         return (void *)ggml_backend_cuda_register_prefill_glu_pair;

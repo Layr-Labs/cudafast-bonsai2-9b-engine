@@ -14,3 +14,8 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx, ggml_
 bool ggml_cuda_rms_norm_mul_mrope_supported(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * rope);
 void ggml_cuda_op_rms_norm_mul_mrope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul,
         ggml_tensor * rope, ggml_tensor * set_rows, ggml_tensor * v_view, ggml_tensor * v_set_rows);
+
+void ggml_cuda_op_rms_norm_mul_mrope_qk(ggml_backend_cuda_context & ctx,
+        ggml_tensor * qrms, ggml_tensor * qmul, ggml_tensor * qrope,
+        ggml_tensor * krms, ggml_tensor * kmul, ggml_tensor * krope,
+        ggml_tensor * kstore, ggml_tensor * vview, ggml_tensor * vstore);

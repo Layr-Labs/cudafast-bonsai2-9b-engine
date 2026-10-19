@@ -364,6 +364,26 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, query_input, model.layers[il].wq_s);
     cb(Qcur_full, "Qcur_full", il);
 
+    // Make the independent decode projections adjacent before allocating the
+    // norm/RoPE intermediates. No work is performed here and prefill keeps its
+    // graph order. A declined CUDA matcher still runs all three separate ops.
+    static const bool dod_qkv_enabled = getenv("GGML_CUDA_DOD_QKV") == nullptr ||
+                                        atoi(getenv("GGML_CUDA_DOD_QKV")) != 0;
+    const auto & layer = model.layers[il];
+    const bool dod_qkv = dod_qkv_enabled && !rows_selected && n_outputs == n_tokens && n_tokens >= 9 && n_tokens <= 16 &&
+        loras->empty() && !layer.wq_s && !layer.wk_s && !layer.wv_s &&
+        layer.wq->type == GGML_TYPE_PQ2_0 && layer.wk->type == GGML_TYPE_PQ2_0 && layer.wv->type == GGML_TYPE_PQ2_0 &&
+        layer.wq->ne[0] == 4096 && layer.wq->ne[1] == 8192 && layer.wk->ne[1] == 1024 && layer.wv->ne[1] == 1024;
+    ggml_tensor * Kcur = nullptr;
+    ggml_tensor * Vcur = nullptr;
+    if (dod_qkv) {
+        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        ggml_build_forward_expand(gf, Qcur_full);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+    }
+
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_queries,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
@@ -373,10 +393,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
 
-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    if (!Kcur) { Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s); }
     cb(Kcur, "Kcur", il);
 
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    if (!Vcur) { Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s); }
     cb(Vcur, "Vcur", il);
 
     // Apply K normalization

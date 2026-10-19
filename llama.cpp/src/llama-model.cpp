@@ -2161,6 +2161,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+    // Attention decode: replace three TM allocations with one verbatim QG|K|V
+    // copy. The original GGUF tensors and all prefill paths are unchanged.
+    if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA")) {
+        using register_qkv_fn_t = size_t (*)(const ggml_tensor *, const ggml_tensor *, const ggml_tensor *);
+        auto * fn = (register_qkv_fn_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_register_dod_qkv");
+        if (fn) {
+            std::unordered_map<std::string, ggml_tensor *> by_name;
+            for (const auto & [name, tensor] : tensors_by_name) { by_name.emplace(name, tensor); }
+            size_t bytes = 0;
+            int count = 0;
+            const std::string suffix = ".attn_q.weight";
+            for (const auto & [name, q] : tensors_by_name) {
+                if (!q || name.size() <= suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix)) { continue; }
+                const std::string prefix = name.substr(0, name.size() - suffix.size());
+                const auto k = by_name.find(prefix + ".attn_k.weight");
+                const auto v = by_name.find(prefix + ".attn_v.weight");
+                if (k == by_name.end() || v == by_name.end()) { continue; }
+                const size_t b = fn(q, k->second, v->second);
+                bytes += b;
+                count += b > 0;
+            }
+            if (count) {
+                LLAMA_LOG_INFO("%s: GB10 QG|K|V decode copies of %d layer(s), %.2f MiB (replacing three copies per layer)\n",
+                               __func__, count, bytes/1024.0/1024.0);
+            }
+        }
+    }
     // ffn_gate and ffn_up of a layer read the same input: a row-interleaved copy of the pair lets the prefill GEMM write
     // silu(gate)*up directly (ggml-cuda ggml_cuda_mul_mat_q_glu); the blocks are copied verbatim.
     // LLAMA_PREFILL_GLU_PAIR=0 makes no copies.

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 // GB10 (sm_121) decode layout ("DL") of the J=16 MMQ weights, plus the streaming J=16 kernels that read it.
 //
 // The decode layout is a load-time copy of a PQ2_0 / Q8_0 weight matrix whose 34-byte blocks are only
@@ -931,6 +933,9 @@ struct ggml_cuda_dl_entry {
     ggml_type    type;
     ggml_type    dl_type; // group format of the copy: type, or GGML_TYPE_PTQ1_0 for a PQ2_0 weight (C51)
     char       * dl_tm64 = nullptr; // optional Q8 copy; dl always retains TM128 for fallback
+    // DOD QKV entries keep independent lookup keys and point into one allocation.
+    // Shared ownership also covers buffers being unregistered in separate calls.
+    std::shared_ptr<char> dl_owner;
 };
 
 // Only measured Q8 FFN and encoder shapes. This is independent of input data;
@@ -1131,4 +1136,188 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
             nullptr, nullptr, args.dst, tmp_fixup, blocks_per_ne00_fd, (int) args.nrows_x, (int) args.ncols_dst,
             (int) args.nrows_dst, one_fd, (int) args.stride_channel_dst, one_fd, (int) args.stride_sample_dst, one_fd);
     }
+}
+
+
+// D1: the same signed-PTQ1 ring arithmetic as mmq-j16-dl.cuh. The combined
+// mode partitions all 80 tiles over 48 CTAs (fp32 reassociation). GROUPED
+// preserves the separate 64/8/8-tile partitions, each over 48 CTAs.
+struct ggml_cuda_dod_qkv_args {
+    const char * x;
+    const int * y;
+    float * dst;
+    float * dst_hi;
+    float * dst_hi2;
+    int stride[3];
+    int ncols;
+};
+
+static_assert(ggml_cuda_mmq_get_config_gb10(GGML_TYPE_PQ2_0, 16, false).I == 128, "D1 uses the original 128-row tiles");
+static_assert(ggml_cuda_mmq_get_config_gb10(GGML_TYPE_PQ2_0, 16, false).nthreads/2 == 128, "D1 fixup uses four warps");
+static_assert(ggml_cuda_mmq_get_config_gb10(GGML_TYPE_PQ2_0, 16, false).K_vram == MMQ_ITER_K, "D1 keeps the original K alignment");
+
+static __host__ __device__ __forceinline__ int ggml_cuda_dod_qkv_start(int b, int rows, int nkb) {
+    int kb = int(int64_t(b)*(rows/128)*nkb/48);
+    kb -= (kb % nkb) % (MMQ_ITER_K/QK_PQ2_0);
+    return kb;
+}
+
+static __device__ __forceinline__ float * ggml_cuda_dod_qkv_dst(
+        const ggml_cuda_dod_qkv_args & a, int & row, int & stride) {
+    if (row < 8192) {
+        stride = a.stride[0];
+        return a.dst;
+    }
+    if (row < 9216) {
+        row -= 8192;
+        stride = a.stride[1];
+        return a.dst_hi;
+    }
+    row -= 9216;
+    stride = a.stride[2];
+    return a.dst_hi2;
+}
+
+template <bool GROUPED>
+__launch_bounds__(16*32, 1)
+static __global__ void mul_mat_q_dod_qkv_ring(ggml_cuda_dod_qkv_args a, float * tmp_fixup) {
+    constexpr int GB = sizeof(block_ptq1_0), I = 128, J = 16, S = 3, SPS = 2;
+    constexpr int K = 4096, nkb = K/QK_PQ2_0, XB = I*GB;
+    constexpr int YB = J*int(sizeof(block_q8_1_mmq));
+    constexpr int SB = ggml_cuda_dl_ring_stage_bytes<GGML_CUDA_DL_FMT_PTQ1S, SPS>();
+    const int problem = GROUPED ? int(blockIdx.x)/48 : 0;
+    const int b = GROUPED ? int(blockIdx.x)%48 : int(blockIdx.x);
+    const int rows = GROUPED ? (problem == 0 ? 8192 : 1024) : 10240;
+    const int row_base = GROUPED ? (problem == 0 ? 0 : 8192 + (problem - 1)*1024) : 0;
+    const int begin = ggml_cuda_dod_qkv_start(b, rows, nkb);
+    const int total = ggml_cuda_dod_qkv_start(b + 1, rows, nkb) - begin;
+    int it = begin/nkb, st = begin % nkb;
+    const int nstages = (total + SPS - 1)/SPS;
+    const char * x = a.x + int64_t(row_base)*nkb*GB;
+    const int * y = a.y;
+    const int tid = threadIdx.y*32 + threadIdx.x;
+    const uint32_t yb_bytes = uint32_t(a.ncols*int(sizeof(block_q8_1_mmq)));
+    extern __shared__ __align__(128) char ggml_cuda_dod_qkv_smem[];
+    char * smem = ggml_cuda_dod_qkv_smem;
+    uint64_t * full = (uint64_t *)(smem + S*SB);
+    if (tid == 0) {
+#pragma unroll
+        for (int k = 0; k < S; ++k) { ggml_cuda_dl_mbar_init(&full[k], 1); }
+        ggml_cuda_dl_mbar_init_fence();
+    }
+    __syncthreads();
+    const uint64_t wpol = ggml_cuda_dl_policy_evict_first();
+    if (tid == 0) {
+        for (int k = 0; k < S && k < nstages; ++k) {
+            const int n = min(SPS, total - k*SPS);
+            ggml_cuda_dl_mbar_expect_tx(&full[k], uint32_t(n)*(XB + yb_bytes));
+            ggml_cuda_dl_bulk_g2s_hint(smem + k*SB, x + int64_t(begin + k*SPS)*XB, uint32_t(n)*XB, &full[k], wpol);
+        }
+    }
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+    if (tid == 0) {
+        for (int k = 0; k < S && k < nstages; ++k) {
+            const int n = min(SPS, total - k*SPS);
+            for (int j = 0; j < n; ++j) {
+                const int stj = (begin + k*SPS + j) % nkb;
+                ggml_cuda_dl_bulk_g2s(smem + k*SB + SPS*XB + j*YB, (const char *)y + int64_t(stj)*yb_bytes, yb_bytes, &full[k]);
+            }
+        }
+    }
+    const int w = threadIdx.y, g = threadIdx.x/4, c = threadIdx.x%4;
+    float sum[1][4] = {{0.0f}};
+#pragma unroll 1
+    for (int k = 0; k < nstages; ++k) {
+        const int s = k%S, n = min(SPS, total - k*SPS);
+        ggml_cuda_dl_mbar_wait(&full[s], uint32_t((k/S)&1));
+#pragma unroll
+        for (int j = 0; j < SPS; ++j) {
+            if (j < n) {
+                const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
+                const char * sy = smem + s*SB + SPS*XB + j*YB + g*int(sizeof(block_q8_1_mmq));
+                ggml_cuda_dl_ring_step<GGML_CUDA_DL_FMT_PTQ1S>(sum, sx, sy, c);
+                ++st;
+                if (st == nkb || k*SPS + j == total - 1) {
+                    if (st == nkb) {
+                        int row = row_base + it*I + w*8, stride;
+                        float * dst = ggml_cuda_dod_qkv_dst(a, row, stride);
+                        ggml_cuda_pq2_j16_store<1>(sum, dst, row, stride, a.ncols - 1);
+                        st = 0;
+                        ++it;
+                    } else {
+                        ggml_cuda_pq2_j16_store<1>(sum, tmp_fixup + int64_t(blockIdx.x)*(J*I), w*8, I, J - 1);
+                    }
+#pragma unroll
+                    for (int l = 0; l < 4; ++l) { sum[0][l] = 0.0f; }
+                }
+            }
+        }
+        if (k + S < nstages) { __syncthreads(); }
+        if (tid == 0 && k + S < nstages) {
+            const int kk = k + S, nn = min(SPS, total - kk*SPS), gsk = begin + kk*SPS;
+            ggml_cuda_dl_mbar_expect_tx(&full[s], uint32_t(nn)*(XB + yb_bytes));
+            ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + int64_t(gsk)*XB, uint32_t(nn)*XB, &full[s], wpol);
+            for (int j = 0; j < nn; ++j) {
+                ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB,
+                    (const char *)y + int64_t((gsk + j)%nkb)*yb_bytes, yb_bytes, &full[s]);
+            }
+        }
+    }
+}
+
+// Same descending CTA-partial addition and final dst += sum as the original
+// mul_mat_q_stream_k_fixup<PQ2_0,16,false,48>. One launch for all destinations.
+template <bool GROUPED>
+__launch_bounds__(128, 1)
+static __global__ void mul_mat_q_dod_qkv_fixup(ggml_cuda_dod_qkv_args a, const float * partials) {
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+    constexpr int nkb = 4096/QK_PQ2_0;
+    const int problem = GROUPED ? int(blockIdx.x)/48 : 0;
+    const int b = GROUPED ? int(blockIdx.x)%48 : int(blockIdx.x);
+    const int rows = GROUPED ? (problem == 0 ? 8192 : 1024) : 10240;
+    const int row_base = GROUPED ? (problem == 0 ? 0 : 8192 + (problem - 1)*1024) : 0;
+    const int begin = ggml_cuda_dod_qkv_start(b, rows, nkb);
+    const int end = ggml_cuda_dod_qkv_start(b + 1, rows, nkb);
+    if (begin == end || begin%nkb == 0 || (begin/nkb == end/nkb && end%nkb != 0)) { return; }
+    float sum[4] = {0.0f};
+    int stop = begin;
+    for (int prev = b - 1; prev >= 0; --prev) {
+        const int start = ggml_cuda_dod_qkv_start(prev, rows, nkb);
+        if (start != stop) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sum[j] += partials[int64_t((GROUPED ? problem*48 : 0) + prev)*2048 +
+                                   (4*j + threadIdx.y)*128 + blockIdx.y*32 + threadIdx.x];
+            }
+            if (start%nkb == 0 || start/nkb < begin/nkb) { break; }
+        }
+        stop = start;
+    }
+    int row = row_base + (begin/nkb)*128 + blockIdx.y*32 + threadIdx.x, stride;
+    float * dst = ggml_cuda_dod_qkv_dst(a, row, stride);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int col = 4*j + threadIdx.y;
+        if (col < a.ncols) { dst[col*stride + row] += sum[j]; }
+    }
+}
+
+template <bool GROUPED>
+static void ggml_cuda_dod_qkv_launch(ggml_cuda_dod_qkv_args a, float * partials, cudaStream_t stream) {
+    constexpr int grid = GROUPED ? 144 : 48;
+    constexpr size_t smem = ggml_cuda_dl_ring_smem<GGML_CUDA_DL_FMT_PTQ1S, 2>(3);
+    const auto kernel = mul_mat_q_dod_qkv_ring<GROUPED>;
+    static bool attr[GGML_CUDA_MAX_DEVICES] = {false};
+    const int device = ggml_cuda_get_device();
+    if (!attr[device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)));
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, int(cudaSharedmemCarveoutMaxShared)));
+        attr[device] = true;
+    }
+    ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid), dim3(32,16), smem, stream), a, partials);
+    ggml_cuda_kernel_launch(mul_mat_q_dod_qkv_fixup<GROUPED>,
+        ggml_cuda_kernel_launch_params(dim3(grid,4), dim3(32,4), 0, stream), a, partials);
+    CUDA_CHECK(cudaGetLastError());
 }
