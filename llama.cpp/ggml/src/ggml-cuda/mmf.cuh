@@ -379,6 +379,56 @@ static __device__ __forceinline__ void mul_mat_f_ksplit_chain(const float * x, c
         }
     }
 }
+// Keep each warp's coalesced global operands and exact ldmatrix/MMA order,
+// but bypass the register/shared stores with two async shared stages.
+static __device__ __forceinline__ void mul_mat_f_ksplit_chain_async(
+        const float * x, const float * y, const int ncols,
+        const int stride_row, const int stride_col_y, const int w,
+        tile<16, 8, float> & C) {
+    using tile_A = tile<16, 8, float>;
+    using tile_B = tile<8, 8, float>;
+    constexpr int pitch = 36;
+    __shared__ __align__(16) float operand[2][24*pitch];
+    const auto fetch = [&](const int stage, const int col) {
+        const int segment = 4*(threadIdx.x%8);
+        const int row = threadIdx.x/8;
+#pragma unroll
+        for (int i = 0; i < 16; i += 4) {
+            const unsigned dst = __cvta_generic_to_shared(operand[stage]+(i+row)*pitch+segment);
+            const float * src = x+(i+row)*stride_row+col+segment;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(src) : "memory");
+        }
+#pragma unroll
+        for (int i = 0; i < 8; i += 4) {
+            const unsigned dst = __cvta_generic_to_shared(operand[stage]+(16+i+row)*pitch+segment);
+            const float * src = y+(i+row)*stride_col_y+col+segment;
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(src) : "memory");
+        }
+    };
+    int stage = 0;
+    int col = w*32;
+    fetch(stage, col);
+    for (; col < ncols; col += mmf_ksplit_nwarps*32) {
+        asm volatile("cp.async.wait_all;" ::: "memory");
+        __syncwarp();
+        if (col + mmf_ksplit_nwarps*32 < ncols) {
+            fetch(stage^1, col + mmf_ksplit_nwarps*32);
+        }
+        tile_A A[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            load_ldmatrix(A[k], operand[stage]+8*k, pitch);
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            tile_B B;
+            load_ldmatrix(B, operand[stage]+16*pitch+8*k, pitch);
+            mma(C, A[k], B);
+        }
+        stage ^= 1;
+    }
+}
+
 #endif // defined(AMPERE_MMA_AVAILABLE) && !defined(VOLTA_MMA_AVAILABLE)
 
 static __global__ void mul_mat_f_ksplit_partial(
@@ -473,7 +523,15 @@ static __global__ void mul_mat_f_ksplit_pair(
     __shared__ float acc[tile_C::ne][warp_size];
 
     tile_C C;
-    mul_mat_f_ksplit_chain(x, y, tile_xy, ncols, stride_row, stride_col_y, w, itB, C);
+#if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    if (ncols >= 256 && ncols % 256 == 0 && stride_row % 4 == 0 && stride_col_y % 4 == 0 &&
+            uintptr_t(x) % 16 == 0 && uintptr_t(y) % 16 == 0) {
+        mul_mat_f_ksplit_chain_async(x, y, ncols, stride_row, stride_col_y, w, C);
+    } else
+#endif
+    {
+        mul_mat_f_ksplit_chain(x, y, tile_xy, ncols, stride_row, stride_col_y, w, itB, C);
+    }
 
 #pragma unroll
     for (int l = 0; l < tile_C::ne; ++l) {
