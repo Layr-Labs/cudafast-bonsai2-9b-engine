@@ -43,13 +43,7 @@
 #define GGML_CUDA_DL_H_WBULK  1 // per-warp cp.async.bulk.prefetch.L2 of its step region (CH > 1: WM only)
 #define GGML_CUDA_DL_H_CBULK  2 // per-CTA cp.async.bulk.prefetch.L2 of the CTA step region (TM only)
 
-static __device__ __forceinline__ void ggml_cuda_dl_bulk_prefetch(const char * p, const uint32_t bytes) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
-    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(__cvta_generic_to_global(p)), "r"(bytes));
-#else
-    GGML_UNUSED_VARS(p, bytes);
-#endif
-}
+// ggml_cuda_dl_bulk_prefetch: common.cuh (shared with the L1 lookahead, ggml_cuda_l2_ahead)
 
 // L2 prefetch stream of one warp (or of the CTA, CBULK). It walks the CTA's own sequence of steps (the
 // steps of its segments in order, across tile boundaries) HD steps ahead of the loads, so a new segment

@@ -21,7 +21,8 @@ static void launch_gated_delta_net(
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K,
-        const int32_t * s_ids, int64_t s_row_stride, int lazy, const float * const zero[3], bool qk_packed, uint32_t * dedup_counter, cudaStream_t stream) {
+        const int32_t * s_ids, int64_t s_row_stride, int lazy, const float * const zero[3], bool qk_packed, uint32_t * dedup_counter,
+        const ggml_cuda_l2_ahead & ahead, cudaStream_t stream) {
     // Fallback dispatcher; eligible long prefills select N1 in the common launcher.
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -86,7 +87,7 @@ static void launch_gated_delta_net(
                             q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
                             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                             sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_ids, s_row_stride,
-                            1 | (gdn_state_evict ? 8 : 0), dedup_counter);
+                            1 | (gdn_state_evict ? 8 : 0), dedup_counter, ahead);
                     } else if (lazy_eff) {
                         ggml_cuda_kernel_launch(gated_delta_net_l8v_cuda<RAW, G_PRECOMPUTED, true>, launch_params,
                             q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
@@ -209,6 +210,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const float scale = 1.0f / sqrtf((float) S_v);
 
     cudaStream_t stream = ctx.stream();
+
+    // L1 lookahead planned for this node by the graph evaluator; only gated_delta_net_dedup_l8v_cuda issues it
+    const ggml_cuda_l2_ahead ahead = ctx.l2_ahead;
+    ctx.l2_ahead = {};
 
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
@@ -427,7 +432,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
 #define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_)                                                       \
     launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, \
         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                    \
-        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, lazy, zero, qk_packed, dedup_counter, stream)
+        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_ids, s_row_stride, lazy, zero, qk_packed, dedup_counter, ahead, stream)
 
     if (kda) {
         if (keep_rs) { GDN_LAUNCH(true,  true,  false, false); } else { GDN_LAUNCH(true,  false, false, false); }

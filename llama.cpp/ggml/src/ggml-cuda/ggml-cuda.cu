@@ -4093,6 +4093,59 @@ static int ggml_cuda_d4_side_plan(const ggml_backend_cuda_context & ctx, const g
     return j;
 }
 
+// GB10 decode verify (L1 lookahead, ggml_cuda_l2_ahead): the GATED_DELTA_NET node at i prefetches the GDN out-projection
+// weights while its recurrence and the gnorm quantizer leave DRAM mostly idle (the z projection on stream 1 and the
+// recurrence's own state traffic come first). The target is the first later PQ2_0 MUL_MAT that depends on the node's
+// output (the z projection reads the layer input and is passed over) when it runs as the PTQ1_0 decode-layout ring over
+// the stream-k partition (ggml_cuda_mmq_dl_run, ggml_cuda_mul_mat_q_fixup_producer): per CTA range the steps after the
+// ring's own 3 stages of 2 steps, at most cap. Default cap 16: all of them for 4096 x 4096 (736 of 1024 steps, 2.5 of
+// 3.5 MiB, about the DRAM time those kernels leave idle).
+// GGML_CUDA_L2_LOOKAHEAD=0 disables it; a positive value sets the cap in steps.
+static ggml_cuda_l2_ahead ggml_cuda_l2_ahead_plan(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const int cap = getenv("GGML_CUDA_L2_LOOKAHEAD") == nullptr ? 16 : std::max(0, atoi(getenv("GGML_CUDA_L2_LOOKAHEAD")));
+    ggml_cuda_l2_ahead plan = {};
+    const ggml_tensor * gdn = cgraph->nodes[i];
+    const auto & dev = ggml_cuda_info().devices[ctx.device];
+    if (cap == 0 || dev.cc != GGML_CUDA_CC_DGX_SPARK || gdn->src[2] == nullptr || gdn->src[2]->ne[2] > 16) {
+        return plan;
+    }
+    std::vector<const ggml_tensor *> dep = { gdn };
+    const int kmax = std::min(cgraph->n_nodes, i + 64);
+    for (int k = i + 1; k < kmax; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        bool reads = false;
+        for (int s = 0; s < GGML_MAX_SRC && !reads; ++s) {
+            reads = t->src[s] != nullptr && std::find(dep.begin(), dep.end(), t->src[s]) != dep.end();
+        }
+        if (!reads) {
+            continue;
+        }
+        if (t->op != GGML_OP_MUL_MAT || t->src[0] == nullptr || t->src[0]->type != GGML_TYPE_PQ2_0) {
+            dep.push_back(t);
+            continue;
+        }
+        const ggml_tensor * w = t->src[0];
+        const ggml_cuda_dl_entry * e = ggml_cuda_dl_find(w->data);
+        mmq_args a = {};
+        a.nrows_x = w->ne[1];
+        const int grid = ggml_cuda_mmq_pq2_j16_grid(a, dev.nsm);
+        if (e != nullptr && e->dl != nullptr && e->type == GGML_TYPE_PQ2_0 && e->dl_type == GGML_TYPE_PTQ1_0 &&
+                e->nrows == w->ne[1] && e->ncols == w->ne[0] && w->ne[1] >= 2048 && w->ne[1] % 128 == 0 &&
+                w->ne[0] % MMQ_ITER_K == 0 && t->src[1]->ne[1] <= 16 && grid != (int) (w->ne[1] / 128)) {
+            plan.x          = e->dl;
+            plan.nst        = (int) (w->ne[0] / QK_PQ2_0);
+            plan.nty        = (int) (w->ne[1] / 128);
+            plan.grid       = grid;
+            plan.bpi        = MMQ_ITER_K / QK_PQ2_0;
+            plan.skip       = 3*2;
+            plan.steps      = cap;
+            plan.step_bytes = 128*(int) sizeof(block_ptq1_0);
+        }
+        return plan;
+    }
+    return plan;
+}
+
 // GB10 decode (verify batches of at most 16 rows): the ffn_gate/ffn_up MUL_MAT pair of one D4 activation feeding a
 // SWIGLU as one stacked launch over the pair's back-to-back PTQ1_0 decode-layout copy (ggml_cuda_glu_pair::dl_stacked):
 // the gate matmul runs its own path (ggml_cuda_mul_mat) with a stacking request that launch_mul_mat_q takes only for
@@ -7657,6 +7710,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                if (node->op == GGML_OP_GATED_DELTA_NET) {
+                    cuda_ctx->l2_ahead = !is_concurrent_event_active && cuda_ctx->curr_stream_no == 0 ?
+                        ggml_cuda_l2_ahead_plan(*cuda_ctx, cgraph, i) : ggml_cuda_l2_ahead{};
+                }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {

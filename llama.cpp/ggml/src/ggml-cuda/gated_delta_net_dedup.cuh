@@ -167,7 +167,7 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
                         int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3,
                         int64_t sb1, int64_t sb2, int64_t sb3, const uint3 neqk1_magic, const uint3 rq3_magic,
                         float scale, int64_t state_slot_stride, int K, const int32_t * s_ids, int64_t s_row_stride,
-                        int lazy, uint32_t * generation_counter) {
+                        int lazy, uint32_t * generation_counter, const ggml_cuda_l2_ahead ahead) {
     constexpr int S_v = 128;
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
@@ -399,6 +399,14 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
             gdn_st(evs, &rec[lane * stride + S_v + GDN_LAZY_NWARPS * 4 + 1], beta_lane);
         }
         }
+    }
+
+    // L1 lookahead: this block's state loads are done and its base/record stores issued; the loop below and the gnorm
+    // quantizer after the kernel leave DRAM mostly idle. The last-scheduled blocks (one per range) prefetch the next
+    // weight stream into L2, after the earlier blocks' state traffic. Cache only.
+    if (tid == 0) {
+        const int nblk = (int) (gridDim.x * gridDim.y * gridDim.z);
+        ggml_cuda_l2_ahead_issue(ahead, nblk - 1 - (int) (blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)));
     }
 
     __shared__ float attn_sm[GDN_L8V_MAX_TOKENS][16];  // this block's 16 columns of the attention output
