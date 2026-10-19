@@ -1395,7 +1395,11 @@ static __global__ void fwht_quantize_mmq_d4_fixup_add_rms(const float * a, const
         v[m]=xn*(1.0f/64.0f);
         if constexpr(SIGNED) v[m]*=sv[m];
     }
-    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    if constexpr (NT == 1024 && ggml_cuda_get_physical_warp_size() == 32) {
+        ggml_cuda_fwht_warp_lane_butterfly<N,NT>(v,shared,tid,lane);
+    } else {
+        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    }
     fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 void fwht_quantize_mmq_d4_fixup_add_rms_cuda(const float * a, const float * b, float * sum,
