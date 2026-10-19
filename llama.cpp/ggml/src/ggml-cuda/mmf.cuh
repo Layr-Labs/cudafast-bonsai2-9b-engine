@@ -470,28 +470,30 @@ static __global__ void mul_mat_f_ksplit_pair(
 
     extern __shared__ char data_mmf_ksplit[];
     float * tile_xy = (float *) data_mmf_ksplit;
-    __shared__ float acc[tile_C::ne][warp_size];
+    static_assert(tile_C::ne == 4, "four exact accumulator values per lane");
+    __shared__ float4 acc[warp_size];
 
     tile_C C;
     mul_mat_f_ksplit_chain(x, y, tile_xy, ncols, stride_row, stride_col_y, w, itB, C);
 
-#pragma unroll
-    for (int l = 0; l < tile_C::ne; ++l) {
-        acc[l][threadIdx.x] = C.x[l];
-    }
+    acc[threadIdx.x] = make_float4(C.x[0], C.x[1], C.x[2], C.x[3]);
     cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
     cluster.sync();
     if (w == 0) {
+        float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int r = 0; r < nwarps; ++r) {
+            const float4 v = *cluster.map_shared_rank(&acc[threadIdx.x], r);
+            sums[0] += v.x;
+            sums[1] += v.y;
+            sums[2] += v.z;
+            sums[3] += v.w;
+        }
 #pragma unroll
         for (int l = 0; l < tile_C::ne; ++l) {
-            float sum = 0.0f;
-#pragma unroll
-            for (int r = 0; r < nwarps; ++r) {
-                sum += *cluster.map_shared_rank(&acc[l][threadIdx.x], r);
-            }
             const int i = itA*tile_C::I + tile_C::get_i(l);
             const int j = itB*tile_C::J + tile_C::get_j(l);
-            dst[j*stride_col_dst + rb*rows_per_block + i] = sum;
+            dst[j*stride_col_dst + rb*rows_per_block + i] = sums[l];
         }
     }
     cluster.sync(); // the other ranks' shared memory stays valid until rank 0 has read it
