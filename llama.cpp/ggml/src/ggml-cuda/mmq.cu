@@ -885,7 +885,7 @@ static bool ggml_cuda_decode_glu_run(ggml_backend_cuda_context & ctx, const ggml
     }
     constexpr int F = 12288, K = 4096, N = 16;
     constexpr size_t shared = ggml_cuda_dl_ring_smem<GGML_CUDA_DL_FMT_PTQ1S, 2>(3);
-    const auto kernel = mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true>;
+    const auto kernel = mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true, true>;
     static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
     if (!attr[ctx.device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared)));

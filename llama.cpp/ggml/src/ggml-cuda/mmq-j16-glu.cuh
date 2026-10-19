@@ -3,7 +3,7 @@
 // gate/up rows give every lane both operands; the dot-product order is unchanged.
 #include "unary.cuh"
 
-template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false>
+template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false, bool FULL_N16 = false>
 __launch_bounds__(16*32, MIN_CTAS)
 static __global__ void mul_mat_q_ptq_gu_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
@@ -93,7 +93,9 @@ static __global__ void mul_mat_q_ptq_gu_ring(
 #pragma unroll
                         for (int h = 0; h < 2; ++h) {
                             const int col = g + 8*h;
-                            if (col < ncols_dst) {
+                            // The guarded production route has exactly 16 columns.
+                            // All other callers retain the runtime bounds check.
+                            if (FULL_N16 || col < ncols_dst) {
                                 dst[(int64_t)col*stride_col_dst + row] =
                                     ggml_cuda_op_silu_single(sum[0][2*h]) * sum[0][2*h + 1];
                             }
