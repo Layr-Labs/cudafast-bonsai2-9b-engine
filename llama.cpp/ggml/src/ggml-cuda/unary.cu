@@ -1,5 +1,6 @@
 #include "unary.cuh"
 #include "convert.cuh"
+#include "unary-gated-vector.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -278,6 +279,19 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
 
 template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
+    if constexpr (std::is_same<T, float>::value && op == op_silu) {
+        // Small vectors lose CTA parallelism; large arrays are bandwidth-bound.
+        // Keep those on the original scalar transport.
+        if (o0 == n && o1 == n && k >= 131072 && k <= 262144 && k % 4 == 0 &&
+                (uintptr_t) x % 16 == 0 && (uintptr_t) g % 16 == 0 && (uintptr_t) dst % 16 == 0) {
+            const int64_t vectors = k/4;
+            const dim3 grid((vectors + CUDA_GLU_BLOCK_SIZE - 1)/CUDA_GLU_BLOCK_SIZE);
+            ggml_cuda_kernel_launch(unary_gated_vector4_kernel<op>,
+                ggml_cuda_kernel_launch_params(grid, CUDA_GLU_BLOCK_SIZE, 0, stream),
+                x, g, dst, vectors);
+            return;
+        }
+    }
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
     ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
