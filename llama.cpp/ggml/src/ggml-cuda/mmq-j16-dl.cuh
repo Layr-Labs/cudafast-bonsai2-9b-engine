@@ -775,7 +775,7 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
         ggml_cuda_pq2_j16_compute<1>(sum, st, c);
     } else if constexpr (FMT == GGML_CUDA_DL_FMT_PTQ1 || FMT == GGML_CUDA_DL_FMT_PTQ1S) {
         ggml_cuda_ptq1_j16_stage st;
-        ggml_cuda_ptq1_j16_load(st, sx, sy, c);
+        ggml_cuda_ptq1_j16_load<FMT == GGML_CUDA_DL_FMT_PTQ1S>(st, sx, sy, c);
         ggml_cuda_ptq1_j16_compute<FMT == GGML_CUDA_DL_FMT_PTQ1S>(sum, st, c);
     } else {
         ggml_cuda_dl_q8_xstage xs;

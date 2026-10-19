@@ -53,15 +53,32 @@ struct ggml_cuda_ptq1_j16_stage {
     uint32_t wa, wb, w6;
 };
 
+template <bool LDM = false>
 static __device__ __forceinline__ void ggml_cuda_ptq1_j16_load(
         ggml_cuda_ptq1_j16_stage & st, const char * __restrict__ xr, const char * yb, const int c) {
+    if constexpr (LDM) {
+        // Four 8x8 halfword matrices: columns 0..7 and 8..15,
+        // first and second 16-byte halves of one 32-byte quant sub-block.
+        // ldmatrix gives lane (g,c) row g, words c in each half.
+        const int lane = threadIdx.x;
+        const int row_delta = (lane & 15) - (lane >> 2);
+        const char * p = yb + row_delta*sizeof(block_q8_1_mmq) + 4*sizeof(float) + 16*(lane >> 4);
 #pragma unroll
-    for (int s = 0; s < 4; ++s) {
+        for (int s = 0; s < 4; ++s) {
+            const uint32_t addr = (uint32_t) __cvta_generic_to_shared(p + 32*s);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                : "=r"(st.ya[s][0][0]), "=r"(st.ya[s][1][0]), "=r"(st.ya[s][0][1]), "=r"(st.ya[s][1][1])
+                : "r"(addr));
+        }
+    } else {
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            const char * p = yb + h*8*sizeof(block_q8_1_mmq) + 4*sizeof(float) + 32*s + 4*c;
-            st.ya[s][h][0] = *(const int *) (p);
-            st.ya[s][h][1] = *(const int *) (p + 16);
+        for (int s = 0; s < 4; ++s) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const char * p = yb + h*8*sizeof(block_q8_1_mmq) + 4*sizeof(float) + 32*s + 4*c;
+                st.ya[s][h][0] = *(const int *) (p);
+                st.ya[s][h][1] = *(const int *) (p + 16);
+            }
         }
     }
 #pragma unroll
