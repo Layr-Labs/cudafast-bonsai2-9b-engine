@@ -1,5 +1,7 @@
 #pragma once
 
+#include "s1-fa-splits.cuh"
+
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
@@ -1143,6 +1145,17 @@ void launch_fattn(
                 : nblocks_stream_k_raw;
 
             blocks_num.x = nblocks_stream_k;
+        }
+
+        // S1: change only the KV partition count. The original MMA body, query
+        // tile and ordered, separate uniform fixup are retained. No atomics.
+        const int s1_splits = ggml_cuda_s1_fa_splits(KQV, cc, ntiles_KV);
+        const int s1_parent_blocks = blocks_num.x;
+        if (s1_splits) blocks_num.x = ntiles_dst*s1_splits;
+        if (ggml_cuda_s1_fa_env("GGML_CUDA_S1_FA_TRACE", 0)) {
+            GGML_LOG_INFO("S1_FA_ROUTE D=%lld T=%lld KV=%lld tile=%dx%d tiles=%d parent_blocks=%d blocks=%u splits=%d\n",
+                (long long) Q->ne[0], (long long) Q->ne[1], (long long) K->ne[1], ncols1, ncols2,
+                ntiles_dst, s1_parent_blocks, blocks_num.x, s1_splits);
         }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
