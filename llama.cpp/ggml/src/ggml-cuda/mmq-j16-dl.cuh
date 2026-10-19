@@ -1304,6 +1304,42 @@ static __global__ void mul_mat_q_dod_qkv_fixup(ggml_cuda_dod_qkv_args a, const f
     }
 }
 
+// Compact only the live grouped-QKV fixup CTAs. Geometry is fixed by
+// ggml_cuda_dod_qkv_args: Q=8192 rows, K/V=1024 rows, K=4096,48 partitions each.
+__launch_bounds__(128, 1)
+static __global__ void mul_mat_q_dod_qkv_fixup_compact(ggml_cuda_dod_qkv_args a, const float * partials) {
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+    constexpr int nkb=4096/QK_PQ2_0;
+    static_assert(nkb==32 && MMQ_ITER_K/QK_PQ2_0==2,"compact fixed partition");
+    const int compact=blockIdx.x;
+    const bool q=compact<32;
+    const int problem=q?0:1+(compact-32)/8;
+    const int local=q?compact:(compact-32)%8;
+    const int b=q?3*(local/2)+1+local%2:6*local+5;
+    const int tile=q?(4*b)/3:local;
+    float sum[4]={0.0f};
+    const int count=q?1:5;
+#pragma unroll
+    for (int off=1;off<=5;++off) {
+        if (off<=count) {
+#pragma unroll
+            for (int j=0;j<4;++j) {
+                sum[j]+=partials[int64_t(problem*48+b-off)*2048+
+                    (4*j+threadIdx.y)*128+blockIdx.y*32+threadIdx.x];
+            }
+        }
+    }
+    const int base=q?0:8192+(problem-1)*1024;
+    int row=base+tile*128+blockIdx.y*32+threadIdx.x,stride;
+    float * dst=ggml_cuda_dod_qkv_dst(a,row,stride);
+#pragma unroll
+    for (int j=0;j<4;++j) {
+        const int col=4*j+threadIdx.y;
+        if (col<a.ncols) dst[col*stride+row]+=sum[j];
+    }
+}
+
 template <bool GROUPED>
 static void ggml_cuda_dod_qkv_launch(ggml_cuda_dod_qkv_args a, float * partials, cudaStream_t stream) {
     constexpr int grid = GROUPED ? 144 : 48;
@@ -1317,7 +1353,12 @@ static void ggml_cuda_dod_qkv_launch(ggml_cuda_dod_qkv_args a, float * partials,
         attr[device] = true;
     }
     ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid), dim3(32,16), smem, stream), a, partials);
-    ggml_cuda_kernel_launch(mul_mat_q_dod_qkv_fixup<GROUPED>,
-        ggml_cuda_kernel_launch_params(dim3(grid,4), dim3(32,4), 0, stream), a, partials);
+    if constexpr (GROUPED) {
+        ggml_cuda_kernel_launch(mul_mat_q_dod_qkv_fixup_compact,
+            ggml_cuda_kernel_launch_params(dim3(48,4),dim3(32,4),0,stream),a,partials);
+    } else {
+        ggml_cuda_kernel_launch(mul_mat_q_dod_qkv_fixup<false>,
+            ggml_cuda_kernel_launch_params(dim3(grid,4),dim3(32,4),0,stream),a,partials);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
