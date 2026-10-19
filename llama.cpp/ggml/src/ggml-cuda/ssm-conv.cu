@@ -503,7 +503,7 @@ struct ssm_conv_front_short_snaps {
 // A q/k CTA owns four token rows. Snapshot work follows those rows, including on nonzero chunks. Mode 2
 // (warp_rows=false) computes four convolutions/channel from seven prefetched inputs and transposes only
 // the SiLU results. Mode 1 keeps the warp/token arithmetic, reading the cooperatively staged inputs.
-template <bool warp_rows>
+template <bool warp_rows, bool vector_weights = false>
 static __global__ void __launch_bounds__(128) ssm_conv_front_l2_short_f32(
         const float * states, const int32_t * gather_ids, const int64_t gather_row, const float * w,
         float * y, float * qk, const __grid_constant__ ssm_conv_front_short_snaps plan,
@@ -547,8 +547,13 @@ static __global__ void __launch_bounds__(128) ssm_conv_front_l2_short_f32(
         }
         float wr[4], win[prev];
         if (run) {
+            if constexpr (vector_weights) {
+                const float4 weights = ((const float4 *) w)[c];
+                wr[0] = weights.x; wr[1] = weights.y; wr[2] = weights.z; wr[3] = weights.w;
+            } else {
 #pragma unroll
-            for (int j = 0; j < 4; ++j) wr[j] = w[c * w_c + j];
+                for (int j = 0; j < 4; ++j) wr[j] = w[c * w_c + j];
+            }
 #pragma unroll
             for (int j = 0; j < prev; ++j)
                 win[j] = ssm_conv_front_input(sm.v.state, c0, xs, c, t0 + j, prev);
@@ -622,13 +627,24 @@ static __global__ void __launch_bounds__(128) ssm_conv_front_l2_short_f32(
     if constexpr (warp_rows) {
         if (warp < nt) {
 #pragma unroll
-            for (int i = 0; i < 4; ++i)
+            for (int i = 0; i < 4; ++i) {
+                if constexpr (vector_weights) {
+                    const float4 weights = ((const float4 *) w)[c0 + i * 32 + lane];
+                    wr[i][0] = weights.x; wr[i][1] = weights.y; wr[i][2] = weights.z; wr[i][3] = weights.w;
+                } else {
 #pragma unroll
-                for (int j = 0; j < 4; ++j) wr[i][j] = w[(c0 + i * 32 + lane) * w_c + j];
+                    for (int j = 0; j < 4; ++j) wr[i][j] = w[(c0 + i * 32 + lane) * w_c + j];
+                }
+            }
         }
     } else {
+        if constexpr (vector_weights) {
+            const float4 weights = ((const float4 *) w)[c];
+            wr[0][0] = weights.x; wr[0][1] = weights.y; wr[0][2] = weights.z; wr[0][3] = weights.w;
+        } else {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) wr[0][j] = w[c * w_c + j];
+            for (int j = 0; j < 4; ++j) wr[0][j] = w[c * w_c + j];
+        }
 #pragma unroll
         for (int t = 0; t < tile; ++t) {
             if (t < nt) {
@@ -756,14 +772,19 @@ void ggml_cuda_ssm_conv_front(ggml_backend_cuda_context & ctx, const ggml_tensor
                 plan.mask[owner] |= uint32_t(1) << k;
             }
             const int blocks = n_vb + (int) (c_v0 / 128) * chunks;
-            const auto launch_short = [&](auto row_mode) {
-                ggml_cuda_kernel_launch_gb10(cc, ssm_conv_front_l2_short_f32<decltype(row_mode)::value>,
+            const auto launch_short = [&](auto row_mode, auto vector_weights) {
+                ggml_cuda_kernel_launch_gb10(cc, ssm_conv_front_l2_short_f32<decltype(row_mode)::value, decltype(vector_weights)::value>,
                     ggml_cuda_kernel_launch_params(dim3(blocks), dim3(32, 4), 0, stream),
                     states_d, ext.gather_ids, ext.gather_row, w_d, y_d, ext.qk, plan, C, c_v0,
                     chunks, n_t, xs, w_c, y_t, ext.hold, ext.eps, ext.zero_row, ext.zero_scale, ext.zero_bias);
             };
-            if (mode == 1) launch_short(std::true_type{});
-            else launch_short(std::false_type{});
+            if (w_c == 4 && (uintptr_t) w_d % 16 == 0) {
+                if (mode == 1) launch_short(std::true_type{}, std::true_type{});
+                else launch_short(std::false_type{}, std::true_type{});
+            } else {
+                if (mode == 1) launch_short(std::true_type{}, std::false_type{});
+                else launch_short(std::false_type{}, std::false_type{});
+            }
             return;
         }
     }
