@@ -1068,7 +1068,7 @@ __launch_bounds__(256, 1)
 static __global__ void fwht_quantize_mmq_d4(const T * x, const T * g, const float * signs, block_q8_1_mmq * y,
                                          int64_t k, int64_t kp, int64_t rows, int64_t o0, int64_t o1) {
     constexpr int N=4096, NT=256, NE=N/NT;
-    __shared__ float shared[N];
+    __shared__ __align__(16) float shared[N];
     const int tid=threadIdx.x, lane=tid%32;
     const int64_t row=blockIdx.y, base=int64_t(blockIdx.x)*N;
     float v[NE];

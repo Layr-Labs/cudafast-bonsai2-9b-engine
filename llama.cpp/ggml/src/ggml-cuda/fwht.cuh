@@ -74,16 +74,21 @@ __device__ __forceinline__ void ggml_cuda_fwht_register_transpose_butterfly(floa
     static_assert(N == 4096 && NT == 256, "register transpose geometry");
     constexpr int NW = NT / warp_size;
     const int warp = tid / warp_size;
+    // Pair the two register planes whose high bit is not exchanged.
+    // Scratch is 16-byte aligned by the selected caller.
+    float2 * const transport = reinterpret_cast<float2 *>(s);
 #pragma unroll
-    for (int j = 0; j < NE; ++j) s[j*NT + tid] = reg[j];
-    __syncthreads();
-    // In transposed ownership, register bit [0..2] is the old warp
-    // index, while current warp selects old register bit [0..2].
-#pragma unroll
-    for (int j = 0; j < NE; ++j) {
-        reg[j] = s[(warp + NW*(j/NW))*NT + (j%NW)*warp_size + lane];
+    for (int j = 0; j < NW; ++j) {
+        transport[j*NT + tid] = make_float2(reg[j], reg[j+NW]);
     }
-    __syncthreads(); // all original shared reads finish before overwrite
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < NW; ++j) {
+        const float2 input = transport[warp*NT + j*warp_size + lane];
+        reg[j] = input.x;
+        reg[j+NW] = input.y;
+    }
+    __syncthreads(); // original shared reads finish before overwrite
 #pragma unroll
     for (int step = 1; step < NW; step *= 2) {
 #pragma unroll
@@ -97,13 +102,17 @@ __device__ __forceinline__ void ggml_cuda_fwht_register_transpose_butterfly(floa
         }
     }
 #pragma unroll
-    for (int j = 0; j < NE; ++j) {
-        s[(warp + NW*(j/NW))*NT + (j%NW)*warp_size + lane] = reg[j];
+    for (int j = 0; j < NW; ++j) {
+        transport[warp*NT + j*warp_size + lane] = make_float2(reg[j], reg[j+NW]);
     }
     __syncthreads();
 #pragma unroll
-    for (int j = 0; j < NE; ++j) reg[j] = s[j*NT + tid];
-    // Scratch is dead after this helper in its one selected caller.
+    for (int j = 0; j < NW; ++j) {
+        const float2 output = transport[j*NT + tid];
+        reg[j] = output.x;
+        reg[j+NW] = output.y;
+    }
+    // Scratch is dead after this helper in its selected caller.
 
     // stages above the block width: partner is another register of the same thread
 #pragma unroll
