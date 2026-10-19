@@ -133,6 +133,46 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
+// bytes (multiple of 16) at p (16-byte aligned) into L2. A cache hint: no architectural effect.
+static __device__ __forceinline__ void ggml_cuda_dl_bulk_prefetch(const char * p, const uint32_t bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(__cvta_generic_to_global(p)), "r"(bytes));
+#else
+    GGML_UNUSED_VARS(p, bytes);
+#endif
+}
+
+// GB10 decode (L1 lookahead): decode-layout (TM) weight bytes of the next weight-streaming ring launch, prefetched into
+// L2 by a latency-bound kernel before it. CTA r of the ring's stream-k partition (ggml_cuda_dl_work mode 0, G = 1: one
+// block group per step) reads the contiguous steps [g0, g1) and fetches the first skip of them itself before its PDL
+// wait; range r is prefetched from g0 + skip, at most steps steps. x == nullptr: none.
+struct ggml_cuda_l2_ahead {
+    const char * x;
+    int nst;        // K steps per 128-row tile
+    int nty;        // 128-row tiles
+    int grid;       // CTAs of the partition
+    int bpi;        // steps per stream-k iteration (range bounds are aligned to it inside a tile)
+    int skip;
+    int steps;
+    int step_bytes; // 128 rows x group bytes
+};
+
+// Range r of the plan (r outside [0, a.grid): nothing).
+static __device__ __forceinline__ void ggml_cuda_l2_ahead_issue(const ggml_cuda_l2_ahead & a, const int r) {
+    if (a.x == nullptr || r < 0 || r >= a.grid) {
+        return;
+    }
+    const int64_t W  = (int64_t) a.nty*a.nst;
+    int           g0 = (int) ((int64_t) r      *W / a.grid);
+    int           g1 = (int) ((int64_t) (r + 1)*W / a.grid);
+    g0 -= (g0 % a.nst) % a.bpi;
+    g1 -= (g1 % a.nst) % a.bpi;
+    const int s1 = min(g1, g0 + a.skip + a.steps);
+    for (int s = g0 + a.skip; s < s1; s += 8) {
+        ggml_cuda_dl_bulk_prefetch(a.x + (int64_t) s*a.step_bytes, (uint32_t) (min(8, s1 - s)*a.step_bytes));
+    }
+}
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;
@@ -1739,6 +1779,10 @@ struct ggml_backend_cuda_context {
     const void * dl_stack_gate   = nullptr;
     float      * dl_stack_up_dst = nullptr;
     bool         dl_stack_done   = false;
+
+    // GB10 decode verify: the L1 lookahead of the next GATED_DELTA_NET launch (ggml_cuda_l2_ahead_plan), set by the
+    // graph evaluator at the node and taken (cleared) by the op
+    ggml_cuda_l2_ahead l2_ahead = {};
 
     // GB10 decode: fork/join events of a D4 matmul run on stream 1 beside the main stream (ggml_cuda_d4_side_plan)
     cudaEvent_t side_fork = nullptr;

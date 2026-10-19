@@ -862,6 +862,46 @@ bool ggml_cuda_mul_mat_q_fixup_producer(ggml_backend_cuda_context & ctx,
     return true;
 }
 
+bool ggml_cuda_mul_mat_q_lookahead(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const size_t budget) {
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * y = mm->src[1];
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    // J = 16 (9 to 16 columns): the only width with a decode-layout route
+    if (device.cc != GGML_CUDA_CC_DGX_SPARK || w->type != GGML_TYPE_Q8_0 || y->ne[1] <= 8 || y->ne[1] > 16 ||
+            w->ne[2] != 1 || w->ne[3] != 1 || mm->ne[2] != 1 || mm->ne[3] != 1) {
+        return false;
+    }
+    const ggml_cuda_dl_entry * e = ggml_cuda_dl_find(w->data);
+    if (e == nullptr) {
+        return false;
+    }
+    // the fields of ggml_cuda_mul_mat_q's arguments that select the route (y: any 16-byte aligned q8 buffer)
+    mmq_args args = {};
+    args.x = (const char *) w->data; args.type_x = w->type; args.dst = (float *) mm->data;
+    args.ncols_x = w->ne[0]; args.nrows_x = w->ne[1]; args.stride_row_x = w->nb[1]/ggml_type_size(w->type);
+    args.ncols_dst = args.ncols_max = mm->ne[1]; args.ncols_y = y->ne[1]; args.nrows_dst = mm->nb[1]/sizeof(float);
+    args.nchannels_x = args.nchannels_y = args.nsamples_x = args.nsamples_y = 1;
+    if (!ggml_cuda_mmq_dl_supported(args, *e)) {
+        return false;
+    }
+    const int  grid  = ggml_cuda_mmq_pq2_j16_grid(args, device.nsm);
+    const int  nty   = (int) (args.nrows_x/128);
+    const int  nkb   = (int) (args.ncols_x/QK8_0);
+    const bool tm64  = ggml_cuda_dl_q8_path(args, *e) == GGML_CUDA_DL_Q8_TM64;
+    const int  ctas  = tm64 ? 2*grid : grid;
+    // a matrix within the budget is prefetched whole, a larger one as its CTAs' first steps (all CTAs alike)
+    const int64_t bytes      = args.nrows_x*nkb*(int64_t) sizeof(block_q8_0);
+    const int64_t step_bytes = (int64_t) ctas*(tm64 ? 64 : 128)*4*sizeof(block_q8_0);
+    const int steps = bytes <= (int64_t) budget ? INT_MAX : (int) std::max<int64_t>(1, (int64_t) budget/step_bytes);
+    const ggml_cuda_kernel_launch_params params(dim3(ctas, 1, 1), dim3(32, 1, 1), 0, ctx.stream());
+    if (tm64) {
+        ggml_cuda_kernel_launch(ggml_cuda_dl_q8_lookahead<64>, params, (const char *) e->dl_tm64, nty, nkb, grid == nty ? 1 : 0, steps);
+    } else {
+        ggml_cuda_kernel_launch(ggml_cuda_dl_q8_lookahead<128>, params, (const char *) e->dl, nty, nkb, grid == nty ? 1 : 0, steps);
+    }
+    return true;
+}
+
 static bool ggml_cuda_decode_glu_enabled() {
     static const bool enabled = ggml_cuda_dl_env_int("GGML_CUDA_DECODE_GU_EPILOGUE", 1) != 0;
     return enabled;

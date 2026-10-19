@@ -43,13 +43,7 @@
 #define GGML_CUDA_DL_H_WBULK  1 // per-warp cp.async.bulk.prefetch.L2 of its step region (CH > 1: WM only)
 #define GGML_CUDA_DL_H_CBULK  2 // per-CTA cp.async.bulk.prefetch.L2 of the CTA step region (TM only)
 
-static __device__ __forceinline__ void ggml_cuda_dl_bulk_prefetch(const char * p, const uint32_t bytes) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
-    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(__cvta_generic_to_global(p)), "r"(bytes));
-#else
-    GGML_UNUSED_VARS(p, bytes);
-#endif
-}
+// ggml_cuda_dl_bulk_prefetch: common.cuh (shared with the L1 lookahead, ggml_cuda_l2_ahead)
 
 // L2 prefetch stream of one warp (or of the CTA, CBULK). It walks the CTA's own sequence of steps (the
 // steps of its segments in order, across tile boundaries) HD steps ahead of the loads, so a new segment
@@ -1042,6 +1036,47 @@ static void ggml_cuda_mmq_dl_launch_q8_tm64(const mmq_args & args, const ggml_cu
         (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
 }
 
+#define GGML_CUDA_DL_Q8_WARP 0
+#define GGML_CUDA_DL_Q8_RING 1
+#define GGML_CUDA_DL_Q8_TM64 2
+
+// Kernel of a Q8_0 decode-layout launch (ggml_cuda_mmq_dl_run; ggml_cuda_mul_mat_q_lookahead prefetches what it reads):
+// matrices of at least 4096 rows take the bulk-copy ring, 2 stages of one step (c64 microbenchmark), on the TM64 copy
+// for its shapes; GGML_CUDA_DL_RING=0 keeps the warp-load kernel.
+static int ggml_cuda_dl_q8_path(const mmq_args & args, const ggml_cuda_dl_entry & e) {
+    static const bool ring     = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING", 1) != 0;
+    static const int  ring_min = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_MIN_ROWS", 4096);
+    if (!ring || args.nrows_x < ring_min) {
+        return GGML_CUDA_DL_Q8_WARP;
+    }
+    return ggml_cuda_dl_q8_tm64_use(args, e) ? GGML_CUDA_DL_Q8_TM64 : GGML_CUDA_DL_Q8_RING;
+}
+
+// L2 lookahead of a Q8_0 decode-layout launch (ggml_cuda_mul_mat_q_lookahead, GB10 only). CTA b prefetches the first
+// `steps` K steps of the work of CTA b of that launch in the copy it reads: TM (I = 128) for the warp-load and ring
+// kernels, TM64 (I = 64, two CTAs per virtual 128-row CTA, half b % 2) for the TM64 ring. ggml_cuda_dl_tm64_work at the
+// launch's virtual grid and mode is the partition of ggml_cuda_dl_work. The prefetch starts once the previous kernel
+// of the stream has finished, so it streams weights during the latency-bound kernels in front of that launch instead
+// of competing with the previous weight stream. Nothing is written: a cache hint, no effect on any value.
+template <int I>
+__launch_bounds__(32, 1)
+static __global__ void ggml_cuda_dl_q8_lookahead(const char * x, const int nty, const int nkb, const int mode, const int steps) {
+    constexpr int GB = 4*sizeof(block_q8_0);
+    constexpr int H  = 128/I;
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    int it, st, rem, tile_inc;
+    ggml_cuda_dl_tm64_work<4, MMQ_ITER_K / QK8_0>(it, st, rem, tile_inc, nty, nkb, mode, blockIdx.x/H, gridDim.x/H);
+    const int nst = nkb / 4;
+    const int n   = min(steps, rem);
+    for (int k = threadIdx.x; k < n; k += 32) {
+        const int     vs  = it*nst + st + k;
+        const int64_t idx = H == 2 ? ggml_cuda_dl_tm64_stage_index(vs, nst, blockIdx.x % H) : (int64_t) vs;
+        ggml_cuda_dl_bulk_prefetch(x + idx*(I*GB), (uint32_t) (I*GB));
+    }
+    GGML_UNUSED(tile_inc);
+}
+
 // grid: the mul_mat_q grid rule (ggml_cuda_mmq_pq2_j16_grid). Stream-k shapes keep that partition and the
 // unchanged mul_mat_q_stream_k_fixup; pure-tiling shapes compute every tile in one CTA (mode 1, one tile
 // per CTA). Prefetch per shape class from the microbenchmark (c44 NOTES): PQ2_0 pure tiling: CTA bulk
@@ -1099,16 +1134,11 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
             ggml_cuda_mmq_dl_launch(mul_mat_q_pq2_j16_dl<TM, GGML_CUDA_DL_H_SECTOR, 2, 1>, attr, args, e, grid, 0, nkb, tmp_fixup, stream);
         }
     } else {
-        // Q8_0 matrices of at least 4096 rows: bulk-copy ring, 2 stages of one step (c64 microbenchmark);
-        // GGML_CUDA_DL_RING=0 keeps the warp-load kernel.
-        static const bool ring     = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING", 1) != 0;
-        static const int  ring_min = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_MIN_ROWS", 4096);
-        if (ring && args.nrows_x >= ring_min) {
-            if (ggml_cuda_dl_q8_tm64_use(args, e)) {
-                ggml_cuda_mmq_dl_launch_q8_tm64(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
-            } else {
-                ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_Q8, 2, 1>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
-            }
+        const int path = ggml_cuda_dl_q8_path(args, e);
+        if (path == GGML_CUDA_DL_Q8_TM64) {
+            ggml_cuda_mmq_dl_launch_q8_tm64(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
+        } else if (path == GGML_CUDA_DL_Q8_RING) {
+            ggml_cuda_mmq_dl_launch_ring<GGML_CUDA_DL_FMT_Q8, 2, 1>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
         } else {
             static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
             ggml_cuda_mmq_dl_launch(mul_mat_q_q8_0_j16_dl<TM, GGML_CUDA_DL_H_SECTOR, 2, 1>, attr, args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);

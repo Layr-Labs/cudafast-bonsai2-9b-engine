@@ -2025,3 +2025,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 bool ggml_cuda_mul_mat_q_fixup_producer(ggml_backend_cuda_context & ctx,
     const ggml_tensor * weight, const ggml_tensor * input, ggml_tensor * dst,
     const void * q8, float * partials);
+
+// GB10 decode: L2 prefetch, about `budget` bytes, of the weight bytes that the decode-layout launch of the Q8_0 MUL_MAT
+// mm reads first (its kernel, copy and CTA partition: ggml_cuda_dl_q8_lookahead). Launched on the stream ahead of the
+// latency-bound kernels before mm; it writes nothing. Returns false (nothing launched) when mm takes another route.
+bool ggml_cuda_mul_mat_q_lookahead(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, size_t budget);

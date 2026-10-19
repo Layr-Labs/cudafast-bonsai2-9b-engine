@@ -4093,6 +4093,59 @@ static int ggml_cuda_d4_side_plan(const ggml_backend_cuda_context & ctx, const g
     return j;
 }
 
+// GB10 decode verify (L1 lookahead, ggml_cuda_l2_ahead): the GATED_DELTA_NET node at i prefetches the GDN out-projection
+// weights while its recurrence and the gnorm quantizer leave DRAM mostly idle (the z projection on stream 1 and the
+// recurrence's own state traffic come first). The target is the first later PQ2_0 MUL_MAT that depends on the node's
+// output (the z projection reads the layer input and is passed over) when it runs as the PTQ1_0 decode-layout ring over
+// the stream-k partition (ggml_cuda_mmq_dl_run, ggml_cuda_mul_mat_q_fixup_producer): per CTA range the steps after the
+// ring's own 3 stages of 2 steps, at most cap. Default cap 16: all of them for 4096 x 4096 (736 of 1024 steps, 2.5 of
+// 3.5 MiB, about the DRAM time those kernels leave idle).
+// GGML_CUDA_L2_LOOKAHEAD=0 disables it; a positive value sets the cap in steps.
+static ggml_cuda_l2_ahead ggml_cuda_l2_ahead_plan(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const int cap = getenv("GGML_CUDA_L2_LOOKAHEAD") == nullptr ? 16 : std::max(0, atoi(getenv("GGML_CUDA_L2_LOOKAHEAD")));
+    ggml_cuda_l2_ahead plan = {};
+    const ggml_tensor * gdn = cgraph->nodes[i];
+    const auto & dev = ggml_cuda_info().devices[ctx.device];
+    if (cap == 0 || dev.cc != GGML_CUDA_CC_DGX_SPARK || gdn->src[2] == nullptr || gdn->src[2]->ne[2] > 16) {
+        return plan;
+    }
+    std::vector<const ggml_tensor *> dep = { gdn };
+    const int kmax = std::min(cgraph->n_nodes, i + 64);
+    for (int k = i + 1; k < kmax; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        bool reads = false;
+        for (int s = 0; s < GGML_MAX_SRC && !reads; ++s) {
+            reads = t->src[s] != nullptr && std::find(dep.begin(), dep.end(), t->src[s]) != dep.end();
+        }
+        if (!reads) {
+            continue;
+        }
+        if (t->op != GGML_OP_MUL_MAT || t->src[0] == nullptr || t->src[0]->type != GGML_TYPE_PQ2_0) {
+            dep.push_back(t);
+            continue;
+        }
+        const ggml_tensor * w = t->src[0];
+        const ggml_cuda_dl_entry * e = ggml_cuda_dl_find(w->data);
+        mmq_args a = {};
+        a.nrows_x = w->ne[1];
+        const int grid = ggml_cuda_mmq_pq2_j16_grid(a, dev.nsm);
+        if (e != nullptr && e->dl != nullptr && e->type == GGML_TYPE_PQ2_0 && e->dl_type == GGML_TYPE_PTQ1_0 &&
+                e->nrows == w->ne[1] && e->ncols == w->ne[0] && w->ne[1] >= 2048 && w->ne[1] % 128 == 0 &&
+                w->ne[0] % MMQ_ITER_K == 0 && t->src[1]->ne[1] <= 16 && grid != (int) (w->ne[1] / 128)) {
+            plan.x          = e->dl;
+            plan.nst        = (int) (w->ne[0] / QK_PQ2_0);
+            plan.nty        = (int) (w->ne[1] / 128);
+            plan.grid       = grid;
+            plan.bpi        = MMQ_ITER_K / QK_PQ2_0;
+            plan.skip       = 3*2;
+            plan.steps      = cap;
+            plan.step_bytes = 128*(int) sizeof(block_ptq1_0);
+        }
+        return plan;
+    }
+    return plan;
+}
+
 // GB10 decode (verify batches of at most 16 rows): the ffn_gate/ffn_up MUL_MAT pair of one D4 activation feeding a
 // SWIGLU as one stacked launch over the pair's back-to-back PTQ1_0 decode-layout copy (ggml_cuda_glu_pair::dl_stacked):
 // the gate matmul runs its own path (ggml_cuda_mul_mat) with a stacking request that launch_mul_mat_q takes only for
@@ -7108,6 +7161,67 @@ static bool ggml_cuda_try_dflash_concat_q8(ggml_backend_cuda_context & ctx,
     return true;
 }
 
+// GB10 DFlash2 drafter graph: L2 lookahead of its 16-row Q8_0 projections (ggml_cuda_mul_mat_q_lookahead). A projection
+// gets its first weight bytes prefetched right after the previous weight matmul (or at the graph start) when the kernels
+// in between are latency-bound: a norm, the block convolution or the attention, during which the DRAM would idle.
+// Budget per stretch: about its idle DRAM time (not measured; the attention stretch is the longest). Only graphs with a
+// DFLASH2_CONV node. GGML_CUDA_D1=0 disables it.
+struct ggml_cuda_lookahead_plan {
+    int    after;  // the previous weight matmul (-1: the graph start)
+    int    target;
+    size_t budget;
+};
+
+// a MUL_MAT that ggml_cuda_mul_mat sends to MMQ with J = 16 and a Q8_0 weight
+static bool ggml_cuda_lookahead_target(const ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * y = mm->src[1];
+    const int cc   = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp = ggml_cuda_info().devices[ctx.device].warp_size;
+    return mm->op == GGML_OP_MUL_MAT && w->type == GGML_TYPE_Q8_0 && y != nullptr && y->type == GGML_TYPE_F32 &&
+        mm->type == GGML_TYPE_F32 && y->ne[1] > 8 && y->ne[1] <= 16 && ggml_is_contiguous(w) &&
+        ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD &&
+        !ggml_cuda_should_use_mmvf(w->type, cc, w->ne, w->nb, y->ne[1]) &&
+        !ggml_cuda_should_use_mmf(w->type, cc, warp, w->ne, w->nb, y->ne[1], false) &&
+        !ggml_cuda_should_use_mmvq(w->type, cc, y->ne[1]) && ggml_cuda_should_use_mmq(w->type, cc, y->ne[1], 0);
+}
+
+static std::vector<ggml_cuda_lookahead_plan> ggml_cuda_plan_lookahead(const ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
+    constexpr size_t budget      = 4608*1024; // at least a whole 1024 x 4096 Q8_0 matrix
+    constexpr size_t budget_attn = 6144*1024;
+    std::vector<ggml_cuda_lookahead_plan> plan;
+    bool drafter = false;
+    for (int j = 0; j < cgraph->n_nodes && !drafter; ++j) {
+        drafter = cgraph->nodes[j]->op == GGML_OP_DFLASH2_CONV;
+    }
+    if (!drafter) {
+        return plan;
+    }
+    int  prev    = -1;
+    bool latency = false;
+    bool attn    = false;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if ((t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        const ggml_tensor * w = t->src[0];
+        if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && w && w->buffer &&
+                ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            if (latency && ggml_cuda_lookahead_target(ctx, t)) {
+                plan.push_back({ prev, j, attn ? budget_attn : budget });
+            }
+            prev    = j;
+            latency = false;
+            attn    = false;
+        } else if (t->op == GGML_OP_RMS_NORM || t->op == GGML_OP_DFLASH2_CONV || t->op == GGML_OP_FLASH_ATTN_EXT) {
+            latency = true;
+            attn    = attn || t->op == GGML_OP_FLASH_ATTN_EXT;
+        }
+    }
+    return plan;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -7159,6 +7273,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     }();
     static const bool shared_q8_enabled = [] {
         const char * env = getenv("GGML_CUDA_GB10_SHARED_Q8");
+        return !env || std::atoi(env) != 0;
+    }();
+    static const bool lookahead_enabled = [] {
+        const char * env = getenv("GGML_CUDA_D1");
         return !env || std::atoi(env) != 0;
     }();
 
@@ -7278,6 +7396,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_tensor * pending_zero = nullptr;  // a deferred zeroing SCALE of a recurrent-cache row
             int side_node = -1;  // a D4 matmul planned on stream 1 (ggml_cuda_d4_side_plan), forked already
             const ggml_tensor * gdn_mmf_pending = nullptr;
+            const std::vector<ggml_cuda_lookahead_plan> lookahead = lookahead_enabled && stream_ctx.concurrent_events.empty() &&
+                ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_DGX_SPARK ?
+                ggml_cuda_plan_lookahead(*cuda_ctx, cgraph) : std::vector<ggml_cuda_lookahead_plan>();
+            size_t lookahead_next = 0;
             const auto flush_zero = [&]() {
                 if (pending_zero != nullptr) {
                     ggml_cuda_op_scale(*cuda_ctx, pending_zero);
@@ -7321,6 +7443,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 prev_i = i;
+
+                // the first node after a planned stretch's opening matmul (its stores and fixup are queued): the lookahead
+                while (lookahead_next < lookahead.size() && lookahead[lookahead_next].after < i) {
+                    const ggml_cuda_lookahead_plan & la = lookahead[lookahead_next++];
+                    if (la.target >= i && !is_concurrent_event_active && cuda_ctx->curr_stream_no == 0) {
+                        ggml_cuda_mul_mat_q_lookahead(*cuda_ctx, cgraph->nodes[la.target], la.budget);
+                    }
+                }
 
                 if (node == gdn_mmf_pending) {
                     GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
@@ -7657,6 +7787,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                if (node->op == GGML_OP_GATED_DELTA_NET) {
+                    cuda_ctx->l2_ahead = !is_concurrent_event_active && cuda_ctx->curr_stream_no == 0 ?
+                        ggml_cuda_l2_ahead_plan(*cuda_ctx, cgraph, i) : ggml_cuda_l2_ahead{};
+                }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
