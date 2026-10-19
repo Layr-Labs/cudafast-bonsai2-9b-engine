@@ -23,3 +23,32 @@ static __global__ void mul_mat_q_q8_dl_fixup_pair(float * dst,const float * part
         }
     }
 }
+
+// Small Q8 DL48 projections: equal groups of producer partitions per tile.
+// The guard ensures every group member has nonempty aligned work.
+template <int NTILES>
+__launch_bounds__(128, 1)
+static __global__ void mul_mat_q_q8_small_fixup_compact(
+        float * dst, const float * partials, int stride, int cols) {
+    static_assert(NTILES == 1 || NTILES == 2 || NTILES == 4 || NTILES == 8, "small DL48 tiles");
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+#endif
+    constexpr int PARTS = 48/NTILES;
+    const int tile = blockIdx.x;
+    const int owner = PARTS*(tile+1)-1;
+    const int row = 32*blockIdx.y + threadIdx.x;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int col = threadIdx.y + 4*j;
+        if (col < cols) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int pred = 1; pred < PARTS; ++pred) {
+                sum += partials[(owner-pred)*(16*128) + col*128 + row];
+            }
+            dst[col*stride + tile*128 + row] += sum;
+        }
+    }
+}

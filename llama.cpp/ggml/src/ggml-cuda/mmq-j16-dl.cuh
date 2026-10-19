@@ -1117,6 +1117,20 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
     if (!tiling) {
         if constexpr (type == GGML_TYPE_Q8_0) {
             const int BPI=ggml_cuda_mmq_get_K_vram(type,16,false,GGML_CUDA_CC_DGX_SPARK)/QK8_0;
+            if (grid == 48 && args.dst_hi == nullptr && args.nrows_dst >= args.nrows_x &&
+                    args.nrows_dst <= INT32_MAX &&
+                    (args.ncols_dst - 1)*args.nrows_dst + args.nrows_x - 1 <= INT32_MAX &&
+                    (args.nrows_x == 128 || args.nrows_x == 256 || args.nrows_x == 512 || args.nrows_x == 1024) &&
+                    nkb >= (48/(args.nrows_x/128))*BPI && nkb%BPI == 0) {
+                const auto fixup = args.nrows_x == 128 ? mul_mat_q_q8_small_fixup_compact<1> :
+                                   args.nrows_x == 256 ? mul_mat_q_q8_small_fixup_compact<2> :
+                                   args.nrows_x == 512 ? mul_mat_q_q8_small_fixup_compact<4> :
+                                                        mul_mat_q_q8_small_fixup_compact<8>;
+                ggml_cuda_kernel_launch(fixup,
+                    ggml_cuda_kernel_launch_params(dim3(args.nrows_x/128, 4), dim3(32, 4), 0, stream),
+                    args.dst, (const float *) tmp_fixup, (int) args.nrows_dst, (int) args.ncols_dst);
+                return;
+            }
             if (grid==48 && args.nrows_x==4096 && nkb>=16*BPI && nkb%BPI==0) {
                 ggml_cuda_kernel_launch(mul_mat_q_q8_dl_fixup_pair,
                     ggml_cuda_kernel_launch_params(dim3(32,4),dim3(32,4),0,stream),
