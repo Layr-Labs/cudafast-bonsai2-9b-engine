@@ -23,3 +23,32 @@ static __global__ void mul_mat_q_q8_dl_fixup_pair(float * dst,const float * part
         }
     }
 }
+
+// PTQ DL48 stream-k reductions: 32 tiles have one predecessor per owner;
+// 16 tiles have two. The host guard excludes alignment-degenerate partitions.
+// Producer ownership and tmp_last_tile allocation remain completely unchanged.
+template <int NTILES>
+__launch_bounds__(128, 1)
+static __global__ void mul_mat_q_ptq_dl_fixup_compact(
+        float * dst, const float * partials, int stride, int cols) {
+    static_assert(NTILES == 16 || NTILES == 32, "fixed DL48 row geometry");
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+    ggml_cuda_pdl_sync();
+    ggml_cuda_pdl_lc();
+#endif
+    const int tile = blockIdx.x;
+    const int owner = NTILES == 16 ? 3*tile + 2 : 3*(tile/2) + 1 + tile%2;
+    const int row = 32*blockIdx.y + threadIdx.x;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int col = threadIdx.y + 4*j;
+        if (col < cols) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int pred = 1; pred <= (NTILES == 16 ? 2 : 1); ++pred) {
+                sum += partials[(owner-pred)*(16*128) + col*128 + row];
+            }
+            dst[col*stride + tile*128 + row] += sum;
+        }
+    }
+}

@@ -1115,6 +1115,19 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
         }
     }
     if (!tiling) {
+        if constexpr (type == GGML_TYPE_PQ2_0) {
+            const int BPI = ggml_cuda_mmq_get_K_vram(type, 16, false, GGML_CUDA_CC_DGX_SPARK)/QK_PQ2_0;
+            if (grid == 48 && e.dl_type == GGML_TYPE_PTQ1_0 && args.dst_hi == nullptr &&
+                    (args.nrows_x == 2048 || args.nrows_x == 4096) && args.nrows_dst >= args.nrows_x &&
+                    args.ncols_dst >= 1 && args.ncols_dst <= 16 && nkb >= 16*BPI && nkb%BPI == 0) {
+                const auto fixup = args.nrows_x == 2048 ? mul_mat_q_ptq_dl_fixup_compact<16>
+                                                       : mul_mat_q_ptq_dl_fixup_compact<32>;
+                ggml_cuda_kernel_launch(fixup,
+                    ggml_cuda_kernel_launch_params(dim3(args.nrows_x/128, 4), dim3(32, 4), 0, stream),
+                    args.dst, (const float *) tmp_fixup, (int) args.nrows_dst, (int) args.ncols_dst);
+                return;
+            }
+        }
         if constexpr (type == GGML_TYPE_Q8_0) {
             const int BPI=ggml_cuda_mmq_get_K_vram(type,16,false,GGML_CUDA_CC_DGX_SPARK)/QK8_0;
             if (grid==48 && args.nrows_x==4096 && nkb>=16*BPI && nkb%BPI==0) {
