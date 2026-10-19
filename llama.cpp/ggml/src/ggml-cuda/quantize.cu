@@ -1085,7 +1085,7 @@ static __global__ void fwht_quantize_mmq_d4(const T * x, const T * g, const floa
             }
             if constexpr(SIGNED) v[i]*=signs[base+i*NT+tid];
         }
-        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+        ggml_cuda_fwht_register_transpose_butterfly<N,NT>(v,shared,tid,lane);
     } else {
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
