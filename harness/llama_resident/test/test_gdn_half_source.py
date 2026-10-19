@@ -5,6 +5,7 @@ These are source/provenance checks, not numerical equivalence claims for C16.
 """
 from hashlib import sha256
 from pathlib import Path
+from test_gdn_block_source import without_block_launcher, without_fused_header, without_block_route
 
 root = Path(__file__).resolve().parents[3]
 HEADER_SHA = '0301cfaa8255510ed87cd0bae46fbabebf41cabac82481c60fb03694cd4076e0'
@@ -12,16 +13,18 @@ BRANCH_SHA = '6e875f735d256de3fe0302edf69b0eb9179d430b7476891791f2d80d090d5bd9'
 
 
 def without_half_launcher(source):
+    source = without_block_launcher(source)
     include = '#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)\n#include "gdn-half-prefill.cuh"\n#endif\n'
     assert source.count(include) == 1
     start = source.index('        static const bool half_prefill =')
     end = source.index('        ggml_cuda_pool_alloc<gdn_chunk32>', start)
     assert sha256(source[start:end].encode()).hexdigest() == BRANCH_SHA
-    assert sha256((root / 'llama.cpp/ggml/src/ggml-cuda/gdn-half-prefill.cuh').read_bytes()).hexdigest() == HEADER_SHA
+    assert sha256(without_fused_header().encode()).hexdigest() == HEADER_SHA
     return (source[:start] + source[end:]).replace(include, '', 1)
 
 
 def without_half_route_test(source):
+    source = without_block_route(source)
     replacements = [
         ('int gdns=0,prepares=0,scans=0,resets=0,half_prepares=0,half_scans=0,materializers=0;',
          'int gdns=0,prepares=0,scans=0,resets=0;'),

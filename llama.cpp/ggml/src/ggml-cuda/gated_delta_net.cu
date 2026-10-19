@@ -6,6 +6,7 @@
 #include "state-clear.cuh"
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include "gdn-half-prefill.cuh"
+#include "gdn-half-prefill32.cuh"
 #endif
 
 #include <cstdlib>
@@ -387,6 +388,18 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (half_prefill && H==32 && neqk1==16 && K==16 && (n_tokens-K)%16==0 &&
                 cache!=nullptr && sb1==1 && sb2==H &&
                 (raw_precomputed || g_precomputed)) {
+            static const bool c32 = getenv("GGML_CUDA_GDN_HALF_C32") == nullptr || atoi(getenv("GGML_CUDA_GDN_HALF_C32")) != 0;
+            if (c32) {
+                static bool logged=false;
+                if(!logged){GGML_LOG_INFO("gdn_half_c32: prefix=%lld padded32=1 gram=f16 inverse=tf32x3 VC=32\n",(long long)n_tokens-16);logged=true;}
+                if(qk_packed)gdn_half_prefill32_launch<true>(ctx,q_d,k_d,v_d,g_d,b_d,rb_d,ra_d,s_d,dst_d,state_d,
+                    int(n_tokens),sq1,sq2,sq3,sv1,sv2,sv3,sb1,sb2,sb3,scale,state_slot_stride,
+                    s_ids,s_row_stride,lazy,zero[0],zero[0]?*zero[1]:0.0f,zero[0]?*zero[2]:0.0f,stream);
+                else gdn_half_prefill32_launch<false>(ctx,q_d,k_d,v_d,g_d,b_d,rb_d,ra_d,s_d,dst_d,state_d,
+                    int(n_tokens),sq1,sq2,sq3,sv1,sv2,sv3,sb1,sb2,sb3,scale,state_slot_stride,
+                    s_ids,s_row_stride,lazy,zero[0],zero[0]?*zero[1]:0.0f,zero[0]?*zero[2]:0.0f,stream);
+                return;
+            }
             if (qk_packed) {
                 gdn_half_prefill_launch<false,true,true>(ctx,q_d,k_d,v_d,g_d,b_d,rb_d,ra_d,s_d,dst_d,state_d,
                     int(n_tokens),sq1,sq2,sq3,sv1,sv2,sv3,sb1,sb2,sb3,scale,state_slot_stride,

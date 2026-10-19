@@ -172,19 +172,58 @@ template<bool RAW,bool OPT_INVERSE=false> __global__ __launch_bounds__(128) void
     if(tid<C){float p=1,last=1;for(int i=0;i<=tid;++i)p*=gg[i];for(int i=tid+1;i<C;++i)last*=gg[i];c->p[tid]=p;c->last[tid]=last;}
 }
 
-template<bool EARLY_V=false,bool WARP_R=false>
+struct InitialState {
+    const float* current;const float* cache;const int32_t* ids;
+    int64_t slot_stride,row_stride;int lazy;
+    const float* zero_row;float zero_scale,zero_bias;
+};
+union __align__(16) OperandStorage {
+    struct {__half q[C*QK],k[C*QK];} pair;
+    float initial[VC*D];
+};
+static_assert(sizeof(OperandStorage)==2*C*QK*sizeof(__half),"initial transpose reuses Q/K storage");
+__device__ __forceinline__ void read_initial(InitialState in,float* tile,int h,int v0) {
+    const int lane=threadIdx.x,w=threadIdx.y,col=v0+w*4;
+    const int64_t selected=in.ids?int64_t(in.ids[0])*in.row_stride:0;
+    const bool zeroed=in.zero_row&&in.current+selected==in.zero_row;
+    const float* current=in.current+selected+int64_t(h)*D*D;
+    const float* cache=in.cache+int64_t(h)*D*D;
+    float shard[4][4];
+    // The flat physical grid has y1. Logical GD1/GD2 geometry stays z8/w4.
+    const bool replayed=in.lazy&&!zeroed&&gdn_lazy_replay<128,32,4,4>(shard,current,cache,
+        in.slot_stride,16,col,lane,col/16,(col%16)/4,8);
+#pragma unroll
+    for(int c=0;c<4;++c) {
+#pragma unroll
+        for(int r=0;r<4;++r) {
+            const int row=r*32+lane;
+            float value=replayed?shard[c][r]:current[(col+c)*D+row];
+            if(zeroed)value=in.zero_scale*value+in.zero_bias;
+            tile[(w*4+c)*D+row]=value;
+        }
+    }
+}
+
+template<bool EARLY_V=false,bool WARP_R=false,bool FUSED_INITIAL=false>
 __global__ __launch_bounds__(128) void carry_packed(Frame f,const Coeff*coef,const __half*packed,
-        const float*initial,float*output,float*final_state,float*boundary,float scale) {
+        const float*initial,float*output,float*final_state,float*boundary,float scale,InitialState init) {
     ggml_cuda_pdl_sync();
-    const int h=blockIdx.x,v0=blockIdx.y*VC,w=threadIdx.y,tid=w*32+threadIdx.x;
-    __shared__ __align__(16) __half q[C*QK],k[C*QK],hs[D*SMALL],a[C*SMALL],m[C*SMALL],r[C*SMALL],delta[C*SMALL];
+    const int h=FUSED_INITIAL?blockIdx.x/8:blockIdx.x,v0=(FUSED_INITIAL?blockIdx.x%8:blockIdx.y)*VC,w=threadIdx.y,tid=w*32+threadIdx.x;
+    __shared__ OperandStorage operands;
+    __half* q=operands.pair.q;__half* k=operands.pair.k;
+    __shared__ __align__(16) __half hs[D*SMALL],a[C*SMALL],m[C*SMALL],r[C*SMALL],delta[C*SMALL];
     __shared__ float oo[C*VC],p[C],last[C];
+    if constexpr(FUSED_INITIAL){read_initial(init,operands.initial,h,v0);__syncthreads();}
     float s[4][4];
 #pragma unroll
     for(int t=0;t<4;++t){const int tile=w+t*4,mr=(tile/2)*16,n=(tile%2)*8;
 #pragma unroll
-        for(int j=0;j<4;++j)s[t][j]=initial[(h*D+v0+n+gdn_half_c16::cc(j))*D+mr+gdn_half_c16::cr(j)];
+        for(int j=0;j<4;++j) {
+            if constexpr(FUSED_INITIAL)s[t][j]=operands.initial[(n+gdn_half_c16::cc(j))*D+mr+gdn_half_c16::cr(j)];
+            else s[t][j]=initial[(h*D+v0+n+gdn_half_c16::cc(j))*D+mr+gdn_half_c16::cr(j)];
+        }
     }
+    if constexpr(FUSED_INITIAL)__syncthreads(); // release F32 transpose before Q/K copies
     for(int ch=0;ch<(f.nt+C-1)/C;++ch){const int first=ch*C;const Coeff*c=coef+ch*H+h;
         const __half*pq=packed+(ch*HK+h%HK)*2*C*D,*pk=pq+C*D;
 #pragma unroll
@@ -294,18 +333,29 @@ static void gdn_half_prefill_launch(
         const float * zero_row,float zero_scale,float zero_bias,cudaStream_t stream) {
     static_assert(!RAW && PRE,"first production experiment requires precomputed gates");
     const int prefix=T-16;
-    ggml_cuda_pool_alloc<float> initial(ctx.pool(),size_t(32)*128*128);
+    static const bool fused_initial=getenv("GGML_CUDA_GDN_FUSED_INITIAL")==nullptr||atoi(getenv("GGML_CUDA_GDN_FUSED_INITIAL"))!=0;
+    ggml_cuda_pool_alloc<float> initial(ctx.pool());
+    if(!fused_initial)initial.alloc(size_t(32)*128*128);
     ggml_cuda_pool_alloc<gdn_half_c16::Coeff> coefficients(ctx.pool(),size_t(32)*(prefix/16));
     ggml_cuda_pool_alloc<__half> packed(ctx.pool(),size_t(prefix)*16*128*2);
     const ggml_cuda_kernel_launch_params mat(dim3(32,1,8),dim3(32,4),0,stream);
-    ggml_cuda_kernel_launch(gdn_half_initial_state,mat,current,state,initial.ptr,slot_stride,
+    if(!fused_initial)ggml_cuda_kernel_launch(gdn_half_initial_state,mat,current,state,initial.ptr,slot_stride,
         ids,row_stride,lazy,zero_row,zero_scale,zero_bias);
     const gdn_half_c16::Frame frame{q,k,v,g,beta,bias,a,prefix,PACKED,sq1,sq2,sv1,sv2};
     const ggml_cuda_kernel_launch_params prep(dim3(32,prefix/16),dim3(32,4),0,stream);
     ggml_cuda_kernel_launch(gdn_half_prefill::prepare_packed<false>,prep,frame,coefficients.ptr,packed.ptr);
     const ggml_cuda_kernel_launch_params carry(dim3(32,8),dim3(32,4),0,stream);
+    if(fused_initial) {
+        static bool logged=false;
+        if(!logged){GGML_LOG_INFO("gdn_fused_initial: logical8x4 reader, flat256 carry, prefix=%d\n",prefix);logged=true;}
+        const ggml_cuda_kernel_launch_params flat(dim3(256,1),dim3(32,4),0,stream);
+        const gdn_half_prefill::InitialState init{current,state,ids,slot_stride,row_stride,lazy,zero_row,zero_scale,zero_bias};
+        ggml_cuda_kernel_launch(gdn_half_prefill::carry_packed<true,false,true>,flat,frame,coefficients.ptr,packed.ptr,
+            (const float*)nullptr,output,state,(float*)nullptr,scale,init);
+    } else {
     ggml_cuda_kernel_launch(gdn_half_prefill::carry_packed<true,false>,carry,frame,coefficients.ptr,packed.ptr,
-        initial.ptr,output,state,(float *)nullptr,scale);
+        initial.ptr,output,state,(float *)nullptr,scale,gdn_half_prefill::InitialState{});
+    }
     // Same scalar tail as N1. It creates every snapshot/header/checksum from
     // the new rounded boundary; later rollback readers retain their protocol.
     ggml_cuda_kernel_launch(gated_delta_net_l8_cuda<false,true,PACKED,true>,mat,
