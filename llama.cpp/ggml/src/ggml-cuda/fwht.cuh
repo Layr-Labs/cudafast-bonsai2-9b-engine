@@ -2,8 +2,9 @@
 
 // In-register block FWHT over N floats held as NE = N/NT per thread, element i*NT + tid in reg[i].
 // Shared by the standalone kernel (fwht_cuda_block) and the fused FWHT + q8_1 quantizer so both
-// produce bit-identical transforms. `s` must hold N floats.
-template <int N, int NT>
+// produce bit-identical transforms. `s` must hold N floats. TERMINAL may be true
+// only if the caller never reuses scratch without another block barrier.
+template <int N, int NT, bool TERMINAL = false>
 __device__ __forceinline__ void ggml_cuda_fwht_block_butterfly(float * reg, float * s, const int tid, const int lane) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int NE        = N / NT;
@@ -34,7 +35,9 @@ __device__ __forceinline__ void ggml_cuda_fwht_block_butterfly(float * reg, floa
             const float val2 = s[j * NT + (tid ^ h)];
             reg[j] = (tid & h) == 0 ? val + val2 : val2 - val;
         }
-        __syncthreads();
+        // A terminal caller never accesses shared scratch again: final reads
+        // need not converge before the register-only high stages and stores.
+        if (!TERMINAL || h * 2 < NT) __syncthreads();
     }
 
     // stages above the block width: partner is another register of the same thread
