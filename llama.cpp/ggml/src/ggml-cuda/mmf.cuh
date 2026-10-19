@@ -434,6 +434,52 @@ static __global__ void mul_mat_f_ksplit_partial(
 // included. The blocks are mul_mat_f_ksplit_partial's (w, row tile, column tile) chains of both matrices, in clusters
 // of the nwarps chains of one tile (cluster rank = w). Rank 0 adds the cluster's accumulators from distributed shared
 // memory in rank order starting from zero, as mul_mat_f_ksplit_reduce adds the partials: the same bits.
+#if defined(AMPERE_MMA_AVAILABLE) && !defined(VOLTA_MMA_AVAILABLE)
+// A warp covers four rows with eight contiguous 16-byte chunks per row. This
+// preserves the coalesced sectors and shared MMA layout, but cuts scalar loads
+// and stores to packed records. The unaligned route keeps the original chain.
+static __device__ __forceinline__ void mul_mat_f_ksplit_chain_vector_operands(
+        const float * x, const float * y, float * tile_xy,
+        const int ncols, const int stride_row, const int stride_col_y, const int w,
+        tile<16, 8, float> & C) {
+    typedef tile<16, 8, float> tile_A;
+    typedef tile<8, 8, float> tile_B;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int pitch = warp_size + mmf_get_padding();
+    float4 xr[4], yr[2];
+    const int row = threadIdx.x / 8;
+    const int c4 = 4*(threadIdx.x % 8);
+    const auto fetch = [&](const int base) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) xr[i] = *reinterpret_cast<const float4 *>(x + (4*i+row)*stride_row + base + c4);
+#pragma unroll
+        for (int j = 0; j < 2; ++j) yr[j] = *reinterpret_cast<const float4 *>(y + (4*j+row)*stride_col_y + base + c4);
+    };
+    int col = w*warp_size;
+    if (col < ncols) fetch(col);
+    for (; col < ncols; col += mmf_ksplit_nwarps*warp_size) {
+        tile_A A[warp_size/tile_A::J];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) *reinterpret_cast<float4 *>(tile_xy + (4*i+row)*pitch + c4) = xr[i];
+        __syncwarp();
+#pragma unroll
+        for (int k = 0; k < warp_size; k += tile_A::J) load_ldmatrix(A[k/tile_A::J], tile_xy+k, pitch);
+        __syncwarp();
+#pragma unroll
+        for (int j = 0; j < 2; ++j) *reinterpret_cast<float4 *>(tile_xy + (4*j+row)*pitch + c4) = yr[j];
+        __syncwarp();
+        if (col + mmf_ksplit_nwarps*warp_size < ncols) fetch(col + mmf_ksplit_nwarps*warp_size);
+#pragma unroll
+        for (int k = 0; k < warp_size; k += tile_B::J) {
+            tile_B B;
+            load_ldmatrix(B, tile_xy+k, pitch);
+            mma(C, A[k/tile_A::J], B);
+        }
+        __syncwarp();
+    }
+}
+#endif
+
 static __global__ void mul_mat_f_ksplit_pair(
         const float * x0, const float * x1, const float * y, float * dst0, float * dst1,
         const int ncols, const int nrb, const int stride_row0, const int stride_row1, const int stride_col_y,
@@ -468,13 +514,18 @@ static __global__ void mul_mat_f_ksplit_pair(
     ggml_cuda_pdl_sync();
     ggml_cuda_pdl_lc();
 
-    extern __shared__ char data_mmf_ksplit[];
-    float * tile_xy = (float *) data_mmf_ksplit;
+    extern __shared__ __align__(16) char data_mmf_ksplit_pair[];
+    float * tile_xy = (float *) data_mmf_ksplit_pair;
     static_assert(tile_C::ne == 4, "four exact accumulator values per lane");
     __shared__ float4 acc[warp_size];
 
     tile_C C;
-    mul_mat_f_ksplit_chain(x, y, tile_xy, ncols, stride_row, stride_col_y, w, itB, C);
+    if (((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(y)) & 15) == 0 &&
+            stride_row % 4 == 0 && stride_col_y % 4 == 0 && ncols % warp_size == 0) {
+        mul_mat_f_ksplit_chain_vector_operands(x, y, tile_xy, ncols, stride_row, stride_col_y, w, C);
+    } else {
+        mul_mat_f_ksplit_chain(x, y, tile_xy, ncols, stride_row, stride_col_y, w, itB, C);
+    }
 
     acc[threadIdx.x] = make_float4(C.x[0], C.x[1], C.x[2], C.x[3]);
     cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
