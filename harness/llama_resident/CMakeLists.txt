@@ -251,6 +251,22 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
             $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
         target_link_libraries(rms-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
         add_test(NAME rms-fwht-equivalence COMMAND rms-fwht-equivalence)
+        foreach(s1_test IN ITEMS s1-fa-splits s1-dflash-kv-j8)
+            string(REPLACE "-" "_" s1_source "${s1_test}")
+            add_executable(${s1_test} test/${s1_source}.cu)
+            target_include_directories(${s1_test} PRIVATE
+                ${LLAMA_CPP_DIR}/ggml/src ${LLAMA_CPP_DIR}/ggml/src/ggml-cuda)
+            target_compile_definitions(${s1_test} PRIVATE
+                $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
+            # Same codegen flags as the ggml-cuda library (-use_fast_math, sm_121a): the frozen parent
+            # bodies in the test TU must compile exactly like the production kernels they are compared to.
+            target_compile_options(${s1_test} PRIVATE
+                $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>
+                $<$<COMPILE_LANGUAGE:CUDA>:-extended-lambda>
+                $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+            set_target_properties(${s1_test} PROPERTIES CUDA_ARCHITECTURES "121a")
+            target_link_libraries(${s1_test} PRIVATE ggml ggml-cuda ggml-base CUDA::cudart)
+        endforeach()
         add_executable(gnorm-fwht-equivalence test/gnorm_fwht_equivalence.cu)
         target_include_directories(gnorm-fwht-equivalence PRIVATE
             ${LLAMA_CPP_DIR}/ggml/src
