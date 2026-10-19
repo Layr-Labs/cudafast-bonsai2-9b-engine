@@ -768,6 +768,71 @@ static __device__ __forceinline__ void ggml_cuda_ptq1_j16_jit_step(
     }
 }
 
+// Paired scale-only transport for the fused GU JIT path. The ordinary helper
+// above is retained verbatim as a fallback and independent test reference.
+static __device__ __forceinline__ void ggml_cuda_ptq1_j16_jit_pair_scale_step(
+        float (&sum)[1][4], const char * sx, const char * sy, const int c) {
+    ggml_cuda_ptq1_j16_stage st;
+    const uint32_t * xw = (const uint32_t *) sx;
+    st.wa = xw[c];
+    st.wb = xw[4 + (c & 1)];
+    st.w6 = xw[6];
+    // The original decoder reads only these three initialized weight words.
+    uint32_t b[4][2];
+    ggml_cuda_ptq1_j16_decode(b, st, c);
+    const int xd = int(st.w6 >> 16);
+    const int d_lo = __shfl_sync(0xFFFFFFFF, xd, 8*c + 0);
+    const int d_hi = __shfl_sync(0xFFFFFFFF, xd, 8*c + 4);
+    const float dA[2] = {
+        __half2float(__ushort_as_half((unsigned short) d_lo)),
+        __half2float(__ushort_as_half((unsigned short) d_hi)),
+    };
+#pragma unroll
+    for (int pair = 0; pair < 2; ++pair) {
+        // Scale pairs remain in shared memory at aligned 8-byte offsets. Two
+        // vector loads replace four scalar loads without lengthening quant lifetime.
+        float bs0, bs1, bt0, bt1;
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP)
+        const uint32_t bp = ggml_cuda_dl_smem_u32(sy + pair*2*sizeof(float));
+        const uint32_t bt = bp + 8*sizeof(block_q8_1_mmq);
+        asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];" : "=f"(bs0), "=f"(bs1) : "r"(bp) : "memory");
+        asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];" : "=f"(bt0), "=f"(bt1) : "r"(bt) : "memory");
+#else
+        bs0 = ((const volatile float *) sy)[pair*2];
+        bs1 = ((const volatile float *) sy)[pair*2+1];
+        bt0 = ((const volatile float *) (sy + 8*sizeof(block_q8_1_mmq)))[pair*2];
+        bt1 = ((const volatile float *) (sy + 8*sizeof(block_q8_1_mmq)))[pair*2+1];
+#endif
+#pragma unroll
+        for (int sub = 0; sub < 2; ++sub) {
+        const int s = pair*2 + sub;
+        // Volatile shared reads prevent the compiler from reconstructing the
+        // original all-four-subblock operand stage. Four words and two scales
+        // serve this MMA; values, signed mapping and FP32 expressions are exact.
+        const char * p0 = sy + 4*sizeof(float) + 32*s + 4*c;
+        const char * p1 = p0 + 8*sizeof(block_q8_1_mmq);
+        const int a0 = *(const volatile int *) p0;
+        const int a1 = *(const volatile int *) p1;
+        const int a2 = *(const volatile int *) (p0 + 16);
+        const int a3 = *(const volatile int *) (p1 + 16);
+        const float dB[2] = {
+            sub == 0 ? bs0 : bs1,
+            sub == 0 ? bt0 : bt1,
+        };
+        int C[4] = {GGML_CUDA_PQ2_J16_MAGIC, GGML_CUDA_PQ2_J16_MAGIC,
+                    GGML_CUDA_PQ2_J16_MAGIC, GGML_CUDA_PQ2_J16_MAGIC};
+        const int b0 = int((b[s][0] + 0x7F7F7F7Fu) ^ 0x80808080u);
+        const int b1 = int((b[s][1] + 0x7F7F7F7Fu) ^ 0x80808080u);
+        ggml_cuda_pq2_j16_mma(C, a0, a1, a2, a3, b0, b1);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const float cf = __int_as_float(C[l]) - 12582912.0f;
+            sum[0][l] += cf*dA[l % 2]*dB[l / 2];
+        }
+        }
+    }
+}
+
 // Operands of one step of lane (g, c) of warp w from a stage, accumulated into sum (the DL kernels' calls).
 template <int FMT>
 static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4], const char * sx, const char * sy, const int c) {

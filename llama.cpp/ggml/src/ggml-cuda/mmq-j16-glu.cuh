@@ -79,7 +79,7 @@ static __global__ void mul_mat_q_ptq_gu_ring(
                 const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
                 const char * sy = smem + s*SB + SPS*XB + j*YB + g*(int) sizeof(block_q8_1_mmq);
                 if constexpr (JIT) {
-                    ggml_cuda_ptq1_j16_jit_step(sum, sx, sy, c);
+                    ggml_cuda_ptq1_j16_jit_pair_scale_step(sum, sx, sy, c);
                 } else {
                     ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
                 }
