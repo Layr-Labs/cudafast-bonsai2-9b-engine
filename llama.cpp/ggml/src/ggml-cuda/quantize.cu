@@ -833,6 +833,10 @@ void quantize_mmq_q8_1_swiglu_cuda(
         const float * x, const float * gate, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    static const bool decode_swiglu_q8_enabled = [] {
+        const char * env = getenv("GGML_CUDA_Q8_DECODE_SWIGLU");
+        return !env || std::atoi(env) != 0;
+    }();
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
 
@@ -841,6 +845,15 @@ void quantize_mmq_q8_1_swiglu_cuda(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
+            if (type_src0 == GGML_TYPE_Q8_0 && ne00 == 12288 && ne1 == 16 && ne2 == 1 && ne3 == 1 &&
+                    ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+                    decode_swiglu_q8_enabled) {
+                const ggml_cuda_kernel_launch_params lp(num_blocks, block_size, 0, stream);
+                ggml_cuda_kernel_launch(quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true>, lp,
+                    x, (const int32_t *) nullptr, vy, ne00, s01, s02, s03, ne0,
+                    int(ne1), int(ne2), 0, gate, (const float *) nullptr, (const float *) nullptr);
+                break;
+            }
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true><<<num_blocks, block_size, 0, stream>>>(
                 x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, 0, gate);
             break;

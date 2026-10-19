@@ -5846,6 +5846,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const char * env = getenv("GGML_CUDA_GB10_DUAL_RMS_Q8");
         return !env || std::atoi(env) != 0;
     }();
+    static const bool decode_swiglu_q8_enabled = [] {
+        const char * env = getenv("GGML_CUDA_Q8_DECODE_SWIGLU");
+        return !env || std::atoi(env) != 0;
+    }();
 
     ggml_tensor * node = cgraph->nodes[i];
 
@@ -5862,7 +5866,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 node->src[1]->type == GGML_TYPE_F32 && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU &&
                 ggml_get_op_params_i32(node, 1) == 0 && ggml_are_same_shape(node->src[0], node->src[1]) &&
                 ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) &&
-                mm->src[1]->ne[1] >= 32 &&
+                (mm->src[1]->ne[1] >= 32 ||
+                 (decode_swiglu_q8_enabled &&
+                  mm->src[0]->type == GGML_TYPE_Q8_0 &&
+                  node->ne[0] == 12288 && node->ne[1] == 16 &&
+                  node->ne[2] == 1 && node->ne[3] == 1)) &&
                 ggml_cuda_should_use_mmq(mm->src[0]->type, cc, mm->src[1]->ne[1], 0) &&
                 ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 1) &&
                 ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
