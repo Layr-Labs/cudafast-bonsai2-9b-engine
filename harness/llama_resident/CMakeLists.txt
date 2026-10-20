@@ -191,6 +191,8 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
             $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
         target_link_libraries(fwht-mmq-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
         add_test(NAME fwht-mmq-equivalence COMMAND fwht-mmq-equivalence)
+        # compares the D4 activation path; D1 (one scale per 128) is a deliberate numerical change
+        set_tests_properties(fwht-mmq-equivalence PROPERTIES ENVIRONMENT "GGML_CUDA_PREFILL_D1=0")
 
         add_executable(logits-topk-equivalence test/logits_topk_equivalence.cpp)
         target_compile_features(logits-topk-equivalence PRIVATE cxx_std_17)
@@ -251,6 +253,8 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
             $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
         target_link_libraries(rms-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
         add_test(NAME rms-fwht-equivalence COMMAND rms-fwht-equivalence)
+        # compares the D4 activation path; D1 (one scale per 128) is a deliberate numerical change
+        set_tests_properties(rms-fwht-equivalence PROPERTIES ENVIRONMENT "GGML_CUDA_PREFILL_D1=0")
         add_executable(gnorm-fwht-equivalence test/gnorm_fwht_equivalence.cu)
         target_include_directories(gnorm-fwht-equivalence PRIVATE
             ${LLAMA_CPP_DIR}/ggml/src
@@ -259,6 +263,8 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
             $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
         target_link_libraries(gnorm-fwht-equivalence PRIVATE ggml-cuda ggml-base CUDA::cudart)
         add_test(NAME gnorm-fwht-equivalence COMMAND gnorm-fwht-equivalence)
+        # compares the D4 activation path; D1 (one scale per 128) is a deliberate numerical change
+        set_tests_properties(gnorm-fwht-equivalence PROPERTIES ENVIRONMENT "GGML_CUDA_PREFILL_D1=0")
         add_executable(attn-glue-equivalence test/attn_glue_equivalence.cu)
         target_include_directories(attn-glue-equivalence PRIVATE
             ${LLAMA_CPP_DIR}/ggml/src

@@ -81,12 +81,33 @@ static __device__ __forceinline__ void ggml_cuda_prefill_plane_d4_alias_load(
         : "=r"(w0), "=r"(w1) : "r"(code), "r"(y) : "memory");
 }
 
+// Exact D1 alias specialization: every owner reads its own original code
+// words; only owners0..63 copy scale0's 128 fields into the first512bytes.
+// One PTX block keeps code reads before their possible overwrite. Predicate
+// only the header traffic, avoiding two copies of the code-load instruction.
+static __device__ __forceinline__ void ggml_cuda_prefill_plane_d1_alias_load(
+        uint32_t code, uint32_t y, uint32_t owner, uint32_t & w0, uint32_t & w1) {
+    asm volatile("{\n"
+        " .reg .b32 code0, code1, d0, d1;\n"
+        " .reg .pred copy;\n"
+        " ld.shared.u32 code0, [%2];\n"
+        " ld.shared.u32 code1, [%2+4];\n"
+        " setp.lt.u32 copy, %4, 64;\n"
+        " @copy ld.shared.u32 d0, [%3];\n"
+        " @copy ld.shared.u32 d1, [%3+144];\n"
+        " @copy st.shared.v2.u32 [%2], {d0, d1};\n"
+        " mov.u32 %0, code0;\n"
+        " mov.u32 %1, code1;\n"
+        "}\n"
+        : "=r"(w0), "=r"(w1) : "r"(code), "r"(y), "r"(owner) : "memory");
+}
+
 // Original 64x128 macro tile, eight compute warps and two CTAs/SM. Both Y and
 // compact 2-bit code tiles use TMA double buffers. The only global X loads in
 // the loop are 64 fp16 scales; one next-scale register stays live across MMA.
 // The 50176-byte footprint equals the existing stream-K kernel, with barriers
 // living in padding of the decoded X tile instead of enlarging shared memory.
-template <bool ADD,bool GLU,bool D4_ALIAS=false,bool OWNER=false>
+template <bool ADD,bool GLU,bool D4_ALIAS=false,bool OWNER=false,bool D1=false>
 static __global__ void __launch_bounds__(256,2) mul_mat_q_pq2_plane(
         const unsigned char * codes,const uint16_t * scales,const int * y,float * dst,
         int nkb,int ncols_y,int stride_col_dst,int ntx,const float * residual) {
@@ -124,7 +145,8 @@ static __global__ void __launch_bounds__(256,2) mul_mat_q_pq2_plane(
             // Each thread overwrites only its own two compact-code words after
             // loading both. The existing CTA barrier publishes the complete D4 table.
             const uint32_t yi=smem+buf*YBYTES+(2*owner%128)*144+(owner/64)*4;
-            ggml_cuda_prefill_plane_d4_alias_load(ci,yi,raw.w0,raw.w1);
+            if constexpr(D1) ggml_cuda_prefill_plane_d1_alias_load(ci,yi,owner,raw.w0,raw.w1);
+            else ggml_cuda_prefill_plane_d4_alias_load(ci,yi,raw.w0,raw.w1);
         } else {
             raw.w0=ggml_cuda_prefill_plane_lds_u32(ci); raw.w1=ggml_cuda_prefill_plane_lds_u32(ci+4);
         }
@@ -133,9 +155,11 @@ static __global__ void __launch_bounds__(256,2) mul_mat_q_pq2_plane(
         if (quarter==0 && kb+1<nkb) scale=sp[(kb+1)*64];
         __syncthreads();
         if constexpr (D4_ALIAS) {
-            ggml_cuda_pq2_ws_compute_compact<true>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144,ctiles+buf*CBYTES+wc*32*4);
+            if constexpr(D1) ggml_cuda_pq2_j128_d1_compute<true>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144,ctiles+buf*CBYTES+wc*32*4);
+            else ggml_cuda_pq2_ws_compute_compact<true>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144,ctiles+buf*CBYTES+wc*32*4);
         } else {
-            ggml_cuda_pq2_ws_compute_compact<false>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144);
+            if constexpr(D1) ggml_cuda_pq2_j128_d1_compute<false>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144);
+            else ggml_cuda_pq2_ws_compute_compact<false>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144);
         }
         if (kb+1<nkb) {
             __syncthreads();
@@ -175,14 +199,18 @@ static bool ggml_cuda_prefill_plane_glu_run(const mmq_args & args, cudaStream_t 
     constexpr int SHARED=2*128*144+64*144+2*64*32;
     const bool alias=ggml_cuda_prefill_plane_d4_alias_enabled();
     const bool owner=alias && ggml_cuda_prefill_plane_owner_enabled();
-    const auto kernel=owner?mul_mat_q_pq2_plane<false,true,true,true>:
-                      alias?mul_mat_q_pq2_plane<false,true,true,false>:mul_mat_q_pq2_plane<false,true,false,false>;
-    static bool attr[2][2][GGML_CUDA_MAX_DEVICES]={};
-    if (!attr[alias][owner][device]) {
+    const bool d1=args.d1_y && owner; // other explicit plane modes retain the compatible original consumer
+    const auto kernel=d1 ? mul_mat_q_pq2_plane<false,true,true,true,true> :
+                      (owner?mul_mat_q_pq2_plane<false,true,true,true>:
+                      alias?mul_mat_q_pq2_plane<false,true,true,false>:mul_mat_q_pq2_plane<false,true,false,false>);
+    static bool attr[2][2][2][GGML_CUDA_MAX_DEVICES]={};
+    if (!attr[d1][alias][owner][device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,SHARED));
         CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributePreferredSharedMemoryCarveout,(int)cudaSharedmemCarveoutMaxShared));
-        attr[alias][owner][device]=true;
+        attr[d1][alias][owner][device]=true;
     }
+    static bool logged=false;
+    if(d1 && !logged){GGML_LOG_INFO("PREFILL_D1_CONSUMER planeGU rows=%lld\n",(long long)args.ncols_y);logged=true;}
     const int nkb=args.ncols_x/QK_PQ2_0,ntx=args.ncols_max/128;
     const uint16_t * scales=(const uint16_t *)(e->data+(int64_t)e->nrows*nkb*32);
     ggml_cuda_kernel_launch(kernel,

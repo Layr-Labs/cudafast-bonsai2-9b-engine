@@ -3,6 +3,9 @@
 #include "mmvq-ptq1_0.cuh"
 #include "unary.cuh"
 #include <cstdint>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
 // this maps to 256-bit loads in PTX on supported devices,
@@ -1038,6 +1041,37 @@ void quantize_mmq_fp4_cuda(
     }
 }
 
+// Prefill-only internal activation scale128 (one F32 scale per 128 values instead of four per 32).
+// Weight formats/values and Hadamard remain unchanged; not bit-exact. GGML_CUDA_PREFILL_D1=0
+// restores the D4 activations; the complete prefill consumer stays metadata-gated.
+bool ggml_cuda_prefill_d1_enabled(int64_t rows) {
+    static const bool enabled=[](){const char*e=std::getenv("GGML_CUDA_PREFILL_D1");return !e||std::atoi(e)!=0;}();
+    const bool use=enabled&&rows>=128&&ggml_cuda_info().devices[ggml_cuda_get_device()].cc==GGML_CUDA_CC_DGX_SPARK;
+    static std::atomic<bool> logged{false};
+    if(use&&!logged.exchange(true))std::fprintf(stderr,"PREFILL_D1_QUALITY rows=%lld group=128 numerical_change=true\n",(long long)rows);
+    return use;
+}
+template<int N,int NT>static __device__ __forceinline__ void fwht_quantize_mmq_d1_store(
+ const float*v,block_q8_1_mmq*y,int64_t base,int64_t row,int64_t rows,int tid,int lane){
+ static_assert(NT%128==0,"whole128 activation groups");
+ constexpr int NE=N/NT;
+ __shared__ float maxima[N/32];
+ const int warp=tid/32,group=warp&~3;
+#pragma unroll
+ for(int i=0;i<NE;++i){const float m=warp_reduce_max<32>(fabsf(v[i]));if(lane==0)maxima[warp*NE+i]=m;}
+ __syncthreads();
+ const int64_t col0=base+tid;const int offset=col0%128;y+=(col0/128)*rows+row;
+ const int64_t stride=(NT/128)*rows;
+#pragma unroll
+ for(int i=0;i<NE;++i){
+  const float amax=fmaxf(fmaxf(maxima[group*NE+i],maxima[(group+1)*NE+i]),fmaxf(maxima[(group+2)*NE+i],maxima[(group+3)*NE+i]));
+  const float inv=amax>0.0f?127.0f/amax:0.0f;
+  y[i*stride].qs[offset]=int8_t(roundf(v[i]*inv));
+  if(lane==0)y[i*stride].d4[offset/32]=amax>0.0f?1.0f/inv:0.0f;
+ }
+ __syncthreads();
+}
+
 // MMQ D4 quantization of transformed rows held as v[i] = element base + i*NT + tid of row `row`.
 template <int N, int NT>
 static __device__ __forceinline__ void fwht_quantize_mmq_d4_store(const float * v, block_q8_1_mmq * y,
@@ -1063,7 +1097,7 @@ static __device__ __forceinline__ void fwht_quantize_mmq_d4_store(const float * 
 // SWIGLU: the input is a SwiGLU no other node reads. Each element is formed with the expression of
 // unary_gated_op_kernel<op_silu, T> (x activated, g the multiplier, row strides o0/o1 in elements),
 // so it is the value that kernel would have stored and the plain variant would load here.
-template <typename T, bool SIGNED, bool SWIGLU>
+template <typename T, bool SIGNED, bool SWIGLU, bool D1 = false>
 __launch_bounds__(256, 1)
 static __global__ void fwht_quantize_mmq_d4(const T * x, const T * g, const float * signs, block_q8_1_mmq * y,
                                          int64_t k, int64_t kp, int64_t rows, int64_t o0, int64_t o1) {
@@ -1090,19 +1124,29 @@ static __global__ void fwht_quantize_mmq_d4(const T * x, const T * g, const floa
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
     }
-    fwht_quantize_mmq_d4_store<N,NT>(v,y,base,row,rows,tid,lane);
+    if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,base,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,base,row,rows,tid,lane);
     GGML_UNUSED(kp); GGML_UNUSED(g); GGML_UNUSED(o0); GGML_UNUSED(o1);
 }
-void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * signs, void * y,
-    int64_t k, int64_t kp, int64_t rows, cudaStream_t stream, const void * g, int64_t o0, int64_t o1) {
+static void fwht_quantize_mmq_mode_cuda(const void * x, ggml_type type, const float * signs, void * y,
+    int64_t k, int64_t kp, int64_t rows, cudaStream_t stream, const void * g, int64_t o0, int64_t o1, bool use_d1) {
     GGML_ASSERT(k%4096==0 && kp%4096==0 && kp>=k);
     const dim3 grid(kp/4096,rows,1);
     const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
-#define C6_LAUNCH(T, GLU) do { if(signs) { ggml_cuda_kernel_launch(fwht_quantize_mmq_d4<T,true,GLU>,lp,(const T*)x,(const T*)g,signs,(block_q8_1_mmq*)y,k,kp,rows,o0,o1); } else { ggml_cuda_kernel_launch(fwht_quantize_mmq_d4<T,false,GLU>,lp,(const T*)x,(const T*)g,signs,(block_q8_1_mmq*)y,k,kp,rows,o0,o1); } } while(0)
+#define C6_LAUNCH(T, GLU) do { if(signs) { ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4<T,true,GLU,true>:fwht_quantize_mmq_d4<T,true,GLU,false>,lp,(const T*)x,(const T*)g,signs,(block_q8_1_mmq*)y,k,kp,rows,o0,o1); } else { ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4<T,false,GLU,true>:fwht_quantize_mmq_d4<T,false,GLU,false>,lp,(const T*)x,(const T*)g,signs,(block_q8_1_mmq*)y,k,kp,rows,o0,o1); } } while(0)
 #define C6_LAUNCH_T(T) do { if(g) { C6_LAUNCH(T, true); } else { C6_LAUNCH(T, false); } } while(0)
     if(type==GGML_TYPE_F32) { C6_LAUNCH_T(float); } else { GGML_ASSERT(type==GGML_TYPE_F16); C6_LAUNCH_T(half); }
 #undef C6_LAUNCH_T
 #undef C6_LAUNCH
+}
+void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * signs, void * y,
+    int64_t k, int64_t kp, int64_t rows, cudaStream_t stream, const void * g, int64_t o0, int64_t o1) {
+    fwht_quantize_mmq_mode_cuda(x,type,signs,y,k,kp,rows,stream,g,o0,o1,ggml_cuda_prefill_d1_enabled(rows));
+}
+// Private native comparison entry: independent of the process-wide production opt-in.
+void fwht_quantize_mmq_d1_test_cuda(const void * x, ggml_type type, const float * signs, void * y,
+    int64_t k, int64_t kp, int64_t rows, cudaStream_t stream) {
+    GGML_ASSERT(rows>=128 && ggml_cuda_info().devices[ggml_cuda_get_device()].cc==GGML_CUDA_CC_DGX_SPARK);
+    fwht_quantize_mmq_mode_cuda(x,type,signs,y,k,kp,rows,stream,nullptr,0,0,true);
 }
 
 // C56: the transform input is SWIGLU(x, g) read through a permuted view of it (the GDN out-projection's
@@ -1111,7 +1155,7 @@ void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * sig
 // <op_silu, T>'s expression (x activated, g the multiplier, row strides o0/o1 in elements), so it is the
 // value that kernel and the CONT would have stored. The butterfly and the quantization are
 // fwht_quantize_mmq_d4's.
-template <typename T, bool SIGNED>
+template <typename T, bool SIGNED, bool D1 = false>
 __launch_bounds__(256, 1)
 static __global__ void fwht_quantize_mmq_d4_glu_perm(const T * x, const T * g, const float * signs, block_q8_1_mmq * y,
         int64_t k, int64_t rows, int64_t o0, int64_t o1, int n0, int n1, int64_t s1, int64_t s2) {
@@ -1136,6 +1180,7 @@ static __global__ void fwht_quantize_mmq_d4_glu_perm(const T * x, const T * g, c
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
     }
+if constexpr(D1){fwht_quantize_mmq_d1_store<N,NT>(v,y,base,row,rows,tid,lane);}else{
 #pragma unroll
     for(int i=0;i<NE;++i) {
         const int64_t col=base+i*NT+tid;
@@ -1146,18 +1191,20 @@ static __global__ void fwht_quantize_mmq_d4_glu_perm(const T * x, const T * g, c
         y[ib].qs[col%QK8_1_MMQ]=q;
         if(lane==0) y[ib].d4[(col%QK8_1_MMQ)/32]=1.0f/d_inv;
     }
+    }
 }
 
 void fwht_quantize_mmq_d4_glu_perm_cuda(const float * x, const float * g, const float * signs, void * y,
     int64_t k, int64_t kp, int64_t rows, int64_t o0, int64_t o1, int n0, int n1, int64_t s1, int64_t s2,
     cudaStream_t stream) {
+    const bool use_d1=ggml_cuda_prefill_d1_enabled(rows);
     GGML_ASSERT(k%4096==0 && kp%4096==0 && kp>=k && n0>0 && n1>0);
     const dim3 grid(kp/4096,rows,1);
     const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
     if (signs) {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_glu_perm<float,true>,lp,x,g,signs,(block_q8_1_mmq*)y,k,rows,o0,o1,n0,n1,s1,s2);
+        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_glu_perm<float,true,true>:fwht_quantize_mmq_d4_glu_perm<float,true,false>,lp,x,g,signs,(block_q8_1_mmq*)y,k,rows,o0,o1,n0,n1,s1,s2);
     } else {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_glu_perm<float,false>,lp,x,g,signs,(block_q8_1_mmq*)y,k,rows,o0,o1,n0,n1,s1,s2);
+        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_glu_perm<float,false,true>:fwht_quantize_mmq_d4_glu_perm<float,false,false>,lp,x,g,signs,(block_q8_1_mmq*)y,k,rows,o0,o1,n0,n1,s1,s2);
     }
 }
 
@@ -1166,7 +1213,7 @@ void fwht_quantize_mmq_d4_glu_perm_cuda(const float * x, const float * g, const 
 // t+3072, here v[j], v[j+4], v[j+8], v[j+12] of thread t%256 (j = t/256), followed by the same xor
 // warp reduction, per-warp partials s_sum[t/32] and final warp reduction; mean, scale and the product
 // use its expressions. norm, when set, receives the product for the norm's other readers.
-template <bool SIGNED>
+template <bool SIGNED, bool D1 = false>
 __launch_bounds__(256, 1)
 static __global__ void fwht_quantize_mmq_d4_rms(const float * x, const int64_t stride_row, const float * w,
         const int ncols, const float eps, const float * signs, float * norm, block_q8_1_mmq * y, int64_t rows) {
@@ -1202,7 +1249,7 @@ static __global__ void fwht_quantize_mmq_d4_rms(const float * x, const int64_t s
         if constexpr(SIGNED) v[i]*=signs[col];
     }
     ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
-    fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
+    if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 // GDN output projection input, one block per 4096-wide row (token): per-head RMS_NORM(x) * w over 128-wide heads
 // (as rms_norm_f32<128, true>), SWIGLU(z, normed) (as unary_gated_op_kernel<op_silu, float>) and the CONT of
@@ -1210,7 +1257,7 @@ static __global__ void fwht_quantize_mmq_d4_rms(const float * x, const int64_t s
 // head row r*g3 + a1*g1 + a2*g2, column a0. Then the signed transform as fwht_quantize_mmq_d4. Register i of the
 // threads of half tid/128 holds one head, column tid%128 being thread tid%128 of that head's rms block: the same
 // square, xor warp reduction, four per-warp partials and final warp reduction (zeros above lane 3).
-template <bool SIGNED>
+template <bool SIGNED, bool D1 = false>
 __launch_bounds__(256, 1)
 static __global__ void fwht_quantize_mmq_d4_gnorm(const float * x, const float * z, const int64_t z_stride,
         const float * w, const int ncols, const float eps, const uint3 ne1, const int64_t g1, const int64_t g2,
@@ -1251,16 +1298,17 @@ static __global__ void fwht_quantize_mmq_d4_gnorm(const float * x, const float *
         if constexpr(SIGNED) v[i]*=signs[i*NT+tid];
     }
     ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
-    fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
+    if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 void fwht_quantize_mmq_d4_gnorm_cuda(const float * x, const float * z, int64_t z_stride, const float * w, float eps,
     int64_t ne1, int64_t g1, int64_t g2, int64_t g3, const float * signs, void * y, int64_t rows, cudaStream_t stream) {
+    const bool use_d1=ggml_cuda_prefill_d1_enabled(rows);
     const ggml_cuda_kernel_launch_params lp(dim3(1,rows,1),dim3(256,1,1),0,stream);
     const uint3 ne1_fd=init_fastdiv_values(ne1);
     if(signs) {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_gnorm<true>,lp,x,z,z_stride,w,128,eps,ne1_fd,g1,g2,g3,signs,(block_q8_1_mmq*)y,rows);
+        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_gnorm<true,true>:fwht_quantize_mmq_d4_gnorm<true,false>,lp,x,z,z_stride,w,128,eps,ne1_fd,g1,g2,g3,signs,(block_q8_1_mmq*)y,rows);
     } else {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_gnorm<false>,lp,x,z,z_stride,w,128,eps,ne1_fd,g1,g2,g3,signs,(block_q8_1_mmq*)y,rows);
+        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_gnorm<false,true>:fwht_quantize_mmq_d4_gnorm<false,false>,lp,x,z,z_stride,w,128,eps,ne1_fd,g1,g2,g3,signs,(block_q8_1_mmq*)y,rows);
     }
 }
 
@@ -1271,7 +1319,7 @@ void fwht_quantize_mmq_d4_gnorm_cuda(const float * x, const float * z, int64_t z
 // holds columns u + NT*m in v[m] and stands for add_rms_norm's threads u + NT*j, j < 1024/NT (columns with
 // m % (1024/NT) == j, in increasing m). The weights and signs are model constants, so they are loaded before the
 // wait for the producing kernel. sum receives the residual; norm, when set, the product.
-template <int NT, bool SIGNED>
+template <int NT, bool SIGNED, bool D1 = false>
 __launch_bounds__(NT, 1)
 static __global__ void fwht_quantize_mmq_d4_add_rms(const float * a, const float * b, float * sum, const float * w,
         const int ncols, const float eps, const float * signs, float * norm, block_q8_1_mmq * y, const int64_t rows) {
@@ -1319,31 +1367,32 @@ static __global__ void fwht_quantize_mmq_d4_add_rms(const float * a, const float
         if constexpr(SIGNED) v[m]*=sv[m];
     }
     ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
-    fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
+    if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 void fwht_quantize_mmq_d4_add_rms_cuda(const float * a, const float * b, float * sum, const float * w, float eps,
     const float * signs, float * norm, void * y, int64_t k, int64_t rows, cudaStream_t stream) {
+    const bool use_d1=ggml_cuda_prefill_d1_enabled(rows);
     GGML_ASSERT(k==4096);
     constexpr int NT=1024; // measured faster in the verify chain than 512 and 256
     const ggml_cuda_kernel_launch_params lp(dim3(1,rows,1),dim3(NT,1,1),0,stream);
     if(signs) {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_add_rms<NT, true>,lp,a,b,sum,w,(int)k,eps,signs,norm,(block_q8_1_mmq*)y,rows);
+        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_add_rms<NT, true,true>:fwht_quantize_mmq_d4_add_rms<NT, true,false>,lp,a,b,sum,w,(int)k,eps,signs,norm,(block_q8_1_mmq*)y,rows);
     } else {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_add_rms<NT, false>,lp,a,b,sum,w,(int)k,eps,signs,norm,(block_q8_1_mmq*)y,rows);
+        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_add_rms<NT, false,true>:fwht_quantize_mmq_d4_add_rms<NT, false,false>,lp,a,b,sum,w,(int)k,eps,signs,norm,(block_q8_1_mmq*)y,rows);
     }
 }
 
 // Exact grid48 PTQ stream-K fixup folded into its exclusive ADD/RMS consumer.
 // The producer's +0 partial accumulation, suffix addition and RN residual add
 // are deliberately separate, matching the original fixup then ADD sequence.
-template <int NT, bool SIGNED>
+template <int NT, bool SIGNED, bool WL = true>
 __launch_bounds__(NT, 1)
 static __global__ void fwht_quantize_mmq_d4_fixup_add_rms(const float * a, const float * b, float * sum, const float * w,
         const int ncols, const float eps, const float * signs, float * norm, block_q8_1_mmq * y, const int64_t rows, const float * partials) {
     constexpr int N=4096, NE=N/NT, NR=1024, R=NR/NT;
     static_assert(NT==256 || NT==512 || NT==1024, "add_rms fold block size");
     __shared__ float s_sum[NR/WARP_SIZE];
-    __shared__ float shared[N];
+    __shared__ __align__(16) float shared[N];
     const int tid=threadIdx.x, lane=tid%WARP_SIZE, warp=tid/WARP_SIZE;
     const int64_t row=blockIdx.y;
     float v[NE], wv[NE], sv[NE];
@@ -1395,32 +1444,39 @@ static __global__ void fwht_quantize_mmq_d4_fixup_add_rms(const float * a, const
         v[m]=xn*(1.0f/64.0f);
         if constexpr(SIGNED) v[m]*=sv[m];
     }
-    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    if constexpr (WL && NT == 1024 && ggml_cuda_get_physical_warp_size() == 32) {
+        ggml_cuda_fwht_warp_lane_butterfly<N,NT>(v,shared,tid,lane);
+    } else {
+        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    }
     fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 void fwht_quantize_mmq_d4_fixup_add_rms_cuda(const float * a, const float * b, float * sum,
         const float * w, float eps, const float * signs, float * norm, void * y,
         const float * partials, cudaStream_t stream) {
     constexpr int NT=1024;
+    // GGML_CUDA_FWHT_WARP_LANE=0 keeps the shared-memory block butterfly.
+    static const bool wl = getenv("GGML_CUDA_FWHT_WARP_LANE") == nullptr || atoi(getenv("GGML_CUDA_FWHT_WARP_LANE")) != 0;
     const ggml_cuda_kernel_launch_params lp(dim3(1,16,1),dim3(NT,1,1),0,stream);
     if (signs) {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_fixup_add_rms<NT,true>, lp,
+        ggml_cuda_kernel_launch(wl ? fwht_quantize_mmq_d4_fixup_add_rms<NT,true,true> : fwht_quantize_mmq_d4_fixup_add_rms<NT,true,false>, lp,
             a,b,sum,w,4096,eps,signs,norm,(block_q8_1_mmq *)y,int64_t(16),partials);
     } else {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_fixup_add_rms<NT,false>, lp,
+        ggml_cuda_kernel_launch(wl ? fwht_quantize_mmq_d4_fixup_add_rms<NT,false,true> : fwht_quantize_mmq_d4_fixup_add_rms<NT,false,false>, lp,
             a,b,sum,w,4096,eps,signs,norm,(block_q8_1_mmq *)y,int64_t(16),partials);
     }
 }
 
 void fwht_quantize_mmq_d4_rms_cuda(const float * x, int64_t stride_row, const float * w, float eps,
     const float * signs, float * norm, void * y, int64_t k, int64_t rows, cudaStream_t stream) {
+    const bool use_d1=ggml_cuda_prefill_d1_enabled(rows);
     GGML_ASSERT(k==4096);
     const dim3 grid(1,rows,1);
     const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
     if(signs) {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_rms<true>,lp,x,stride_row,w,(int)k,eps,signs,norm,(block_q8_1_mmq*)y,rows);
+        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_rms<true,true>:fwht_quantize_mmq_d4_rms<true,false>,lp,x,stride_row,w,(int)k,eps,signs,norm,(block_q8_1_mmq*)y,rows);
     } else {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_rms<false>,lp,x,stride_row,w,(int)k,eps,signs,norm,(block_q8_1_mmq*)y,rows);
+        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_rms<false,true>:fwht_quantize_mmq_d4_rms<false,false>,lp,x,stride_row,w,(int)k,eps,signs,norm,(block_q8_1_mmq*)y,rows);
     }
 }
 
@@ -1433,7 +1489,7 @@ static __device__ __forceinline__ float fwht_gate_op_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
-template <bool SIGNED, bool STRIDED>
+template <bool SIGNED, bool STRIDED, bool D1 = false>
 __launch_bounds__(256, 1)
 static __global__ void fwht_quantize_mmq_d4_sigmoid_gate(const float * gate, const float * attn, const float * signs,
         block_q8_1_mmq * y, int64_t k, int64_t rows, int n0, int64_t g1, int64_t gt, int64_t at) {
@@ -1466,6 +1522,7 @@ static __global__ void fwht_quantize_mmq_d4_sigmoid_gate(const float * gate, con
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
     }
+if constexpr(D1){fwht_quantize_mmq_d1_store<N,NT>(v,y,base,row,rows,tid,lane);}else{
 #pragma unroll
     for(int i=0;i<NE;++i) {
         const int64_t col=base+i*NT+tid;
@@ -1476,17 +1533,19 @@ static __global__ void fwht_quantize_mmq_d4_sigmoid_gate(const float * gate, con
         y[ib].qs[col%QK8_1_MMQ]=q;
         if(lane==0) y[ib].d4[(col%QK8_1_MMQ)/32]=1.0f/d_inv;
     }
+    }
 }
 
 void fwht_quantize_mmq_d4_sigmoid_gate_cuda(const float * gate, const float * attn, const float * signs, void * y,
     int64_t k, int64_t kp, int64_t rows, int n0, int64_t g1, int64_t gt, int64_t at, cudaStream_t stream) {
+    const bool use_d1=ggml_cuda_prefill_d1_enabled(rows);
     GGML_ASSERT(k%4096==0 && kp%4096==0 && kp>=k && n0>0);
     const dim3 grid(kp/4096,rows,1);
     const ggml_cuda_kernel_launch_params lp(grid,dim3(256,1,1),0,stream);
 #define SIGMOID_STRIDE_LAUNCH(S) do { if (signs) { \
-    ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_sigmoid_gate<true,S>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at); \
+    ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_sigmoid_gate<true,S,true>:fwht_quantize_mmq_d4_sigmoid_gate<true,S,false>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at); \
     } else { \
-    ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_sigmoid_gate<false,S>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at); \
+    ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_sigmoid_gate<false,S,true>:fwht_quantize_mmq_d4_sigmoid_gate<false,S,false>,lp,gate,attn,signs,(block_q8_1_mmq*)y,k,rows,n0,g1,gt,at); \
     } } while (0)
     if (kp<=INT32_MAX && n0==256) { SIGMOID_STRIDE_LAUNCH(true); }
     else { SIGMOID_STRIDE_LAUNCH(false); }

@@ -9,6 +9,17 @@
 #include <mutex>
 #include <unordered_map>
 
+// The three mmq_d4 registration sites all call one of the six FWHT
+// producers sharing this opt-in. Match tensor identity, held pointer and shape;
+// an arbitrary D4 buffer or recycled allocator address must never select D1.
+bool ggml_cuda_mmq_d1_input(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
+                            const void * external_q8, bool requantize) {
+    if (!input || !external_q8 || requantize || !ggml_cuda_prefill_d1_enabled(input->ne[1])) return false;
+    const auto * pre=ctx.fwht_q8().find(input);
+    return pre && pre->mmq_d4 && pre->data==external_q8 && pre->ncols==input->ne[1] &&
+        pre->ne0==GGML_PAD(input->ne[0],MATRIX_ROW_PADDING);
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -228,13 +239,14 @@ void ggml_cuda_mul_mat_q(
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
 
-        const mmq_args args = {
+        mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ne1, add_res, add_dst};
+        args.d1_y=ggml_cuda_mmq_d1_input(ctx,src1,external_q8,quantize_external);
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -885,7 +897,11 @@ static bool ggml_cuda_decode_glu_run(ggml_backend_cuda_context & ctx, const ggml
     }
     constexpr int F = 12288, K = 4096, N = 16;
     constexpr size_t shared = ggml_cuda_dl_ring_smem<GGML_CUDA_DL_FMT_PTQ1S, 2>(3);
-    const auto kernel = mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true>;
+    // F=12288 and grid=2*F/128 below guarantee one whole tile per CTA.
+    // GGML_CUDA_GU_ONE_TILE=0 keeps the segmented epilogue.
+    static const bool one_tile = ggml_cuda_dl_env_int("GGML_CUDA_GU_ONE_TILE", 1) != 0;
+    const auto kernel = one_tile ? mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true, true>
+                                 : mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true, false>;
     static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
     if (!attr[ctx.device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared)));
@@ -954,6 +970,7 @@ bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor 
     if (!ggml_cuda_mmq_pq2_j128_use(args, nsm) || ggml_cuda_mmq_pq2_j128_grid(args, nsm) != ntiles) {
         return false; // the separate launch would not be pure tiling in the J=128 kernel
     }
+    args.d1_y=ggml_cuda_mmq_d1_input(ctx,src1,external_q8,false);
     args.x       = (const char *) stacked;
     args.nrows_x = 2*gate_w->ne[1];
     if (!ggml_cuda_mmq_pq2_j128_supported(args)) {

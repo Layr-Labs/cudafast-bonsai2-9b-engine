@@ -101,6 +101,13 @@ void fwht_quantize_mmq_d4_cuda(const void * x, ggml_type type, const float * sig
     int64_t k, int64_t kp, int64_t rows, cudaStream_t stream,
     const void * g = nullptr, int64_t o0 = 0, int64_t o1 = 0);
 
+// Shared opt-in for all FWHT producers and metadata-validated prefill consumers.
+bool ggml_cuda_prefill_d1_enabled(int64_t rows);
+
+// Private native D4-versus-D1 complete-chain comparison; no model dispatch uses this.
+void fwht_quantize_mmq_d1_test_cuda(const void * x, ggml_type type, const float * signs, void * y,
+    int64_t k, int64_t kp, int64_t rows, cudaStream_t stream);
+
 // The same transform of SWIGLU(x, g) (f32) read through a permuted view of it: transform column
 // i0 + n0*(i1 + n1*i2) of row r reads offset i0 + s1*i1 + s2*i2 of operand rows r (strides o0/o1, elements).
 void fwht_quantize_mmq_d4_glu_perm_cuda(const float * x, const float * g, const float * signs, void * y,

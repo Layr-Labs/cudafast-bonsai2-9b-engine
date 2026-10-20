@@ -1620,6 +1620,8 @@ struct mmq_args {
     // (same column stride); nullptr = unstacked.
     float       * dst_hi   = nullptr;
     int64_t       nrows_lo = 0;
+    // True only for a matching per-graph held FWHT D1 producer record.
+    bool          d1_y = false;
 };
 
 // GB10 prefill: the row-interleaved copy of a layer's ffn_gate/ffn_up PQ2_0 weights (made at model load): in every
@@ -1997,6 +1999,9 @@ void ggml_cuda_mul_mat_q(
         void * external_q8 = nullptr, bool quantize_external = true,
         const float * external_norm_scale = nullptr,
         const float * add_res = nullptr, float * add_dst = nullptr);
+
+bool ggml_cuda_mmq_d1_input(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
+                            const void * external_q8, bool requantize);
 
 size_t ggml_cuda_mul_mat_q_q8_size(const ggml_tensor * src0, const ggml_tensor * src1);
 
