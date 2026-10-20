@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-lowstage.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -62,6 +63,24 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    // Shared Q removes persistent register pressure; keep the measured shape envelope.
+    if constexpr (DKQ == 128 && DKQ == DV && type_KV == GGML_TYPE_F16) {
+        static const bool lowstage_enabled = [] {
+            const char * value = getenv("GGML_CUDA_FATTN_LOWSTAGE");
+            return !value || strcmp(value, "0") != 0;
+        }();
+        float softcap;
+        memcpy(&softcap, (const float *) KQV->op_params + 2, sizeof(softcap));
+        if (lowstage_enabled && cc == GGML_CUDA_CC_DGX_SPARK && use_gqa_opt &&
+                gqa_ratio == 4 && Q->ne[1] == 16 && Q->ne[3] == 1 && softcap == 0.0f &&
+                K->ne[1] >= 512 && K->ne[1] <= 1024 && K->ne[2] == (DKQ == 128 ? 8 : 4) &&
+                K->ne[3] == 1 && V->ne[3] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 &&
+                K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+            ggml_cuda_fattn_lowstage::ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 2>(ctx, dst);
+            return;
+        }
+    }
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {

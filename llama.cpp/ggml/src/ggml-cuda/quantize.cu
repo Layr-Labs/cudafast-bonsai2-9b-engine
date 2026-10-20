@@ -1336,14 +1336,14 @@ void fwht_quantize_mmq_d4_add_rms_cuda(const float * a, const float * b, float *
 // Exact grid48 PTQ stream-K fixup folded into its exclusive ADD/RMS consumer.
 // The producer's +0 partial accumulation, suffix addition and RN residual add
 // are deliberately separate, matching the original fixup then ADD sequence.
-template <int NT, bool SIGNED>
+template <int NT, bool SIGNED, bool WL = true>
 __launch_bounds__(NT, 1)
 static __global__ void fwht_quantize_mmq_d4_fixup_add_rms(const float * a, const float * b, float * sum, const float * w,
         const int ncols, const float eps, const float * signs, float * norm, block_q8_1_mmq * y, const int64_t rows, const float * partials) {
     constexpr int N=4096, NE=N/NT, NR=1024, R=NR/NT;
     static_assert(NT==256 || NT==512 || NT==1024, "add_rms fold block size");
     __shared__ float s_sum[NR/WARP_SIZE];
-    __shared__ float shared[N];
+    __shared__ __align__(16) float shared[N];
     const int tid=threadIdx.x, lane=tid%WARP_SIZE, warp=tid/WARP_SIZE;
     const int64_t row=blockIdx.y;
     float v[NE], wv[NE], sv[NE];
@@ -1395,19 +1395,25 @@ static __global__ void fwht_quantize_mmq_d4_fixup_add_rms(const float * a, const
         v[m]=xn*(1.0f/64.0f);
         if constexpr(SIGNED) v[m]*=sv[m];
     }
-    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    if constexpr (WL && NT == 1024 && ggml_cuda_get_physical_warp_size() == 32) {
+        ggml_cuda_fwht_warp_lane_butterfly<N,NT>(v,shared,tid,lane);
+    } else {
+        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    }
     fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 void fwht_quantize_mmq_d4_fixup_add_rms_cuda(const float * a, const float * b, float * sum,
         const float * w, float eps, const float * signs, float * norm, void * y,
         const float * partials, cudaStream_t stream) {
     constexpr int NT=1024;
+    // GGML_CUDA_FWHT_WARP_LANE=0 keeps the shared-memory block butterfly.
+    static const bool wl = getenv("GGML_CUDA_FWHT_WARP_LANE") == nullptr || atoi(getenv("GGML_CUDA_FWHT_WARP_LANE")) != 0;
     const ggml_cuda_kernel_launch_params lp(dim3(1,16,1),dim3(NT,1,1),0,stream);
     if (signs) {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_fixup_add_rms<NT,true>, lp,
+        ggml_cuda_kernel_launch(wl ? fwht_quantize_mmq_d4_fixup_add_rms<NT,true,true> : fwht_quantize_mmq_d4_fixup_add_rms<NT,true,false>, lp,
             a,b,sum,w,4096,eps,signs,norm,(block_q8_1_mmq *)y,int64_t(16),partials);
     } else {
-        ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_fixup_add_rms<NT,false>, lp,
+        ggml_cuda_kernel_launch(wl ? fwht_quantize_mmq_d4_fixup_add_rms<NT,false,true> : fwht_quantize_mmq_d4_fixup_add_rms<NT,false,false>, lp,
             a,b,sum,w,4096,eps,signs,norm,(block_q8_1_mmq *)y,int64_t(16),partials);
     }
 }

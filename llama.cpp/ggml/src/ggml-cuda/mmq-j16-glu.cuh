@@ -3,7 +3,7 @@
 // gate/up rows give every lane both operands; the dot-product order is unchanged.
 #include "unary.cuh"
 
-template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false>
+template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false, bool ONE_TILE = false>
 __launch_bounds__(16*32, MIN_CTAS)
 static __global__ void mul_mat_q_ptq_gu_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
@@ -83,29 +83,31 @@ static __global__ void mul_mat_q_ptq_gu_ring(
                 } else {
                     ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
                 }
-                ++st;
-                const bool last = k*SPS + j == total - 1;
-                if (st == nst || last) { // end of a segment: the stores of the DL kernels
-                    if (st == nst) {
-                        // Consecutive rows are the original gate/up pair.
-                        // Each lane already owns both rows for its two columns.
-                        const int row = (it*I + w*8)/2 + c;
-#pragma unroll
-                        for (int h = 0; h < 2; ++h) {
-                            const int col = g + 8*h;
-                            if (col < ncols_dst) {
-                                dst[(int64_t)col*stride_col_dst + row] =
-                                    ggml_cuda_op_silu_single(sum[0][2*h]) * sum[0][2*h + 1];
+                if constexpr (!ONE_TILE) {
+                    ++st;
+                    const bool last = k*SPS + j == total - 1;
+                    if (st == nst || last) { // end of a segment: the stores of the DL kernels
+                        if (st == nst) {
+                            // Consecutive rows are the original gate/up pair.
+                            // Each lane already owns both rows for its two columns.
+                            const int row = (it*I + w*8)/2 + c;
+    #pragma unroll
+                            for (int h = 0; h < 2; ++h) {
+                                const int col = g + 8*h;
+                                if (col < ncols_dst) {
+                                    dst[(int64_t)col*stride_col_dst + row] =
+                                        ggml_cuda_op_silu_single(sum[0][2*h]) * sum[0][2*h + 1];
+                                }
                             }
+                            st = 0;
+                            it += tile_inc;
+                        } else {
+                            ggml_cuda_pq2_j16_store<1>(sum, tmp_fixup + (int64_t) blockIdx.x*(J*I), w*8, I, J - 1);
                         }
-                        st = 0;
-                        it += tile_inc;
-                    } else {
-                        ggml_cuda_pq2_j16_store<1>(sum, tmp_fixup + (int64_t) blockIdx.x*(J*I), w*8, I, J - 1);
-                    }
-#pragma unroll
-                    for (int l = 0; l < 4; ++l) {
-                        sum[0][l] = 0.0f;
+    #pragma unroll
+                        for (int l = 0; l < 4; ++l) {
+                            sum[0][l] = 0.0f;
+                        }
                     }
                 }
             }
@@ -123,6 +125,20 @@ static __global__ void mul_mat_q_ptq_gu_ring(
             ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + (int64_t) gsk*XB, (uint32_t) nn*XB, &full[s], wpol);
             for (int j = 0; j < nn; ++j) {
                 ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB, (const char *) y + (int64_t) ((gsk + j) % nst)*yb_bytes, yb_bytes, &full[s]);
+            }
+        }
+    }
+    if constexpr (ONE_TILE) {
+        // The guarded launch has exactly one whole tile per CTA (gridDim.x == nty).
+        // Accumulate all K steps before the SwiGLU epilogue; no intermediate reset.
+        // It also has exactly 16 columns, so every lane's two columns are live.
+        const int row = (it*I + w*8)/2 + c;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int col = g + 8*h;
+            {
+                dst[(int64_t)col*stride_col_dst + row] =
+                    ggml_cuda_op_silu_single(sum[0][2*h]) * sum[0][2*h + 1];
             }
         }
     }

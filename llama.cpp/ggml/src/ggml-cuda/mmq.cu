@@ -885,7 +885,11 @@ static bool ggml_cuda_decode_glu_run(ggml_backend_cuda_context & ctx, const ggml
     }
     constexpr int F = 12288, K = 4096, N = 16;
     constexpr size_t shared = ggml_cuda_dl_ring_smem<GGML_CUDA_DL_FMT_PTQ1S, 2>(3);
-    const auto kernel = mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true>;
+    // F=12288 and grid=2*F/128 below guarantee one whole tile per CTA.
+    // GGML_CUDA_GU_ONE_TILE=0 keeps the segmented epilogue.
+    static const bool one_tile = ggml_cuda_dl_env_int("GGML_CUDA_GU_ONE_TILE", 1) != 0;
+    const auto kernel = one_tile ? mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true, true>
+                                 : mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true, false>;
     static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
     if (!attr[ctx.device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared)));
