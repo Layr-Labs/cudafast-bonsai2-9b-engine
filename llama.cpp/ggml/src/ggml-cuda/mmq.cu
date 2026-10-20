@@ -2,10 +2,14 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#define GGML_CUDA_S1_DFLASH_KV_IMPLEMENTATION
+#include "s1-dflash-kv-j8.cuh"
+#undef GGML_CUDA_S1_DFLASH_KV_IMPLEMENTATION
 
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 
@@ -18,6 +22,84 @@ bool ggml_cuda_mmq_d1_input(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const auto * pre=ctx.fwht_q8().find(input);
     return pre && pre->mmq_d4 && pre->data==external_q8 && pre->ncols==input->ne[1] &&
         pre->ne0==GGML_PAD(input->ne[0],MATRIX_ROW_PADDING);
+}
+
+bool ggml_cuda_s1_dflash_kv_enabled() {
+    const char * value = getenv("GGML_CUDA_S1_DFLASH_KV_J8");
+    return (value ? atoi(value) : GGML_CUDA_S1_DFLASH_KV_J8_DEFAULT) == 2;
+}
+
+bool ggml_cuda_s1_dflash_kv_trace() {
+    const char * value = getenv("GGML_CUDA_S1_DFLASH_KV_TRACE");
+    return (value ? atoi(value) : GGML_CUDA_S1_DFLASH_KV_TRACE_DEFAULT) != 0;
+}
+
+bool ggml_cuda_s1_dflash_kv_j16(ggml_backend_cuda_context & ctx, const ggml_tensor * cat,
+        const ggml_tensor * first, const ggml_tensor * second, const void * q8) {
+    if (!ggml_cuda_s1_dflash_kv_enabled() || ctx.curr_stream_no != 0 || !cat || !first || !second || !q8 ||
+            ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_DGX_SPARK ||
+            cat->op != GGML_OP_CONCAT || cat->type != GGML_TYPE_F32 || cat->view_src ||
+            cat->ne[0] != 4096 || cat->ne[1] != 32 || cat->ne[2] != 1 || cat->ne[3] != 1 ||
+            !ggml_is_contiguous(cat) || !cat->src[0] || !cat->src[1]) return false;
+    // This input is created only by the merged DFlash graph builder. A target
+    // or unrelated same-shape concat cannot enter through shape alone.
+    const ggml_tensor * context = cat->src[0];
+    if (!ggml_cuda_s1_dflash_context_input(context)) return false;
+    for (const ggml_tensor * slab : {cat->src[0],cat->src[1]}) {
+        if (slab->type != GGML_TYPE_F32 || slab->ne[0] != 4096 || slab->ne[1] != 16 ||
+                slab->ne[2] != 1 || slab->ne[3] != 1 || !ggml_is_contiguous(slab) || !slab->data ||
+                !slab->buffer || ggml_backend_buffer_get_type(slab->buffer) != ggml_backend_cuda_buffer_type(ctx.device) ||
+                (uintptr_t(slab->data) & 15)) return false;
+    }
+    int layer[2] = {-1,-1}, role[2] = {-1,-1};
+    const ggml_tensor * outputs[2] = {first,second};
+    mmq_args args[2] = {};
+    const auto buft = ggml_backend_cuda_buffer_type(ctx.device);
+    for (int j=0;j<2;++j) {
+        const ggml_tensor * out = outputs[j];
+        const ggml_tensor * w = out->src[0];
+        if (out->op != GGML_OP_MUL_MAT || out->src[1] != cat || !w || !out->data ||
+                out->view_src || out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
+                out->ne[0] != 1024 || out->ne[1] != 32 || out->ne[2] != 1 || out->ne[3] != 1 ||
+                !(out->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                ggml_get_op_params_i32(out,1) == GGML_HINT_SRC0_IS_HADAMARD ||
+                w->type != GGML_TYPE_Q8_0 || w->view_src || !w->data || !ggml_is_contiguous(w) ||
+                w->ne[0] != 4096 || w->ne[1] != 1024 || w->ne[2] != 1 || w->ne[3] != 1 ||
+                !w->buffer || !out->buffer || ggml_backend_buffer_get_type(w->buffer) != buft ||
+                ggml_backend_buffer_get_type(out->buffer) != buft ||
+                ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                (uintptr_t(out->data) & 15) || (uintptr_t(w->data) & 15)) return false;
+        int end=0;
+        if (sscanf(w->name,"blk.%d.attn_k.weight%n",&layer[j],&end) == 1 && end>0 && !w->name[end]) role[j]=0;
+        else {
+            end=0;
+            if (sscanf(w->name,"blk.%d.attn_v.weight%n",&layer[j],&end) == 1 && end>0 && !w->name[end]) role[j]=1;
+            else return false;
+        }
+        args[j].x=(const char*)w->data;args[j].type_x=GGML_TYPE_Q8_0;args[j].y=(const int*)q8;
+        args[j].dst=(float*)out->data;args[j].ncols_x=w->ne[0];args[j].nrows_x=w->ne[1];
+        args[j].ncols_dst=out->ne[1];args[j].stride_row_x=w->nb[1]/sizeof(block_q8_0);
+        args[j].ncols_y=cat->ne[1];args[j].nrows_dst=out->nb[1]/sizeof(float);args[j].ncols_max=out->ne[1];
+        args[j].nchannels_x=args[j].nchannels_y=args[j].nsamples_x=args[j].nsamples_y=1;
+    }
+    if (role[0] == role[1] || layer[0] < 0 || layer[0] != layer[1] || (uintptr_t(q8) & 15)) return false;
+    auto overlaps = [](const void * a,size_t na,const void * b,size_t nb) {
+        const uintptr_t x=uintptr_t(a),y=uintptr_t(b);return x<y+nb && y<x+na;
+    };
+    for (int j=0;j<2;++j) {
+        if (overlaps(outputs[j]->data,ggml_nbytes(outputs[j]),q8,4096*32/128*sizeof(block_q8_1_mmq))) return false;
+        for (const ggml_tensor * other : {first->src[0],second->src[0]})
+            if (overlaps(outputs[j]->data,ggml_nbytes(outputs[j]),other->data,ggml_nbytes(other))) return false;
+    }
+    if (overlaps(first->data,ggml_nbytes(first),second->data,ggml_nbytes(second))) return false;
+    // Each output remains paired with its own weight, including the model's
+    // common V-before-K graph order. Plane names carry no K-specific arithmetic.
+    if (!ggml_cuda_s1_kv_j8_launch(ctx,args[0],args[1],ctx.stream())) return false;
+    if (ggml_cuda_s1_dflash_kv_trace()) {
+        GGML_LOG_INFO("S1_DFLASH_KV_ROUTE layer=%d first=%s second=%s M=1024 K=4096 N=32 slabs=16+16 J=16 grid=8x2x2 CTAs=32 q8=%p\n",
+            layer[0],first->src[0]->name,second->src[0]->name,q8);
+    }
+    return true;
 }
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {

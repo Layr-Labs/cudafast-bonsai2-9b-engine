@@ -66,6 +66,7 @@
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/dflash2-conv.cuh"
 #include "ggml-cuda/dflash-concat-q8.h"
+#include "ggml-cuda/s1-dflash-kv-j8.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -7108,6 +7109,46 @@ static bool ggml_cuda_try_dflash_concat_q8(ggml_backend_cuda_context & ctx,
     return true;
 }
 
+// S1: consume the existing virtual-concat D4 bytes at the first K/V MMQ,
+// never at CONCAT (the later output allocation may not be writable there).
+static bool ggml_cuda_try_s1_dflash_kv(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph,
+        int index, std::vector<char> & skipped) {
+    const ggml_tensor * first=graph->nodes[index];
+    if (ctx.curr_stream_no != 0 || first->op != GGML_OP_MUL_MAT || !first->src[1] ||
+            first->src[1]->op != GGML_OP_CONCAT || !ggml_cuda_s1_dflash_kv_enabled()) return false;
+    const ggml_tensor * cat=first->src[1];
+    if (!ggml_cuda_s1_dflash_context_input(cat->src[0])) return false;
+    const auto decline = [&](const char * reason) {
+        if (ggml_cuda_s1_dflash_kv_trace()) GGML_LOG_INFO("S1_DFLASH_KV_SKIP first=%s M=%lld K=%lld N=%lld reason=%s\n",
+            first->name,(long long)first->ne[0],first->src[0] ? (long long)first->src[0]->ne[0] : 0LL,(long long)cat->ne[1],reason);
+        return false;
+    };
+    int cat_index=-1;
+    for (int j=0;j<index;++j) if (graph->nodes[j] == cat) {cat_index=j;break;}
+    if (cat_index<0 || ggml_cuda_dflash_concat_q8_match(graph,cat_index) != index) return decline("not_first_exclusive_KV_consumer");
+    auto & reuse=ctx.fwht_q8();
+    const auto packed=reuse.plain_q8.find(cat);
+    const auto users=reuse.plain_q8_users.find(cat);
+    if (packed == reuse.plain_q8.end() || users == reuse.plain_q8_users.end() || users->second != 2)
+        return decline("virtual_concat_D4_unavailable");
+    int second=-1;
+    for (int j=index+1;j<graph->n_nodes;++j) {
+        const ggml_tensor * node=graph->nodes[j];
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] == cat) {second=j;break;}
+        if (!ggml_cuda_is_view_or_noop(node)) return decline("intervening_compute");
+    }
+    if (second<0 || (int(skipped.size())>second && skipped[second])) return decline("second_consumer_unavailable");
+    const int outputs[2]={index,second};
+    // Includes every intervening metadata node. A later K/V output must not
+    // overwrite any source still live at the earlier projection. The launcher
+    // additionally rejects output/output, weight and packed-input overlap.
+    if (!ggml_cuda_check_fusion_memory_ranges(graph,index,second-index+1,outputs,2)) return decline("live_source_overlap");
+    if (!ggml_cuda_s1_dflash_kv_j16(ctx,cat,first,graph->nodes[second],packed->second)) return decline("shape_weight_role_or_alias");
+    if (int(skipped.size())<graph->n_nodes) skipped.resize(graph->n_nodes,0);
+    skipped[second]=1;
+    return true;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -7380,6 +7421,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (node->op == GGML_OP_CONCAT && !is_concurrent_event_active &&
                         stream_ctx.concurrent_events.empty() &&
                         ggml_cuda_try_dflash_concat_q8(*cuda_ctx, cgraph, i)) {
+                    continue;
+                }
+
+                if (node->op == GGML_OP_MUL_MAT && !is_concurrent_event_active &&
+                        stream_ctx.concurrent_events.empty() &&
+                        ggml_cuda_try_s1_dflash_kv(*cuda_ctx,cgraph,i,conv_front_skip)) {
                     continue;
                 }
 

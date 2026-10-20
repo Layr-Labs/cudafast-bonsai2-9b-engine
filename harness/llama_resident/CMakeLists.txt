@@ -255,6 +255,19 @@ if(LLAMA_RESIDENT_BUILD_TESTS)
         add_test(NAME rms-fwht-equivalence COMMAND rms-fwht-equivalence)
         # compares the D4 activation path; D1 (one scale per 128) is a deliberate numerical change
         set_tests_properties(rms-fwht-equivalence PROPERTIES ENVIRONMENT "GGML_CUDA_PREFILL_D1=0")
+        add_executable(s1-dflash-kv-j8 test/s1_dflash_kv_j8.cu)
+        target_include_directories(s1-dflash-kv-j8 PRIVATE
+            ${LLAMA_CPP_DIR}/ggml/src ${LLAMA_CPP_DIR}/ggml/src/ggml-cuda)
+        target_compile_definitions(s1-dflash-kv-j8 PRIVATE
+            $<TARGET_PROPERTY:ggml-cuda,COMPILE_DEFINITIONS>)
+        # Same codegen flags as the ggml-cuda library (-use_fast_math, sm_121a): the frozen parent
+        # bodies in the test TU must compile exactly like the production kernels they are compared to.
+        target_compile_options(s1-dflash-kv-j8 PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>
+            $<$<COMPILE_LANGUAGE:CUDA>:-extended-lambda>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+        set_target_properties(s1-dflash-kv-j8 PROPERTIES CUDA_ARCHITECTURES "121a")
+        target_link_libraries(s1-dflash-kv-j8 PRIVATE ggml ggml-cuda ggml-base CUDA::cudart)
         add_executable(gnorm-fwht-equivalence test/gnorm_fwht_equivalence.cu)
         target_include_directories(gnorm-fwht-equivalence PRIVATE
             ${LLAMA_CPP_DIR}/ggml/src
