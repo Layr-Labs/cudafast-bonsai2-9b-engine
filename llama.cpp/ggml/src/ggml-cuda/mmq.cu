@@ -922,7 +922,8 @@ static bool ggml_cuda_decode_glu_run(ggml_backend_cuda_context & ctx, const ggml
 }
 
 bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * src1,
-                             ggml_tensor * gate_dst, const void * stacked, void * external_q8) {
+                             ggml_tensor * gate_dst, const void * stacked, void * external_q8, bool * stored_f16) {
+    if (stored_f16) *stored_f16 = false;
     const int id  = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
@@ -971,13 +972,17 @@ bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor 
         return false; // the separate launch would not be pure tiling in the J=128 kernel
     }
     args.d1_y=ggml_cuda_mmq_d1_input(ctx,src1,external_q8,false);
+    // GGML_CUDA_PREFILL_GLU_F16=0 keeps the F32 SwiGLU storage.
+    static const bool glu_f16 = getenv("GGML_CUDA_PREFILL_GLU_F16") == nullptr || atoi(getenv("GGML_CUDA_PREFILL_GLU_F16")) != 0;
+    args.glu_f16=glu_f16;
     args.x       = (const char *) stacked;
     args.nrows_x = 2*gate_w->ne[1];
     if (!ggml_cuda_mmq_pq2_j128_supported(args)) {
         return false;
     }
-    ggml_cuda_mmq_pq2_j128_glu_launch<GGML_TYPE_PQ2_0>(args, ctx.stream());
+    const bool f16 = ggml_cuda_mmq_pq2_j128_glu_launch<GGML_TYPE_PQ2_0>(args, ctx.stream());
     CUDA_CHECK(cudaGetLastError());
+    if (stored_f16) *stored_f16 = f16;
     return true;
 }
 

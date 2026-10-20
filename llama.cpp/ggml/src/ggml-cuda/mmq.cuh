@@ -1622,6 +1622,8 @@ struct mmq_args {
     int64_t       nrows_lo = 0;
     // True only for a matching per-graph held FWHT D1 producer record.
     bool          d1_y = false;
+    // Prefill GLU only: store the fused SwiGLU as F16 when the D1 plane consumer runs (GGML_CUDA_PREFILL_GLU_F16).
+    bool          glu_f16 = false;
 };
 
 // GB10 prefill: the row-interleaved copy of a layer's ffn_gate/ffn_up PQ2_0 weights (made at model load): in every
@@ -2009,8 +2011,9 @@ size_t ggml_cuda_mul_mat_q_q8_size(const ggml_tensor * src0, const ggml_tensor *
 // ggml_cuda_glu_pair), writing silu(gate)*up into gate_dst; external_q8 is the D4 activation both would read. Only
 // when the separate gate (and up) matmul would run the pure-tiling J=128 kernel, so every value is the one the two
 // launches and the SWIGLU node compute. Returns false (nothing launched) otherwise.
+// stored_f16 (optional): set to whether the SwiGLU went into the gate operand as F16 instead of F32.
 bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * src1,
-                             ggml_tensor * gate_dst, const void * stacked, void * external_q8);
+                             ggml_tensor * gate_dst, const void * stacked, void * external_q8, bool * stored_f16 = nullptr);
 
 bool ggml_cuda_mul_mat_q_dod_qkv(ggml_backend_cuda_context & ctx, const ggml_tensor * q,
         const ggml_tensor * k, const ggml_tensor * v, const void * q8);

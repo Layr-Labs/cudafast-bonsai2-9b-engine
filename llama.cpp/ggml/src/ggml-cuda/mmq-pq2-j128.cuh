@@ -598,8 +598,9 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_res_hint(const float *
 // gate rows of 8 features and rows 8-15 the up rows of the same features, so a thread holds gate (row g) and up
 // (row g + 8) of feature row_base/2 + 8*rt + g. It stores silu(gate)*up there with the expression of
 // unary_gated_op_kernel<op_silu, float> (the SWIGLU node's value); out has the gate output's layout.
+template <typename T = float>
 static __device__ __forceinline__ void ggml_cuda_pq2_j128_store_glu(
-        const float (&acc)[2][4][4], float * out, const int stride_col, const int row_base, const int col_base,
+        const float (&acc)[2][4][4], T * out, const int stride_col, const int row_base, const int col_base,
         const int j_max) {
     const int lane = threadIdx.x;
     const int g    = lane / 4;
@@ -615,7 +616,14 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_store_glu(
                     continue;
                 }
                 const int i = row_base/2 + rt*8 + g;
-                out[(int64_t) j*stride_col + i] = ggml_cuda_op_silu_single(acc[rt][ct][l]) * acc[rt][ct][l + 2];
+                const float v = ggml_cuda_op_silu_single(acc[rt][ct][l]) * acc[rt][ct][l + 2];
+                if constexpr (std::is_same<T, half>::value) {
+                    // F16 transport of the prefill SwiGLU (GGML_CUDA_PREFILL_GLU_F16): round to nearest,
+                    // saturating at the largest finite half so an outlier can never become inf.
+                    out[(int64_t) j*stride_col + i] = __float2half_rn(fminf(fmaxf(v, -65504.0f), 65504.0f));
+                } else {
+                    out[(int64_t) j*stride_col + i] = v;
+                }
             }
         }
     }
@@ -948,9 +956,10 @@ static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid,
 // The GLU kernel over a 2*F-row interleaved weight (args.nrows_x = 2*F, args.dst = the gate output, args.nrows_dst its
 // column stride): pure tiling, one CTA per 128-row tile, no fixup.
 template <ggml_type type>
-static void ggml_cuda_mmq_pq2_j128_glu_launch(const mmq_args & args, cudaStream_t stream) {
+static bool ggml_cuda_mmq_pq2_j128_glu_launch(const mmq_args & args, cudaStream_t stream) {
     static_assert(type == GGML_TYPE_PQ2_0, "PQ2_0 only");
-    if (ggml_cuda_prefill_plane_glu_run<type>(args, stream)) return;
+    bool stored_f16 = false;
+    if (ggml_cuda_prefill_plane_glu_run<type>(args, stream, &stored_f16)) return stored_f16;
     constexpr size_t smem = ggml_cuda_pq2_j128_smem();
     const int nkb = (int) (args.ncols_x / QK_PQ2_0);
     const int ntx = (int) ((args.ncols_max + 127) / 128);
@@ -968,6 +977,7 @@ static void ggml_cuda_mmq_pq2_j128_glu_launch(const mmq_args & args, cudaStream_
         ggml_cuda_kernel_launch_params(dim3(2*ntiles, 1, 1), dim3(32, 8, 1), smem, stream),
         args.x, args.y, args.dst, nullptr, (int) args.nrows_x, nkb, (int) args.stride_row_x, (int) args.ncols_y,
         (int) args.nrows_dst, (int) args.ncols_dst, ntx, (const float *) nullptr, (float *) nullptr);
+    return false; // the J128 GLU kernel stores F32
 }
 
 // Template so that only the PQ2_0 MMQ translation unit instantiates the kernels. Pure tiling loads the
