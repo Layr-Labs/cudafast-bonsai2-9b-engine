@@ -7109,6 +7109,17 @@ static bool ggml_cuda_try_dflash_concat_q8(ggml_backend_cuda_context & ctx,
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+#ifdef USE_CUDA_GRAPH
+    // The caller has already checked graph properties and registry generations.
+    // A stable replay needs no capture-only consumer maps or scratch bookkeeping.
+    if (use_cuda_graph && !cuda_graph_update_required) {
+        ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        GGML_ASSERT(graph->instance != nullptr);
+        CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        return;
+    }
+#endif
+
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
