@@ -138,8 +138,20 @@ class LlamaSpeculativeRoundBackend : public SpeculativeRoundBackend {
         // One top-8 scan per verify row: the accept reads its token, the emit reuses it.
         verify_emits_.clear();
         greedy_accept_ids_.clear();
+        std::vector<llama_logits_topk_row> rows;
+        bool rows_ready = false;
+        if (eng_->logits_topk_) {
+            rows.resize(draft.size() + 1);
+            rows_ready = llama_get_logits_topk_rows(eng_->ctx_tgt_, static_cast<int32_t>(rows.size()), rows.data());
+        }
         for (size_t i = 0; i <= draft.size(); ++i) {
-            verify_emits_.push_back(eng_->emit_logits(static_cast<int>(i)));
+            // Copy each consumed view before any later target decode; keep the scalar path for
+            // unavailable selections and NaNs, and never inspect rows beyond the first mismatch.
+            Emit e;
+            if (!rows_ready || !top_from_selection(rows[i].ids, rows[i].logits, rows[i].head, e)) {
+                e = eng_->emit_logits(static_cast<int>(i));
+            }
+            verify_emits_.push_back(std::move(e));
             greedy_accept_ids_.push_back(verify_emits_.back().token);
             if (i == draft.size() || draft[i] != greedy_accept_ids_.back()) {
                 break;

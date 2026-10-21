@@ -4743,6 +4743,20 @@ bool llama_get_logits_topk_ith(llama_context * ctx, int32_t i, const int32_t ** 
     return ctx->get_logits_topk_ith(i, ids, logits, head);
 }
 
+bool llama_get_logits_topk_rows(llama_context * ctx, int32_t n_rows, llama_logits_topk_row * rows) {
+    if (ctx == nullptr || n_rows <= 0 || rows == nullptr) {
+        return false;
+    }
+    ctx->synchronize();
+
+    for (int32_t i = 0; i < n_rows; ++i) {
+        if (!ctx->get_logits_topk_ith(i, &rows[i].ids, &rows[i].logits, &rows[i].head)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void llama_set_embeddings_layer_inp_dev(llama_context * ctx, bool value) {
     ctx->set_embeddings_layer_inp_dev(value);
 }

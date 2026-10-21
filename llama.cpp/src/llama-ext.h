@@ -132,6 +132,18 @@ LLAMA_API bool llama_set_logits_topk(struct llama_context * ctx, int32_t k);
 LLAMA_API bool llama_get_logits_topk_ith(struct llama_context * ctx, int32_t i, const int32_t ** ids,
                                          const float ** logits, const float ** head);
 
+struct llama_logits_topk_row {
+    const int32_t * ids;
+    const float * logits;
+    const float * head;
+};
+
+// Selections for batch token indices [0, n_rows), synchronized together and resolved as by
+// llama_get_logits_topk_ith. rows has n_rows entries; consume none if false is returned.
+// The views belong to ctx: consume them before another decode/encode or output-buffer change.
+LLAMA_API bool llama_get_logits_topk_rows(struct llama_context * ctx, int32_t n_rows,
+                                          struct llama_logits_topk_row * rows);
+
 // Keep up to n built graphs (default 1), each with its own scheduler and compute buffers, so a
 // context that alternates graph types reuses each graph instead of rebuilding it every call.
 LLAMA_API void llama_set_graph_slots(struct llama_context * ctx, uint32_t n);
