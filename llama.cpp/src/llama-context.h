@@ -407,7 +407,17 @@ private:
     // with graph slots the draft graph's own slot keeps the ids until its next run: they are read there,
     // with no copy to walk_dev. Set only between a draft graph and its importer.
     ggml_tensor *           walk_src = nullptr;
+    bool                   walk_staged = false;
     const ggml_tensor *     walk_tensor() const { return walk_src ? walk_src : walk_dev; }
+
+    // Per-context host staging for the current walk only. The device import waits on walk_event,
+    // recorded before this copy; the host waits on walk_host_ready. No payload survives re-arming.
+    ggml_backend_buffer_ptr buf_walk_host;
+    ggml_backend_event_ptr  walk_host_ready;
+    ggml_backend_dev_t      walk_host_device = nullptr;
+    int64_t                walk_host_n = 0;
+    bool                   walk_host_pending = false;
+    void dflash_walk_host_stage(ggml_backend_t backend);
 
     // a staged import of another context's device walk into this context's next input tokens
     struct token_import_info {

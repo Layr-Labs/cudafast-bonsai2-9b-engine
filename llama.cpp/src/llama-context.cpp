@@ -600,6 +600,9 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (walk_host_pending) {
+        ggml_backend_event_synchronize(walk_host_ready.get());
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1674,6 +1677,27 @@ void llama_context::set_causal_attn(bool value) {
 }
 
 void llama_context::set_dflash_device_walk(bool enable) {
+    // Re-arming also occurs when the speculative state is recreated for a new request.
+    // Keep only the allocation; every usable payload must come from a new walk stage.
+    walk_host_n = 0;
+    walk_staged = false;
+    if (enable && !buf_walk_host && model.hparams.dflash_block_size > 1) {
+        ggml_backend_dev_t dev = model.dev_output();
+        ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (host_buft) {
+            const size_t size = (size_t) (model.hparams.dflash_block_size - 1)*sizeof(int32_t);
+            ggml_backend_buffer_ptr host(ggml_backend_buft_alloc_buffer(host_buft, size));
+            // CUDA's host allocator can silently fall back to pageable CPU memory.
+            if (host && ggml_backend_buffer_get_type(host.get()) == host_buft) {
+                ggml_backend_event_ptr ready(ggml_backend_event_new(dev));
+                if (ready) {
+                    buf_walk_host = std::move(host);
+                    walk_host_ready = std::move(ready);
+                    walk_host_device = dev;
+                }
+            }
+        }
+    }
     if (cparams.dflash_device_walk == enable) {
         return;
     }
@@ -1702,6 +1726,8 @@ void llama_context::dflash_walk_stage(ggml_tensor * t) {
         // the host read: the ids are read where the walk wrote them
         walk_src = t;
         ggml_backend_event_record(walk_event.get(), backend);
+        walk_staged = true;
+        dflash_walk_host_stage(backend);
         return;
     }
     walk_src = nullptr;
@@ -1730,12 +1756,38 @@ void llama_context::dflash_walk_stage(ggml_tensor * t) {
 
     ggml_backend_tensor_copy_async(backend, backend, t, walk_dev);
     ggml_backend_event_record(walk_event.get(), backend);
+    walk_staged = true;
+    dflash_walk_host_stage(backend);
+}
+
+void llama_context::dflash_walk_host_stage(ggml_backend_t backend) {
+    walk_host_n = 0;
+    const ggml_tensor * walk = walk_tensor();
+    if (!buf_walk_host || !walk_host_ready || ggml_backend_get_device(backend) != walk_host_device ||
+            ggml_nbytes(walk) > ggml_backend_buffer_get_size(buf_walk_host.get())) {
+        return;
+    }
+
+    // Ordered after the walk on the drafter's stream. The target's device import only waits for
+    // walk_event above, so it can proceed independently of this host copy and its completion event.
+    ggml_backend_tensor_get_async(backend, walk, ggml_backend_buffer_get_base(buf_walk_host.get()), 0, ggml_nbytes(walk));
+    ggml_backend_event_record(walk_host_ready.get(), backend);
+    walk_host_n = walk->ne[0];
+    walk_host_pending = true;
 }
 
 int32_t llama_context::get_dflash_walk(int32_t * out, int32_t n_out) {
     const ggml_tensor * walk = walk_tensor();
-    if (walk == nullptr || !walk_event || n_out < walk->ne[0]) {
+    if (!walk_staged || walk == nullptr || !walk_event || n_out < walk->ne[0]) {
         return -1;
+    }
+    if (buf_walk_host && walk_host_ready && walk_host_n == walk->ne[0]) {
+        if (walk_host_pending) {
+            ggml_backend_event_synchronize(walk_host_ready.get());
+            walk_host_pending = false;
+        }
+        std::memcpy(out, ggml_backend_buffer_get_base(buf_walk_host.get()), ggml_nbytes(walk));
+        return (int32_t) walk->ne[0];
     }
     // the ids were written on this context's stream; the event orders the host read after them
     ggml_backend_event_synchronize(walk_event.get());
@@ -1744,7 +1796,7 @@ int32_t llama_context::get_dflash_walk(int32_t * out, int32_t n_out) {
 }
 
 bool llama_context::set_token_import_dflash_walk(const llama_context & src, int32_t row0, int32_t n) {
-    if (src.walk_tensor() == nullptr || !src.walk_event || row0 < 0 || n <= 0 || n > src.walk_tensor()->ne[0]) {
+    if (!src.walk_staged || src.walk_tensor() == nullptr || !src.walk_event || row0 < 0 || n <= 0 || n > src.walk_tensor()->ne[0]) {
         return false;
     }
     token_import = { &src, row0, n };
