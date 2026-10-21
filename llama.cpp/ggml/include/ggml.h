@@ -598,6 +598,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_DFLASH_WALK,
+        GGML_OP_DFLASH_RESCORE,
 
         GGML_OP_COUNT,
     };
@@ -2431,6 +2432,18 @@ extern "C" {
             int                   top_k,
             int                   row0,
             int                   n_steps);
+
+    // DFlash2 drafter head rescore: exact dot products of selected rows of a quantized head a [K, R]
+    // with b [K, n] (f32, the head's input after its transforms). c [kc, n_chunks*n] (i32) holds, for
+    // each column j of b and each chunk q of `chunk` head rows, kc row offsets inside the chunk
+    // (column q + j*n_chunks). Result [kc*n_chunks, n, 2] f32: plane 0 the dot products, plane 1 the
+    // global row ids (q*chunk + offset) as f32.
+    GGML_API struct ggml_tensor * ggml_dflash_rescore(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c,
+            int                   chunk);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

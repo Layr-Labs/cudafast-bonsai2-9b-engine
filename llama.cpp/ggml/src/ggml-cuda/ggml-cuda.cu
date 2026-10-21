@@ -53,6 +53,7 @@
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
 #include "ggml-cuda/dflash-walk.cuh"
+#include "ggml-cuda/dflash-rescore.cuh"
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
@@ -2791,6 +2792,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DFLASH_WALK:
             ggml_cuda_op_dflash_walk(ctx, dst);
+            break;
+        case GGML_OP_DFLASH_RESCORE:
+            ggml_cuda_op_dflash_rescore(ctx, dst);
             break;
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
@@ -8841,6 +8845,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_DFLASH_WALK:
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
+        case GGML_OP_DFLASH_RESCORE:
+            return ggml_cuda_dflash_rescore_supported(op);
         case GGML_OP_TOP_K:
         case GGML_OP_ARGSORT:
 #ifndef GGML_CUDA_USE_CUB
