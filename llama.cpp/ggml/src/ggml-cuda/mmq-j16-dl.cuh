@@ -723,19 +723,34 @@ static __host__ __device__ constexpr size_t ggml_cuda_dl_ring_smem(const int S) 
 
 // Signed PTQ1 FFN variant: keep only one sub-block of activation words and
 // scales live. The MMA operands and FP32 accumulation order are unchanged.
+template <bool PAIR_TAIL = false>
 static __device__ __forceinline__ void ggml_cuda_ptq1_j16_jit_step(
         float (&sum)[1][4], const char * sx, const char * sy, const int c) {
     ggml_cuda_ptq1_j16_stage st;
     const uint32_t * xw = (const uint32_t *) sx;
     st.wa = xw[c];
     st.wb = xw[4 + (c & 1)];
-    st.w6 = xw[6];
+    uint32_t ds = 0;
+    if constexpr (PAIR_TAIL) {
+        const int g = int(threadIdx.x)/4;
+        const uint32_t * tile = xw - 7*g;
+        st.w6 = tile[7*(g/2) + 6] >> (16*(g&1));
+        ds = tile[7*(4+c) + 6];
+    } else {
+        st.w6 = xw[6];
+    }
     // The original decoder reads only these three initialized weight words.
     uint32_t b[4][2];
     ggml_cuda_ptq1_j16_decode(b, st, c);
-    const int xd = int(st.w6 >> 16);
-    const int d_lo = __shfl_sync(0xFFFFFFFF, xd, 8*c + 0);
-    const int d_hi = __shfl_sync(0xFFFFFFFF, xd, 8*c + 4);
+    int d_lo, d_hi;
+    if constexpr (PAIR_TAIL) {
+        d_lo = int(ds & 0xffffu);
+        d_hi = int(ds >> 16);
+    } else {
+        const int xd = int(st.w6 >> 16);
+        d_lo = __shfl_sync(0xFFFFFFFF, xd, 8*c + 0);
+        d_hi = __shfl_sync(0xFFFFFFFF, xd, 8*c + 4);
+    }
     const float dA[2] = {
         __half2float(__ushort_as_half((unsigned short) d_lo)),
         __half2float(__ushort_as_half((unsigned short) d_hi)),

@@ -345,8 +345,8 @@ static __device__ __forceinline__ void ggml_cuda_pq2_ws_compute_compact(float (&
     }
 }
 
-// Opt-in D1 compute, copied byte-for-byte from the qualified private consumer.
-template<bool DT=false>static __device__ __forceinline__ void ggml_cuda_pq2_j128_d1_compute(
+// Qualified D1 compute; B_PAIR only combines adjacent B fragment loads.
+template<bool DT=false, bool B_PAIR=false>static __device__ __forceinline__ void ggml_cuda_pq2_j128_d1_compute(
  float (&acc)[2][4][4],uint32_t xs,uint32_t ys,uint32_t dbt=0){
  const int lane=threadIdx.x,g=lane/4,c=lane%4;
  constexpr int XS=4*ggml_cuda_pq2_j128_xs,YS=4*ggml_cuda_pq2_j128_ys;
@@ -366,9 +366,25 @@ template<bool DT=false>static __device__ __forceinline__ void ggml_cuda_pq2_j128
 #pragma unroll
   for(int rt=0;rt<2;++rt)ggml_cuda_pq2_j128_ldsm_x4(A[rt],xa+rt*16*XS+sub*32);
 #pragma unroll
-  for(int ct=0;ct<4;++ct){int B[2];ggml_cuda_pq2_j128_ldsm_x2(B,ya+ct*8*YS+sub*32);
+  for(int ct=0;ct<4;ct+=(B_PAIR?2:1)){
+   if constexpr(B_PAIR){
+    // x4 matrices 0/1 are the original x2 at ct; matrices 2/3
+    // are the original x2 at ct+1. Lanes 16..31 supply that second
+    // column tile's row addresses. Operand bytes and MMA order stay
+    // identical; only two extra B registers are live, with no scale
+    // fragments live yet. Per K128: eight A x4 + eight B x4 loads
+    // instead of eight A x4 + sixteen B x2 loads (32 MMAs in both).
+    int B[4];
+    ggml_cuda_pq2_j128_ldsm_x4(B,ya+(ct+lane/16)*8*YS+sub*32);
 #pragma unroll
-   for(int rt=0;rt<2;++rt)ggml_cuda_pq2_j16_mma(C[rt][ct],A[rt][0],A[rt][1],A[rt][2],A[rt][3],B[0],B[1]);
+    for(int h=0;h<2;++h){
+#pragma unroll
+     for(int rt=0;rt<2;++rt)ggml_cuda_pq2_j16_mma(C[rt][ct+h],A[rt][0],A[rt][1],A[rt][2],A[rt][3],B[2*h],B[2*h+1]);
+    }
+   }else{int B[2];ggml_cuda_pq2_j128_ldsm_x2(B,ya+ct*8*YS+sub*32);
+#pragma unroll
+    for(int rt=0;rt<2;++rt)ggml_cuda_pq2_j16_mma(C[rt][ct],A[rt][0],A[rt][1],A[rt][2],A[rt][3],B[0],B[1]);
+   }
   }
  }
  // Same original per-row dA, loaded after the integer reduction. The D1
@@ -404,7 +420,7 @@ template<bool DT=false>static __device__ __forceinline__ void ggml_cuda_pq2_j128
 // arrives by TMA with its Y tile, in the 4 KB that the transposed D4 scales use otherwise; a thread unpacks the same
 // 8 code bytes and fp16 dA that the raw global loads would give it (the plane copy holds the block bytes verbatim),
 // so the X tile, every product and every sum are the same. D1 reads its Y scale from the Y tile, as pure tiling does.
-template <bool PURE, bool COMPACT = false, bool D1 = false, bool TMAX = false>
+template <bool PURE, bool COMPACT = false, bool D1 = false, bool TMAX = false, bool B_PAIR = false>
 static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
         float (&acc)[2][4][4], const uint32_t smem, const char * __restrict__ x, const int * y,
         const int row0, const int stride_row_x, const int ncols_y, const int col0,
@@ -520,7 +536,7 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
         __syncthreads();
         for (int kb = kb_start; kb < kb_stop; ++kb) {
             const uint32_t cur = (kb - kb_start) & 1;
-            ggml_cuda_pq2_j128_d1_compute<false>(acc, xw, yw + cur*YBYTES);
+            ggml_cuda_pq2_j128_d1_compute<false,B_PAIR>(acc, xw, yw + cur*YBYTES);
             if (kb + 1 >= kb_stop) {
                 break;
             }
@@ -715,12 +731,13 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_store_glu(
 // res and dst_add have dst's layout (stride_col_dst). dst_add may be dst or res; it overlaps nothing else.
 // GLU (pure tiling only): x is a gate/up row-interleaved weight of 2*F rows, dst the F-row gate output (see
 // ggml_cuda_pq2_j128_store_glu); every accumulator is the one the separate gate and up launches compute.
-template <bool PURE, bool ADD, bool GLU = false, bool COMPACT = false, bool D1 = false, bool TMAX = false>
+template <bool PURE, bool ADD, bool GLU = false, bool COMPACT = false, bool D1 = false, bool TMAX = false, bool B_PAIR = false>
 __launch_bounds__(256, 2)
 static __global__ void mul_mat_q_pq2_j128(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
         const int nrows_x, const int nkb, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const int ncols_dst, const int ntx, const float * res, float * dst_add) {
+    static_assert(!B_PAIR || (!PURE && D1 && TMAX), "B pairing is restricted to D1 stream-k TMAX");
     constexpr int I    = 128; // tile of the old kernel
     constexpr int J    = 128;
     constexpr int ROWS = 64;
@@ -824,7 +841,7 @@ static __global__ void mul_mat_q_pq2_j128(
         if (whole) {
             ggml_cuda_pq2_j128_res_hint(res, stride_col_dst, it*I + q*ROWS, jt*J, ncols_dst);
         }
-        ggml_cuda_pq2_j128_segment<PURE,COMPACT,D1,TMAX>(acc, smem, x, y, it*I + q*ROWS, stride_row_x, ncols_y, jt*J, kb0_start, kb0_stop, ph, nrows_x);
+        ggml_cuda_pq2_j128_segment<PURE,COMPACT,D1,TMAX,B_PAIR>(acc, smem, x, y, it*I + q*ROWS, stride_row_x, ncols_y, jt*J, kb0_start, kb0_stop, ph, nrows_x);
         if (!ends_tile) {
             ggml_cuda_pq2_j128_store(acc, tmp_fixup + (int64_t) b*(J*I), I, row_in_tile, col_in_tile, J - 1);
             return;
@@ -995,6 +1012,13 @@ static int ggml_cuda_pq2_prefill_compact_mode() {
     return mode;
 }
 
+// On by default (GGML_CUDA_PREFILL_GEMM_V2=0 turns it off), confined to the D1 plane GU and stream-k TMAX
+// consumers. Pure tiling and the D4/raw-weight fallbacks keep their kernels.
+static bool ggml_cuda_prefill_gemm_v2_enabled() {
+    static const bool enabled = ggml_cuda_dl_env_int("GGML_CUDA_PREFILL_GEMM_V2", 1) != 0;
+    return enabled;
+}
+
 #include "mmq-pq2-plane.cuh"
 
 // TMAX for this stream-k D1 launch: the weight has a prefill plane copy (contiguous rows of whole K blocks).
@@ -1014,16 +1038,20 @@ static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid,
     const int nkb = (int) (args.ncols_x / QK_PQ2_0);
     const int ntx = (int) ((args.ncols_max + 127) / 128);
     const ggml_cuda_prefill_plane_entry * plane = PURE ? nullptr : ggml_cuda_pq2_j128_tmax_plane(args, nkb);
-    const auto kernel = plane ? mul_mat_q_pq2_j128<PURE, ADD, false, true, true, true> :
+    auto kernel = plane ? mul_mat_q_pq2_j128<PURE, ADD, false, true, true, true> :
         args.d1_y ? mul_mat_q_pq2_j128<PURE, ADD, false, true, true> :
         (COMPACT || ggml_cuda_pq2_prefill_compact_mode() == 1
         ? mul_mat_q_pq2_j128<PURE, ADD, false, true> : mul_mat_q_pq2_j128<PURE, ADD>);
-    static bool attr_set[2][2][GGML_CUDA_MAX_DEVICES] = {};
+    const bool v2 = plane && ggml_cuda_prefill_gemm_v2_enabled();
+    if constexpr (!PURE) {
+        if (v2) kernel = mul_mat_q_pq2_j128<false, ADD, false, true, true, true, true>;
+    }
+    static bool attr_set[2][2][2][GGML_CUDA_MAX_DEVICES] = {};
     const int device = ggml_cuda_get_device();
-    if (!attr_set[plane != nullptr][args.d1_y][device]) {
+    if (!attr_set[v2][plane != nullptr][args.d1_y][device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
-        attr_set[plane != nullptr][args.d1_y][device] = true;
+        attr_set[v2][plane != nullptr][args.d1_y][device] = true;
     }
     static bool logged=false;
     if(args.d1_y && !logged){GGML_LOG_INFO("PREFILL_D1_CONSUMER ordinary ADD=%d PURE=%d rows=%lld\n",int(ADD),int(PURE),(long long)args.ncols_y);logged=true;}

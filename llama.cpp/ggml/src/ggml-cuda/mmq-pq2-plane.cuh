@@ -107,10 +107,11 @@ static __device__ __forceinline__ void ggml_cuda_prefill_plane_d1_alias_load(
 // the loop are 64 fp16 scales; one next-scale register stays live across MMA.
 // The 50176-byte footprint equals the existing stream-K kernel, with barriers
 // living in padding of the decoded X tile instead of enlarging shared memory.
-template <bool ADD,bool GLU,bool D4_ALIAS=false,bool OWNER=false,bool D1=false,bool GLU_H=false>
+template <bool ADD,bool GLU,bool D4_ALIAS=false,bool OWNER=false,bool D1=false,bool GLU_H=false,bool B_PAIR=false>
 static __global__ void __launch_bounds__(256,2) mul_mat_q_pq2_plane(
         const unsigned char * codes,const uint16_t * scales,const int * y,float * dst,
         int nkb,int ncols_y,int stride_col_dst,int ntx,const float * residual) {
+    static_assert(!B_PAIR || (D1 && D4_ALIAS), "B pairing requires the D1 alias consumer");
     constexpr int YBYTES=128*144,XBYTES=64*144,CBYTES=64*32;
     extern __shared__ int plane_smem[];
     const uint32_t smem=(uint32_t)__cvta_generic_to_shared(plane_smem);
@@ -155,7 +156,7 @@ static __global__ void __launch_bounds__(256,2) mul_mat_q_pq2_plane(
         if (quarter==0 && kb+1<nkb) scale=sp[(kb+1)*64];
         __syncthreads();
         if constexpr (D4_ALIAS) {
-            if constexpr(D1) ggml_cuda_pq2_j128_d1_compute<true>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144,ctiles+buf*CBYTES+wc*32*4);
+            if constexpr(D1) ggml_cuda_pq2_j128_d1_compute<true,B_PAIR>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144,ctiles+buf*CBYTES+wc*32*4);
             else ggml_cuda_pq2_ws_compute_compact<true>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144,ctiles+buf*CBYTES+wc*32*4);
         } else {
             if constexpr(D1) ggml_cuda_pq2_j128_d1_compute<false>(acc,xtile+wr*32*144,smem+buf*YBYTES+wc*32*144);
@@ -205,15 +206,18 @@ static bool ggml_cuda_prefill_plane_glu_run(const mmq_args & args, cudaStream_t 
     const bool owner=alias && ggml_cuda_prefill_plane_owner_enabled();
     const bool d1=args.d1_y && owner; // other explicit plane modes retain the compatible original consumer
     const bool glu_h=d1 && args.glu_f16; // F16 SwiGLU storage only on the D1 production consumer
-    const auto kernel=glu_h ? mul_mat_q_pq2_plane<false,true,true,true,true,true> :
+    const bool v2=d1 && ggml_cuda_prefill_gemm_v2_enabled();
+    const auto kernel=v2 ? (glu_h ? mul_mat_q_pq2_plane<false,true,true,true,true,true,true> :
+                                  mul_mat_q_pq2_plane<false,true,true,true,true,false,true>) :
+                      glu_h ? mul_mat_q_pq2_plane<false,true,true,true,true,true> :
                       d1 ? mul_mat_q_pq2_plane<false,true,true,true,true> :
                       (owner?mul_mat_q_pq2_plane<false,true,true,true>:
                       alias?mul_mat_q_pq2_plane<false,true,true,false>:mul_mat_q_pq2_plane<false,true,false,false>);
-    static bool attr[2][2][2][2][GGML_CUDA_MAX_DEVICES]={};
-    if (!attr[glu_h][d1][alias][owner][device]) {
+    static bool attr[2][2][2][2][2][GGML_CUDA_MAX_DEVICES]={};
+    if (!attr[v2][glu_h][d1][alias][owner][device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,SHARED));
         CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributePreferredSharedMemoryCarveout,(int)cudaSharedmemCarveoutMaxShared));
-        attr[glu_h][d1][alias][owner][device]=true;
+        attr[v2][glu_h][d1][alias][owner][device]=true;
     }
     static bool logged=false;
     if(d1 && !logged){GGML_LOG_INFO("PREFILL_D1_CONSUMER planeGU rows=%lld\n",(long long)args.ncols_y);logged=true;}
