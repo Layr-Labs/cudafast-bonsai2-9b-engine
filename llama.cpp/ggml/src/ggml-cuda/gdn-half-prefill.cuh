@@ -113,7 +113,7 @@ template<bool AT,bool BT,int K> __device__ __forceinline__ void dot(float *c,con
     }
 }
 
-template<bool RAW,bool OPT_INVERSE=false> __global__ __launch_bounds__(128) void prepare_packed(Frame f,Coeff*out,__half*packed) {
+template<bool RAW,bool OPT_INVERSE=false,bool OPT_DECAY=false> __global__ __launch_bounds__(128) void prepare_packed(Frame f,Coeff*out,__half*packed) {
     ggml_cuda_pdl_sync();
     const int h=blockIdx.x,ch=blockIdx.y,warp=threadIdx.y,tid=warp*32+threadIdx.x,first=ch*C;
     __shared__ float q[C*gdn_half_c16::QK_STRIDE],k[C*gdn_half_c16::QK_STRIDE],kk[C*C],qk[C*C],ai[C*C],gg[C],bb[C];
@@ -164,9 +164,23 @@ template<bool RAW,bool OPT_INVERSE=false> __global__ __launch_bounds__(128) void
 #pragma unroll
         for(int r=0;r<C;++r)ai[r*C+j]=inv[r];
     }
+    if constexpr(OPT_DECAY) {
+        // All Q/K readers completed at the barrier before the inverse. Warp 1
+        // reuses dead Q storage while warp 0 computes the inverse columns.
+        // Each column retains the original ascending rounded product chain.
+        if(warp==1&&threadIdx.x<C) {
+            const int j=threadIdx.x;float decay=1.0f;
+#pragma unroll
+            for(int i=0;i<C;++i) {
+                if(i>j)decay*=gg[i];
+                q[i*C+j]=i<j?0.0f:decay;
+            }
+        }
+    }
     __syncthreads();Coeff*c=out+ch*H+h;
     for(int e=tid;e<C*C;e+=128){const int i=e/C,j=e%C;float decay=1;
-        if(j<=i)for(int r=j+1;r<=i;++r)decay*=gg[r];else decay=0;
+        if constexpr(OPT_DECAY)decay=q[e];
+        else {if(j<=i)for(int r=j+1;r<=i;++r)decay*=gg[r];else decay=0;}
         c->a[e]=(ai[e]*decay)*bb[j];c->m[e]=qk[e]*decay;
     }
     if(tid<C){float p=1,last=1;for(int i=0;i<=tid;++i)p*=gg[i];for(int i=tid+1;i<C;++i)last*=gg[i];c->p[tid]=p;c->last[tid]=last;}
@@ -343,7 +357,7 @@ static void gdn_half_prefill_launch(
         ids,row_stride,lazy,zero_row,zero_scale,zero_bias);
     const gdn_half_c16::Frame frame{q,k,v,g,beta,bias,a,prefix,PACKED,sq1,sq2,sv1,sv2};
     const ggml_cuda_kernel_launch_params prep(dim3(32,prefix/16),dim3(32,4),0,stream);
-    ggml_cuda_kernel_launch(gdn_half_prefill::prepare_packed<false>,prep,frame,coefficients.ptr,packed.ptr);
+    ggml_cuda_kernel_launch(gdn_half_prefill::prepare_packed<false,false,true>,prep,frame,coefficients.ptr,packed.ptr);
     const ggml_cuda_kernel_launch_params carry(dim3(32,8),dim3(32,4),0,stream);
     if(fused_initial) {
         static bool logged=false;
