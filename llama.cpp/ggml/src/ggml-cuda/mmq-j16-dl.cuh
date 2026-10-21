@@ -565,10 +565,23 @@ static __global__ void ggml_cuda_dl_repack_kernel(const char * __restrict__ src,
     }
     const int64_t sidx = ggml_cuda_dl_src_index<LAYOUT, G>(d, nkb);
     const uint16_t * ps = (const uint16_t *) (src + sidx*BB);
-    uint16_t       * pd = (uint16_t       *) (dst + d*BB);
+    if constexpr (LAYOUT == GGML_CUDA_DL_TM64 && G == 4 && BB == sizeof(block_q8_0)) {
+        // Internal TM64 operand copy: [four half scales][four 32-byte qs].
+        // Same bytes and four-block grouping as the original Q8 file, but qs
+        // begin at an 8-byte aligned offset. No re-quantization or scale change.
+        uint16_t * group = (uint16_t *) (dst + (d/4)*(4*BB));
+        const int sub = int(d%4);
+        group[sub] = ps[0];
 #pragma unroll
-    for (int k = 0; k < BB/2; ++k) {
-        pd[k] = ps[k];
+        for (int k = 0; k < 16; ++k) {
+            group[4 + sub*16 + k] = ps[1 + k];
+        }
+    } else {
+        uint16_t * pd = (uint16_t *) (dst + d*BB);
+#pragma unroll
+        for (int k = 0; k < BB/2; ++k) {
+            pd[k] = ps[k];
+        }
     }
 }
 

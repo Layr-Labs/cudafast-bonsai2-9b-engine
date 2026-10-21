@@ -31,6 +31,20 @@ static __host__ __device__ int64_t ggml_cuda_dl_tm64_stage_index(int virtual_ste
     return (int64_t(virtual_step/nst)*2+half)*nst+virtual_step%nst;
 }
 
+// TM64's internal Q8 group has the four unmodified half scales first, then
+// four unmodified 32-byte quant arrays. Unlike file AoS, every int2 is aligned.
+static __device__ __forceinline__ void ggml_cuda_dl_q8_load_x_soa(
+        ggml_cuda_dl_q8_xstage & st, const char * xb, const int c) {
+#pragma unroll
+    for (int sub = 0; sub < 4; ++sub) {
+        const int2 q = *(const int2 *) (xb + 8 + sub*32 + c*8);
+        st.q[sub][0] = q.x;
+        st.q[sub][1] = q.y;
+    }
+    st.d[0] = ((const int *) xb)[0];
+    st.d[1] = ((const int *) xb)[1];
+}
+
 template <int FMT, int S, int SPS>
 __launch_bounds__(8*32, 2)
 static __global__ void mul_mat_q_q8_j16_dl_ring_tm64(
@@ -110,7 +124,11 @@ static __global__ void mul_mat_q_q8_j16_dl_ring_tm64(
             if (j < n) {
                 const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
                 const char * sy = smem + s*SB + SPS*XB + j*YB + g*(int) sizeof(block_q8_1_mmq);
-                ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
+                ggml_cuda_dl_q8_xstage xs;
+                ggml_cuda_dl_q8_ystage ys;
+                ggml_cuda_dl_q8_load_x_soa(xs, sx, c);
+                ggml_cuda_dl_q8_load_y(ys, sy, c);
+                ggml_cuda_dl_q8_compute(sum[0], xs, ys, c);
                 ++st;
                 const bool last = k*SPS + j == total - 1;
                 if (st == nst || last) { // end of a segment: the stores of the DL kernels
