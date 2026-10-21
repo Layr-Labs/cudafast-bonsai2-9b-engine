@@ -408,6 +408,12 @@ private:
     // with no copy to walk_dev. Set only between a draft graph and its importer.
     ggml_tensor *           walk_src = nullptr;
     const ggml_tensor *     walk_tensor() const { return walk_src ? walk_src : walk_dev; }
+    // A separate host-ready event does not lengthen the target's device import dependency.
+    ggml_backend_buffer_ptr buf_walk_host;
+    ggml_backend_event_ptr  walk_host_event;
+    size_t                 walk_host_bytes = 0;
+    bool                   walk_host_pending = false;
+
 
     // a staged import of another context's device walk into this context's next input tokens
     struct token_import_info {

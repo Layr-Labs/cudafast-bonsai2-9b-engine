@@ -600,6 +600,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (walk_host_pending) {
+        ggml_backend_event_synchronize(walk_host_event.get());
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1697,39 +1701,62 @@ void llama_context::dflash_walk_stage(ggml_tensor * t) {
         walk_event.reset(ggml_backend_event_new(ggml_backend_get_device(backend)));
         GGML_ASSERT(walk_event && "the DFlash2 device walk needs backend events");
     }
+    // One staging buffer is reused. Do not overwrite or release a pending D2H target.
+    if (walk_host_pending) {
+        ggml_backend_event_synchronize(walk_host_event.get());
+        walk_host_pending = false;
+    }
     if (n_graph_slots > 1) {
         // the draft graph keeps its own slot (compute buffer) until it runs again, after the importer and
         // the host read: the ids are read where the walk wrote them
         walk_src = t;
         ggml_backend_event_record(walk_event.get(), backend);
-        return;
+    } else {
+        walk_src = nullptr;
+
+        // the ids leave the compute buffer before the next graph is allocated over it
+        if (walk_dev == nullptr || walk_dev->ne[0] != t->ne[0]) {
+            // an import may still read the old copy
+            ggml_backend_sched_synchronize(sched.get());
+
+            walk_dev = nullptr;
+            buf_walk_dev.reset();
+
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ctx_walk_dev.reset(ggml_init(params));
+            ggml_tensor * dev_t = ggml_new_tensor_1d(ctx_walk_dev.get(), GGML_TYPE_I32, t->ne[0]);
+
+            ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+            buf_walk_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_walk_dev.get(), ggml_backend_buffer_get_type(buf)));
+            GGML_ASSERT(buf_walk_dev && "failed to allocate the DFlash2 walk buffer");
+            walk_dev = dev_t;
+        }
+
+        ggml_backend_tensor_copy_async(backend, backend, t, walk_dev);
+        ggml_backend_event_record(walk_event.get(), backend);
     }
-    walk_src = nullptr;
 
-    // the ids leave the compute buffer before the next graph is allocated over it
-    if (walk_dev == nullptr || walk_dev->ne[0] != t->ne[0]) {
-        // an import may still read the old copy
-        ggml_backend_sched_synchronize(sched.get());
-
-        walk_dev = nullptr;
-        buf_walk_dev.reset();
-
-        ggml_init_params params = {
-            /*.mem_size   =*/ ggml_tensor_overhead(),
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
-        };
-        ctx_walk_dev.reset(ggml_init(params));
-        ggml_tensor * dev_t = ggml_new_tensor_1d(ctx_walk_dev.get(), GGML_TYPE_I32, t->ne[0]);
-
-        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
-        buf_walk_dev.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_walk_dev.get(), ggml_backend_buffer_get_type(buf)));
-        GGML_ASSERT(buf_walk_dev && "failed to allocate the DFlash2 walk buffer");
-        walk_dev = dev_t;
+    // Queue the same integer readback on the producing stream before target verification is submitted.
+    // The device-ready event above remains independent of host readiness.
+    const ggml_tensor * walk = walk_tensor();
+    const size_t bytes = ggml_nbytes(walk);
+    if (!buf_walk_host || walk_host_bytes < bytes) {
+        auto buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+        buf_walk_host.reset(buft ? ggml_backend_buft_alloc_buffer(buft, bytes) : nullptr);
+        walk_host_bytes = buf_walk_host ? bytes : 0;
     }
-
-    ggml_backend_tensor_copy_async(backend, backend, t, walk_dev);
-    ggml_backend_event_record(walk_event.get(), backend);
+    if (buf_walk_host && !walk_host_event) {
+        walk_host_event.reset(ggml_backend_event_new(ggml_backend_get_device(backend)));
+    }
+    if (buf_walk_host && walk_host_event) {
+        ggml_backend_tensor_get_async(backend, walk, ggml_backend_buffer_get_base(buf_walk_host.get()), 0, bytes);
+        ggml_backend_event_record(walk_host_event.get(), backend);
+        walk_host_pending = true;
+    }
 }
 
 int32_t llama_context::get_dflash_walk(int32_t * out, int32_t n_out) {
@@ -1737,9 +1764,14 @@ int32_t llama_context::get_dflash_walk(int32_t * out, int32_t n_out) {
     if (walk == nullptr || !walk_event || n_out < walk->ne[0]) {
         return -1;
     }
-    // the ids were written on this context's stream; the event orders the host read after them
-    ggml_backend_event_synchronize(walk_event.get());
-    ggml_backend_tensor_get(walk, out, 0, ggml_nbytes(walk));
+    if (walk_host_pending) {
+        ggml_backend_event_synchronize(walk_host_event.get());
+        std::memcpy(out, ggml_backend_buffer_get_base(buf_walk_host.get()), ggml_nbytes(walk));
+    } else {
+        // Preserve the original path on backends without a host buffer type/event.
+        ggml_backend_event_synchronize(walk_event.get());
+        ggml_backend_tensor_get(walk, out, 0, ggml_nbytes(walk));
+    }
     return (int32_t) walk->ne[0];
 }
 
