@@ -289,6 +289,8 @@ void correctness() {
 } // namespace
 
 int main() {
+    // Isolate the exact F32 address permutation from the numerical half-prefix route.
+    setenv("GGML_CUDA_CONV_C16_PACK","0",1);
     correctness();
     return 0;
 }

@@ -1,7 +1,10 @@
 #pragma once
+#include <type_traits>
 // GB10 C16 long prefill. Original external tensors and persistent state
 // remain F32; TF32 Gram and explicitly rounded F16 MMA views change internal
-// arithmetic. Derived from tested f1b386e packed/early-V research implementation.
+// arithmetic. A fused conv may supply the prefix Q/K half slabs directly;
+// their Gram uses F16 MMA, with F32 accumulation and the same inverse/decays.
+// Derived from tested f1b386e packed/early-V research implementation.
 // The original scalar final16 kernel remains the sole cache-record writer.
 namespace gdn_half_c16 {
 constexpr int C=16,D=128,H=32,HK=16,VC=16,QK_STRIDE=132;
@@ -113,16 +116,33 @@ template<bool AT,bool BT,int K> __device__ __forceinline__ void dot(float *c,con
     }
 }
 
-template<bool RAW,bool OPT_INVERSE=false> __global__ __launch_bounds__(128) void prepare_packed(Frame f,Coeff*out,__half*packed) {
+template<bool RAW,bool OPT_INVERSE=false,bool INPUT_PACKED=false>
+__global__ __launch_bounds__(128) void prepare_packed(Frame f,Coeff*out,__half*packed) {
     ggml_cuda_pdl_sync();
     const int h=blockIdx.x,ch=blockIdx.y,warp=threadIdx.y,tid=warp*32+threadIdx.x,first=ch*C;
-    __shared__ float q[C*gdn_half_c16::QK_STRIDE],k[C*gdn_half_c16::QK_STRIDE],kk[C*C],qk[C*C],ai[C*C],gg[C],bb[C];
-    gdn_half_c16::stage_qk_async(f,first,h%HK,tid,q,k);
+    using QKType=std::conditional_t<INPUT_PACKED,__half,float>;
+    constexpr int stride=INPUT_PACKED?QK:gdn_half_c16::QK_STRIDE;
+    __shared__ __align__(16) QKType q[C*stride],k[C*stride];
+    __shared__ float kk[C*C],qk[C*C],ai[C*C],gg[C],bb[C];
+    if constexpr(INPUT_PACKED) {
+        const __half *pq=packed+(ch*HK+h%HK)*2*C*D,*pk=pq+C*D;
+#pragma unroll
+        for(int i=tid*8;i<C*D;i+=128*8) {
+            const int dst=(i/D)*QK+i%D;
+            const unsigned aq=unsigned(__cvta_generic_to_shared(q+dst));
+            const unsigned ak=unsigned(__cvta_generic_to_shared(k+dst));
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"::"r"(aq),"l"(pq+i):"memory");
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"::"r"(ak),"l"(pk+i):"memory");
+        }
+        asm volatile("cp.async.commit_group;":::"memory");
+    } else {
+        gdn_half_c16::stage_qk_async(f,first,h%HK,tid,q,k);
+    }
     if(tid<C)gdn_half_c16::gates<RAW>(f,first+tid,h,gg[tid],bb[tid]);
     asm volatile("cp.async.wait_group 0;" ::: "memory");__syncthreads();
     // Only one of the two value-head users writes each canonical Q/K slab.
     // This is inside the measured preparation kernel, never a warmup cache.
-    if(h<HK) {
+    if constexpr(!INPUT_PACKED) if(h<HK) {
         __half *pq=packed+(ch*HK+h)*2*C*D,*pk=pq+C*D;
 #pragma unroll
         for(int i=2*tid;i<C*D;i+=256) {
@@ -132,7 +152,11 @@ template<bool RAW,bool OPT_INVERSE=false> __global__ __launch_bounds__(128) void
         }
     }
     float z[4]={0,0,0,0};
-    gdn_half_c16::dot<false,D>(z,warp<2?k:q,gdn_half_c16::QK_STRIDE,1,k,1,gdn_half_c16::QK_STRIDE,0,(warp%2)*8);
+    if constexpr(INPUT_PACKED) {
+        dot<false,true,D>(z,warp<2?k:q,QK,k,QK,0,(warp%2)*8);
+    } else {
+        gdn_half_c16::dot<false,D>(z,warp<2?k:q,gdn_half_c16::QK_STRIDE,1,k,1,gdn_half_c16::QK_STRIDE,0,(warp%2)*8);
+    }
 #pragma unroll
     for(int j=0;j<4;++j) {
         const int row=gdn_half_c16::cr(j),col=(warp%2)*8+gdn_half_c16::cc(j);
@@ -330,30 +354,39 @@ static void gdn_half_prefill_launch(
         int64_t sq1,int64_t sq2,int64_t sq3,int64_t sv1,int64_t sv2,int64_t sv3,
         int64_t sb1,int64_t sb2,int64_t sb3,float scale,int64_t slot_stride,
         const int32_t * ids,int64_t row_stride,int lazy,
-        const float * zero_row,float zero_scale,float zero_bias,cudaStream_t stream) {
+        const float * zero_row,float zero_scale,float zero_bias,cudaStream_t stream,const __half * conv_packed=nullptr) {
     static_assert(!RAW && PRE,"first production experiment requires precomputed gates");
     const int prefix=T-16;
     static const bool fused_initial=[] { const char* value=getenv("GGML_CUDA_GDN_FUSED_INITIAL"); return !value||atoi(value)!=0; }();
     ggml_cuda_pool_alloc<float> initial(ctx.pool());
     if(!fused_initial)initial.alloc(size_t(32)*128*128);
     ggml_cuda_pool_alloc<gdn_half_c16::Coeff> coefficients(ctx.pool(),size_t(32)*(prefix/16));
-    ggml_cuda_pool_alloc<__half> packed(ctx.pool(),size_t(prefix)*16*128*2);
+    ggml_cuda_pool_alloc<__half> packed(ctx.pool());
+    if(!conv_packed)packed.alloc(size_t(prefix)*16*128*2);
+    const __half * packed_d=conv_packed?conv_packed:packed.ptr;
     const ggml_cuda_kernel_launch_params mat(dim3(32,1,8),dim3(32,4),0,stream);
     if(!fused_initial)ggml_cuda_kernel_launch(gdn_half_initial_state,mat,current,state,initial.ptr,slot_stride,
         ids,row_stride,lazy,zero_row,zero_scale,zero_bias);
     const gdn_half_c16::Frame frame{q,k,v,g,beta,bias,a,prefix,PACKED,sq1,sq2,sv1,sv2};
     const ggml_cuda_kernel_launch_params prep(dim3(32,prefix/16),dim3(32,4),0,stream);
-    ggml_cuda_kernel_launch(gdn_half_prefill::prepare_packed<false>,prep,frame,coefficients.ptr,packed.ptr);
+    if(conv_packed) {
+        // INPUT_PACKED never writes this pointer. It belongs to the graph's
+        // internal L2 allocation, so producer/consumer lifetimes need no pool lease.
+        ggml_cuda_kernel_launch(gdn_half_prefill::prepare_packed<false,false,true>,prep,frame,coefficients.ptr,
+            const_cast<__half *>(conv_packed));
+    } else {
+        ggml_cuda_kernel_launch(gdn_half_prefill::prepare_packed<false>,prep,frame,coefficients.ptr,packed.ptr);
+    }
     const ggml_cuda_kernel_launch_params carry(dim3(32,8),dim3(32,4),0,stream);
     if(fused_initial) {
         static bool logged=false;
         if(!logged){GGML_LOG_INFO("gdn_fused_initial: logical8x4 reader, flat256 carry, prefix=%d\n",prefix);logged=true;}
         const ggml_cuda_kernel_launch_params flat(dim3(256,1),dim3(32,4),0,stream);
         const gdn_half_prefill::InitialState init{current,state,ids,slot_stride,row_stride,lazy,zero_row,zero_scale,zero_bias};
-        ggml_cuda_kernel_launch(gdn_half_prefill::carry_packed<true,false,true>,flat,frame,coefficients.ptr,packed.ptr,
+        ggml_cuda_kernel_launch(gdn_half_prefill::carry_packed<true,false,true>,flat,frame,coefficients.ptr,packed_d,
             (const float*)nullptr,output,state,(float*)nullptr,scale,init);
     } else {
-    ggml_cuda_kernel_launch(gdn_half_prefill::carry_packed<true,false>,carry,frame,coefficients.ptr,packed.ptr,
+    ggml_cuda_kernel_launch(gdn_half_prefill::carry_packed<true,false>,carry,frame,coefficients.ptr,packed_d,
         initial.ptr,output,state,(float *)nullptr,scale,gdn_half_prefill::InitialState{});
     }
     // Same scalar tail as N1. It creates every snapshot/header/checksum from

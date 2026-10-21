@@ -4,6 +4,8 @@
 #undef main
 
 int main(int argc,char ** argv) {
+    // This fixture compares natural and permuted F32 producers with the same Gram arithmetic.
+    setenv("GGML_CUDA_CONV_C16_PACK","0",1);
     for(int i=1;i<argc;++i)if(std::strcmp(argv[i],"--legacy-control")==0) {
         // Diagnostic only: reproduce the inherited H4/C32 fixture failure with
         // the new method explicitly disabled. This is not a tolerance change.
