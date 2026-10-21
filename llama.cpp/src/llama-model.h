@@ -617,6 +617,9 @@ struct llama_model {
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
 
+    // DFlash2 drafter head screen: verbatim copy of the leading blocks of every output row (PQ2_0), or null
+    struct ggml_tensor * output_screen = nullptr;
+
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;

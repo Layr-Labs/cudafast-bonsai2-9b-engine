@@ -64,6 +64,40 @@ static void pin_to_fastest_cores() {
     }
 }
 
+// Boot warm-up: run the request path on a fixed synthetic prompt before the socket opens, so that
+// CUDA graph capture and instantiation, the scheduler and pool growth of the first decode windows
+// happen at boot instead of inside a request (contract §8: CUDA graph capture at boot and other
+// input-independent preparation). The prompt does not depend on any request; invalidate() then
+// clears every request state exactly as between two requests. RESIDENT_BOOT_WARMUP=N sets the
+// number of synthetic requests (default 2, 0 turns it off).
+static void boot_warmup(Session &session) {
+    const char *env = std::getenv("RESIDENT_BOOT_WARMUP");
+    const int n = env ? std::atoi(env) : 2;
+    if (n <= 0) {
+        return;
+    }
+    const int32_t vocab = session.hello().vocab_size;
+    std::vector<int32_t> prompt(512);
+    for (size_t i = 0; i < prompt.size(); ++i) {
+        prompt[i] = static_cast<int32_t>(1000 + (i*7919) % 20000) % vocab;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+        for (int i = 0; i < n; ++i) {
+            session.invalidate();
+            session.sync(prompt, true);  // a timed-prefill pass (frontier only)
+            session.invalidate();
+            const int32_t first = session.sync(prompt);
+            session.spec_run(first, 128);
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "resident: boot warm-up stopped: " << e.what() << "\n";
+    }
+    session.invalidate();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::cerr << "resident: boot warm-up " << n << " synthetic request(s), " << ms << " ms\n";
+}
+
 int main(int argc, char **argv) {
     pin_to_fastest_cores();
     bool fake = false;
@@ -172,5 +206,8 @@ int main(int argc, char **argv) {
     }
 
     Session session(std::move(engine), true, load_epoch);
+    if (!fake) {
+        boot_warmup(session);
+    }
     return run_resident_server(session, socket_path, ready_file, timeout_s);
 }

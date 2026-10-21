@@ -591,6 +591,18 @@ static size_t ggml_cuda_prefill_plane_register(const void * stacked, int64_t nro
     return bytes;
 }
 
+// GB10 prefill: a plane copy of one PQ2_0 weight for the TMA-fed stream-k J=128 consumer (mmq-pq2-j128.cuh, TMAX).
+// Returns the bytes allocated (0: not eligible, disabled or out of memory: the weight keeps the raw loads).
+size_t ggml_cuda_prefill_plane_register_weight(const void * w, const int64_t nrows, const int64_t ncols, const ggml_type type) {
+    if (type != GGML_TYPE_PQ2_0 || ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_DGX_SPARK) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
+    // the weight upload (possibly asynchronous, other streams) must be complete
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return ggml_cuda_prefill_plane_register(w, nrows, ncols);
+}
+
 // Caller holds the same lock. Erase before releasing the stacked source so a
 // reused device address can never find a stale layout from an unloaded model.
 static void ggml_cuda_prefill_plane_erase(const void * stacked) {
@@ -922,7 +934,8 @@ static bool ggml_cuda_decode_glu_run(ggml_backend_cuda_context & ctx, const ggml
 }
 
 bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * src1,
-                             ggml_tensor * gate_dst, const void * stacked, void * external_q8) {
+                             ggml_tensor * gate_dst, const void * stacked, void * external_q8, bool * stored_f16) {
+    if (stored_f16) *stored_f16 = false;
     const int id  = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
@@ -971,13 +984,17 @@ bool ggml_cuda_mul_mat_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor 
         return false; // the separate launch would not be pure tiling in the J=128 kernel
     }
     args.d1_y=ggml_cuda_mmq_d1_input(ctx,src1,external_q8,false);
+    // GGML_CUDA_PREFILL_GLU_F16=0 keeps the F32 SwiGLU storage.
+    static const bool glu_f16 = getenv("GGML_CUDA_PREFILL_GLU_F16") == nullptr || atoi(getenv("GGML_CUDA_PREFILL_GLU_F16")) != 0;
+    args.glu_f16=glu_f16;
     args.x       = (const char *) stacked;
     args.nrows_x = 2*gate_w->ne[1];
     if (!ggml_cuda_mmq_pq2_j128_supported(args)) {
         return false;
     }
-    ggml_cuda_mmq_pq2_j128_glu_launch<GGML_TYPE_PQ2_0>(args, ctx.stream());
+    const bool f16 = ggml_cuda_mmq_pq2_j128_glu_launch<GGML_TYPE_PQ2_0>(args, ctx.stream());
     CUDA_CHECK(cudaGetLastError());
+    if (stored_f16) *stored_f16 = f16;
     return true;
 }
 
@@ -1070,6 +1087,18 @@ size_t ggml_cuda_glu_pair_register(const void * gate, const void * up, const int
 
 void ggml_cuda_dl_unregister_range(const void * base, const size_t size) {
     std::lock_guard<std::mutex> lock(ggml_cuda_dl_mutex());
+    {
+        // plane copies keyed by a weight of this range (single-weight copies; stacked ones are erased with their pair)
+        std::vector<const void *> keys;
+        for (const auto & kv : ggml_cuda_prefill_plane_map()) {
+            if ((const char *) kv.first >= (const char *) base && (const char *) kv.first < (const char *) base + size) {
+                keys.push_back(kv.first);
+            }
+        }
+        for (const void * k : keys) {
+            ggml_cuda_prefill_plane_erase(k);
+        }
+    }
     {
         auto & groups = ggml_cuda_dod_qkv_map();
         const uintptr_t first = uintptr_t(base);

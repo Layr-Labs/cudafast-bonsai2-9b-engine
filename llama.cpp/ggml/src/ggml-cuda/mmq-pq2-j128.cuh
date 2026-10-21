@@ -100,6 +100,23 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_bulk_y(const uint32_t 
         :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
 }
 
+// TMAX: the Y tile and the CTA's 64 x 32-byte compact code tile of the same K block, completing on one mbarrier
+static __device__ __forceinline__ void ggml_cuda_pq2_j128_bulk_yc(const uint32_t dst_y, const void * ysrc, const uint32_t ybytes,
+        const uint32_t dst_c, const void * csrc, const uint32_t bar) {
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(bar), "r"(ybytes + 64*32) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+        :: "r"(dst_y), "l"(ysrc), "r"(ybytes), "r"(bar) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+        :: "r"(dst_c), "l"(csrc), "r"(64*32), "r"(bar) : "memory");
+}
+
+static __device__ __forceinline__ uint32_t ggml_cuda_pq2_j128_lds_u32(const uint32_t addr) {
+    uint32_t v;
+    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(addr));
+    return v;
+}
+
 static __device__ __forceinline__ void ggml_cuda_pq2_j128_hint(const char * p) {
 #if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP)
     asm volatile("prefetch.global.L2 [%0];" :: "l"(__cvta_generic_to_global(p)));
@@ -381,11 +398,17 @@ template<bool DT=false>static __device__ __forceinline__ void ggml_cuda_pq2_j128
 // unpack the next X block and start the copy of the one after, barrier. Each thread holds the raw X words
 // of the next block in registers (global loads issued one block ahead).
 // PURE (pure-tiling launch): Y by cp.async. !PURE (stream-k launch): Y by TMA bulk copies.
-template <bool PURE, bool COMPACT = false, bool D1 = false>
+//
+// TMAX (stream-k, D1): x is the weight's prefill plane copy (mmq-pq2-plane.cuh: per 64-row tile and K block, 64 x 32
+// code bytes, then all fp16 scales; stride_row_x = blocks per row, nrows_x = rows). The code tile of each K block
+// arrives by TMA with its Y tile, in the 4 KB that the transposed D4 scales use otherwise; a thread unpacks the same
+// 8 code bytes and fp16 dA that the raw global loads would give it (the plane copy holds the block bytes verbatim),
+// so the X tile, every product and every sum are the same. D1 reads its Y scale from the Y tile, as pure tiling does.
+template <bool PURE, bool COMPACT = false, bool D1 = false, bool TMAX = false>
 static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
         float (&acc)[2][4][4], const uint32_t smem, const char * __restrict__ x, const int * y,
         const int row0, const int stride_row_x, const int ncols_y, const int col0,
-        const int kb_start, const int kb_stop, uint32_t & ph) {
+        const int kb_start, const int kb_stop, uint32_t & ph, const int nrows_x = 0) {
     constexpr int G  = 64;                      // threads per column group (warps w%4 == wc)
     constexpr int XS = 4*ggml_cuda_pq2_j128_xs; // bytes per X row
     constexpr int YS = 4*ggml_cuda_pq2_j128_ys; // bytes per Y column record
@@ -460,6 +483,61 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_segment(
             }
             __syncthreads(); // X tile (block kb+1) and Y buffer `cur ^ 1` complete
         }
+    } else if constexpr (TMAX) {
+        static_assert(D1, "TMAX is the D1 stream-k consumer");
+        const uint32_t bar   = smem + 2*YBYTES + 136;      // buffer b: X row b bytes 136..143
+        const uint32_t cbuf  = smem + 2*YBYTES + XBYTES;   // 2 x 2048 code bytes
+        const int      nkbr  = stride_row_x;               // K blocks per row
+        const int      rt64  = row0 / 64;
+        const char *   cp    = x + (int64_t) rt64*nkbr*2048;
+        const uint16_t * sp  = (const uint16_t *) (x + (int64_t) nrows_x*nkbr*32) + (int64_t) rt64*nkbr*64 + tid/4;
+        const char *   ysrc  = (const char *) y + kb_start*y_kb_bytes + (int64_t) col0*YS;
+        const uint32_t cofs  = (tid/4)*32 + kq*8;
+        const auto unpack = [&](const uint32_t buf, const uint32_t d) {
+            ggml_cuda_pq2_j128_xraw r;
+            r.w0 = ggml_cuda_pq2_j128_lds_u32(cbuf + buf*2048 + cofs);
+            r.w1 = ggml_cuda_pq2_j128_lds_u32(cbuf + buf*2048 + cofs + 4);
+            r.w2 = r.w1;
+            r.sh = 0;
+            r.d  = d;
+            ggml_cuda_pq2_j128_xstore(r, xst, kq);
+        };
+        uint32_t sc = kq == 0 ? (uint32_t) sp[(int64_t) kb_start*64] : 0u;
+        __syncthreads(); // the previous segment's last compute no longer reads any tile
+        if (tid == 0) {
+            ggml_cuda_pq2_j128_bulk_yc(smem, ysrc, YBYTES, cbuf, cp + (int64_t) kb_start*2048, bar);
+            if (kb_start + 1 < kb_stop) {
+                ggml_cuda_pq2_j128_bulk_yc(smem + YBYTES, ysrc + y_kb_bytes, YBYTES, cbuf + 2048,
+                                           cp + (int64_t) (kb_start + 1)*2048, bar + 144);
+            }
+        }
+        ggml_cuda_pq2_j128_mbar_wait(bar, ph & 1);
+        ph ^= 1u;
+        unpack(0, sc);
+        if (kq == 0 && kb_start + 1 < kb_stop) {
+            sc = sp[(int64_t) (kb_start + 1)*64];
+        }
+        __syncthreads();
+        for (int kb = kb_start; kb < kb_stop; ++kb) {
+            const uint32_t cur = (kb - kb_start) & 1;
+            ggml_cuda_pq2_j128_d1_compute<false>(acc, xw, yw + cur*YBYTES);
+            if (kb + 1 >= kb_stop) {
+                break;
+            }
+            __syncthreads(); // X tile, Y buffer `cur` and code buffer `cur` no longer read
+            if (kb + 2 < kb_stop && tid == 0) {
+                ggml_cuda_pq2_j128_bulk_yc(smem + cur*YBYTES, ysrc + (int64_t) (kb - kb_start + 2)*y_kb_bytes, YBYTES,
+                                           cbuf + cur*2048, cp + (int64_t) (kb + 2)*2048, bar + 144*cur);
+            }
+            ggml_cuda_pq2_j128_mbar_wait(bar + 144*(cur ^ 1), (ph >> (cur ^ 1)) & 1); // Y and codes of block kb+1
+            ph ^= 1u << (cur ^ 1);
+            unpack(cur ^ 1, sc);
+            if (kq == 0 && kb + 2 < kb_stop) {
+                sc = sp[(int64_t) (kb + 2)*64];
+            }
+            __syncthreads(); // X tile (block kb+1) complete
+        }
+        GGML_UNUSED(ycp); GGML_UNUSED(m); GGML_UNUSED(yb); GGML_UNUSED(xblk); GGML_UNUSED(hint_off); GGML_UNUSED(hint_lane);
     } else {
         // Y through one bulk copy (TMA) per K block; after it lands, the D4 headers of the 128 columns are
         // transposed by threads 0..127 into dBT[buf][s][col] (2 KB per buffer) so that a lane reads the
@@ -598,8 +676,9 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_res_hint(const float *
 // gate rows of 8 features and rows 8-15 the up rows of the same features, so a thread holds gate (row g) and up
 // (row g + 8) of feature row_base/2 + 8*rt + g. It stores silu(gate)*up there with the expression of
 // unary_gated_op_kernel<op_silu, float> (the SWIGLU node's value); out has the gate output's layout.
+template <typename T = float>
 static __device__ __forceinline__ void ggml_cuda_pq2_j128_store_glu(
-        const float (&acc)[2][4][4], float * out, const int stride_col, const int row_base, const int col_base,
+        const float (&acc)[2][4][4], T * out, const int stride_col, const int row_base, const int col_base,
         const int j_max) {
     const int lane = threadIdx.x;
     const int g    = lane / 4;
@@ -615,7 +694,14 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_store_glu(
                     continue;
                 }
                 const int i = row_base/2 + rt*8 + g;
-                out[(int64_t) j*stride_col + i] = ggml_cuda_op_silu_single(acc[rt][ct][l]) * acc[rt][ct][l + 2];
+                const float v = ggml_cuda_op_silu_single(acc[rt][ct][l]) * acc[rt][ct][l + 2];
+                if constexpr (std::is_same<T, half>::value) {
+                    // F16 transport of the prefill SwiGLU (GGML_CUDA_PREFILL_GLU_F16): round to nearest,
+                    // saturating at the largest finite half so an outlier can never become inf.
+                    out[(int64_t) j*stride_col + i] = __float2half_rn(fminf(fmaxf(v, -65504.0f), 65504.0f));
+                } else {
+                    out[(int64_t) j*stride_col + i] = v;
+                }
             }
         }
     }
@@ -629,7 +715,7 @@ static __device__ __forceinline__ void ggml_cuda_pq2_j128_store_glu(
 // res and dst_add have dst's layout (stride_col_dst). dst_add may be dst or res; it overlaps nothing else.
 // GLU (pure tiling only): x is a gate/up row-interleaved weight of 2*F rows, dst the F-row gate output (see
 // ggml_cuda_pq2_j128_store_glu); every accumulator is the one the separate gate and up launches compute.
-template <bool PURE, bool ADD, bool GLU = false, bool COMPACT = false, bool D1 = false>
+template <bool PURE, bool ADD, bool GLU = false, bool COMPACT = false, bool D1 = false, bool TMAX = false>
 __launch_bounds__(256, 2)
 static __global__ void mul_mat_q_pq2_j128(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
@@ -668,7 +754,13 @@ static __global__ void mul_mat_q_pq2_j128(
     // Programmatic stream serialization: L2 hints for the first 4 K blocks of this CTA's weight rows
     // (weights only, no memory read), then the grid dependency wait before y is read or dst/tmp_fixup
     // written; y/dst/tmp_fixup are not __restrict__ so nothing moves above the wait.
-    if (kbc < kbc_stop) {
+    if (TMAX && kbc < kbc_stop) {
+        // the first 4 K blocks of the CTA's code tiles (contiguous 2 KB per block)
+        const int tid = threadIdx.y*32 + threadIdx.x;
+        const int it  = (kbc / nkb) / ntx;
+        const int n4  = min(4, kb0_stop - kb0_start)*2048;
+        if (tid*128 < n4) ggml_cuda_pq2_j128_hint(x + ((int64_t) (2*it + q)*nkb + kb0_start)*2048 + tid*128);
+    } else if (kbc < kbc_stop) {
         const int tid = threadIdx.y*32 + threadIdx.x;
         const int it  = (kbc / nkb) / ntx;
         const int row = tid / 4;
@@ -732,7 +824,7 @@ static __global__ void mul_mat_q_pq2_j128(
         if (whole) {
             ggml_cuda_pq2_j128_res_hint(res, stride_col_dst, it*I + q*ROWS, jt*J, ncols_dst);
         }
-        ggml_cuda_pq2_j128_segment<PURE,COMPACT,D1>(acc, smem, x, y, it*I + q*ROWS, stride_row_x, ncols_y, jt*J, kb0_start, kb0_stop, ph);
+        ggml_cuda_pq2_j128_segment<PURE,COMPACT,D1,TMAX>(acc, smem, x, y, it*I + q*ROWS, stride_row_x, ncols_y, jt*J, kb0_start, kb0_stop, ph, nrows_x);
         if (!ends_tile) {
             ggml_cuda_pq2_j128_store(acc, tmp_fixup + (int64_t) b*(J*I), I, row_in_tile, col_in_tile, J - 1);
             return;
@@ -903,27 +995,45 @@ static int ggml_cuda_pq2_prefill_compact_mode() {
     return mode;
 }
 
+#include "mmq-pq2-plane.cuh"
+
+// TMAX for this stream-k D1 launch: the weight has a prefill plane copy (contiguous rows of whole K blocks).
+// GGML_CUDA_PREFILL_J128_TMAX=0 keeps the raw global weight loads.
+static const ggml_cuda_prefill_plane_entry * ggml_cuda_pq2_j128_tmax_plane(const mmq_args & args, const int nkb) {
+    static const bool enabled = ggml_cuda_dl_env_int("GGML_CUDA_PREFILL_J128_TMAX", 1) != 0;
+    if (!enabled || !args.d1_y || args.stride_row_x != nkb || args.nrows_x % 64 != 0) {
+        return nullptr;
+    }
+    const auto * e = ggml_cuda_prefill_plane_find(args.x);
+    return e && e->device == ggml_cuda_get_device() && e->nrows == args.nrows_x && e->ncols == args.ncols_x ? e : nullptr;
+}
+
 template <ggml_type type, bool PURE, bool ADD, bool COMPACT = false>
 static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid, float * tmp_fixup, cudaStream_t stream) {
     constexpr size_t smem = ggml_cuda_pq2_j128_smem() + (PURE ? 0 : 4096); // stream-k: + 2 x 2 KB transposed D4 scales
     const int nkb = (int) (args.ncols_x / QK_PQ2_0);
     const int ntx = (int) ((args.ncols_max + 127) / 128);
-    const auto kernel = args.d1_y ? mul_mat_q_pq2_j128<PURE, ADD, false, true, true> :
+    const ggml_cuda_prefill_plane_entry * plane = PURE ? nullptr : ggml_cuda_pq2_j128_tmax_plane(args, nkb);
+    const auto kernel = plane ? mul_mat_q_pq2_j128<PURE, ADD, false, true, true, true> :
+        args.d1_y ? mul_mat_q_pq2_j128<PURE, ADD, false, true, true> :
         (COMPACT || ggml_cuda_pq2_prefill_compact_mode() == 1
         ? mul_mat_q_pq2_j128<PURE, ADD, false, true> : mul_mat_q_pq2_j128<PURE, ADD>);
-    static bool attr_set[2][GGML_CUDA_MAX_DEVICES] = {};
+    static bool attr_set[2][2][GGML_CUDA_MAX_DEVICES] = {};
     const int device = ggml_cuda_get_device();
-    if (!attr_set[args.d1_y][device]) {
+    if (!attr_set[plane != nullptr][args.d1_y][device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, (int) cudaSharedmemCarveoutMaxShared));
-        attr_set[args.d1_y][device] = true;
+        attr_set[plane != nullptr][args.d1_y][device] = true;
     }
     static bool logged=false;
     if(args.d1_y && !logged){GGML_LOG_INFO("PREFILL_D1_CONSUMER ordinary ADD=%d PURE=%d rows=%lld\n",int(ADD),int(PURE),(long long)args.ncols_y);logged=true;}
+    static bool logged_tmax=false;
+    if(plane && !logged_tmax){GGML_LOG_INFO("prefill j128 stream-k weights by TMA from the plane copy\n");logged_tmax=true;}
     // Programmatic stream serialization (PDL), as launch_mul_mat_q does on GB10.
     ggml_cuda_kernel_launch(kernel,
         ggml_cuda_kernel_launch_params(dim3(2*grid, 1, 1), dim3(32, 8, 1), smem, stream),
-        args.x, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.stride_row_x, (int) args.ncols_y,
+        plane ? (const char *) plane->data : args.x, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb,
+        (int) args.stride_row_x, (int) args.ncols_y,
         (int) args.nrows_dst, (int) args.ncols_dst, ntx, args.add_res, args.add_dst);
     if (ADD && !PURE && ggml_cuda_mmq_pq2_j128_needs_fixup(args, grid)) {
         const uint3 blocks_per_ne00_fd = init_fastdiv_values(nkb);
@@ -943,14 +1053,13 @@ static void ggml_cuda_mmq_pq2_j128_launch(const mmq_args & args, const int grid,
     }
 }
 
-#include "mmq-pq2-plane.cuh"
-
 // The GLU kernel over a 2*F-row interleaved weight (args.nrows_x = 2*F, args.dst = the gate output, args.nrows_dst its
 // column stride): pure tiling, one CTA per 128-row tile, no fixup.
 template <ggml_type type>
-static void ggml_cuda_mmq_pq2_j128_glu_launch(const mmq_args & args, cudaStream_t stream) {
+static bool ggml_cuda_mmq_pq2_j128_glu_launch(const mmq_args & args, cudaStream_t stream) {
     static_assert(type == GGML_TYPE_PQ2_0, "PQ2_0 only");
-    if (ggml_cuda_prefill_plane_glu_run<type>(args, stream)) return;
+    bool stored_f16 = false;
+    if (ggml_cuda_prefill_plane_glu_run<type>(args, stream, &stored_f16)) return stored_f16;
     constexpr size_t smem = ggml_cuda_pq2_j128_smem();
     const int nkb = (int) (args.ncols_x / QK_PQ2_0);
     const int ntx = (int) ((args.ncols_max + 127) / 128);
@@ -968,6 +1077,7 @@ static void ggml_cuda_mmq_pq2_j128_glu_launch(const mmq_args & args, cudaStream_
         ggml_cuda_kernel_launch_params(dim3(2*ntiles, 1, 1), dim3(32, 8, 1), smem, stream),
         args.x, args.y, args.dst, nullptr, (int) args.nrows_x, nkb, (int) args.stride_row_x, (int) args.ncols_y,
         (int) args.nrows_dst, (int) args.ncols_dst, ntx, (const float *) nullptr, (float *) nullptr);
+    return false; // the J128 GLU kernel stores F32
 }
 
 // Template so that only the PQ2_0 MMQ translation unit instantiates the kernels. Pure tiling loads the
