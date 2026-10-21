@@ -1004,7 +1004,18 @@ static __global__ void ggml_cuda_decode_glu_pack(const uint32_t * gate, const ui
         const int kb = int(block/128)%steps;
         const int src_row = row/2;
         const size_t src_block = (size_t(src_row/128)*steps + kb)*128 + src_row%128;
-        dst[i] = (row&1 ? up : gate)[7*src_block + i%7];
+        if (i%7 != 6) {
+            dst[i] = (row&1 ? up : gate)[7*src_block + i%7];
+        } else {
+            // Pair the qh tails and then the fp16 scales of adjacent gate/up
+            // rows within the same eight-row block; allocation size is unchanged.
+            const int pair_row = (row/8)*4 + (row&3);
+            const size_t pair_block = (size_t(pair_row/128)*steps + kb)*128 + pair_row%128;
+            const int shift = (row&7) < 4 ? 0 : 16;
+            const uint32_t lo = gate[7*pair_block + 6] >> shift;
+            const uint32_t hi = up[7*pair_block + 6] >> shift;
+            dst[i] = (lo&0xffffu) | (hi << 16);
+        }
     }
 }
 
