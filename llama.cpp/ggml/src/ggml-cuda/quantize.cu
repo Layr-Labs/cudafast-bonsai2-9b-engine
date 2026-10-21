@@ -1051,14 +1051,24 @@ bool ggml_cuda_prefill_d1_enabled(int64_t rows) {
     if(use&&!logged.exchange(true))std::fprintf(stderr,"PREFILL_D1_QUALITY rows=%lld group=128 numerical_change=true\n",(long long)rows);
     return use;
 }
-template<int N,int NT>static __device__ __forceinline__ void fwht_quantize_mmq_d1_store(
+// Nonnegative normal binary32 values have the same bit and numeric order.
+// Exceptional maxima retain the original FP shuffle tree, including its FTZ
+// and NaN behavior. Ordinary magnitudes need one native integer collective.
+static __device__ __forceinline__ float fwht_d1_warp_max(float x) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ const unsigned int b=__reduce_max_sync(0xffffffffu,__float_as_uint(x));
+ if (b <= 0x7f800000u && (b == 0 || b >= 0x00800000u)) return __uint_as_float(b);
+#endif
+ return warp_reduce_max<32>(x);
+}
+template<int N,int NT,bool NATIVE=true>static __device__ __forceinline__ void fwht_quantize_mmq_d1_store(
  const float*v,block_q8_1_mmq*y,int64_t base,int64_t row,int64_t rows,int tid,int lane){
  static_assert(NT%128==0,"whole128 activation groups");
  constexpr int NE=N/NT;
  __shared__ float maxima[N/32];
  const int warp=tid/32,group=warp&~3;
 #pragma unroll
- for(int i=0;i<NE;++i){const float m=warp_reduce_max<32>(fabsf(v[i]));if(lane==0)maxima[warp*NE+i]=m;}
+ for(int i=0;i<NE;++i){const float m=NATIVE?fwht_d1_warp_max(fabsf(v[i])):warp_reduce_max<32>(fabsf(v[i]));if(lane==0)maxima[warp*NE+i]=m;}
  __syncthreads();
  const int64_t col0=base+tid;const int offset=col0%128;y+=(col0/128)*rows+row;
  const int64_t stride=(NT/128)*rows;
@@ -1249,7 +1259,7 @@ static __global__ void fwht_quantize_mmq_d4_rms(const float * x, const int64_t s
         if constexpr(SIGNED) v[i]*=signs[col];
     }
     ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
-    if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
+    if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT,false>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 // GDN output projection input, one block per 4096-wide row (token): per-head RMS_NORM(x) * w over 128-wide heads
 // (as rms_norm_f32<128, true>), SWIGLU(z, normed) (as unary_gated_op_kernel<op_silu, float>) and the CONT of
@@ -1367,7 +1377,7 @@ static __global__ void fwht_quantize_mmq_d4_add_rms(const float * a, const float
         if constexpr(SIGNED) v[m]*=sv[m];
     }
     ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
-    if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
+    if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT,false>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 void fwht_quantize_mmq_d4_add_rms_cuda(const float * a, const float * b, float * sum, const float * w, float eps,
     const float * signs, float * norm, void * y, int64_t k, int64_t rows, cudaStream_t stream) {
