@@ -3965,8 +3965,16 @@ static int ggml_cuda_try_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cg
                                       (const float *) rms_w->data, eps, (const float *) signs->data,
                                       rms_norm_out, out, K, ncols, ctx.stream());
     } else {
-        fwht_quantize_mmq_d4_cuda(glu ? glu_x : x->data, x->type, signs ? (const float *) signs->data : nullptr,
+        // a prefused SwiGLU stored as F16 is read as F16 rows of K (the same element layout)
+        const auto it_h = glu_pre ? std::find(ctx.glu_prefused_f16.begin(), ctx.glu_prefused_f16.end(), glu)
+                                  : ctx.glu_prefused_f16.end();
+        const bool glu_h = it_h != ctx.glu_prefused_f16.end();
+        fwht_quantize_mmq_d4_cuda(glu ? glu_x : x->data, glu_h ? GGML_TYPE_F16 : x->type,
+                                   signs ? (const float *) signs->data : nullptr,
                                    out, K, ne0_padded, ncols, ctx.stream(), glu_pre ? nullptr : glu_g, glu_o0, glu_o1);
+        if (glu_h) {
+            ctx.glu_prefused_f16.erase(it_h);
+        }
     }
     if (glu_pre) {
         ctx.glu_prefused.erase(std::find(ctx.glu_prefused.begin(), ctx.glu_prefused.end(), glu));
@@ -4044,10 +4052,14 @@ static int ggml_cuda_try_prefill_glu(ggml_backend_cuda_context & ctx, const ggml
     if (pair == nullptr || pair->up != wu->data || pair->nrows != wg->ne[1] || pair->ncols != wg->ne[0]) {
         return 0;
     }
-    if (!ggml_cuda_mul_mat_q_glu(ctx, wg, xg, gate, pair->stacked, const_cast<void *>(pg->data))) {
+    bool glu_f16 = false;
+    if (!ggml_cuda_mul_mat_q_glu(ctx, wg, xg, gate, pair->stacked, const_cast<void *>(pg->data), &glu_f16)) {
         return 0;
     }
     ctx.glu_prefused.push_back(glu);
+    if (glu_f16) {
+        ctx.glu_prefused_f16.push_back(glu);
+    }
     return 2;
 }
 
@@ -7269,6 +7281,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             cuda_ctx->glu_prefused.clear();
+            cuda_ctx->glu_prefused_f16.clear();
             cuda_ctx->gdn_prefill_qk_layout.clear();
             if (ggml_cuda_dirty_tracking()) {
                 ggml_cuda_dirty_mark_graph(cgraph, cuda_ctx->stream());
@@ -7491,7 +7504,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     const auto it = std::find(cuda_ctx->glu_prefused.begin(), cuda_ctx->glu_prefused.end(), node);
                     if (it != cuda_ctx->glu_prefused.end()) {
                         cuda_ctx->glu_prefused.erase(it);
-                        if (node->data != node->src[0]->data) {
+                        const auto it_h = std::find(cuda_ctx->glu_prefused_f16.begin(), cuda_ctx->glu_prefused_f16.end(), node);
+                        if (it_h != cuda_ctx->glu_prefused_f16.end()) {
+                            // F16 storage: widen into the node's F32 output (through a scratch if they alias)
+                            cuda_ctx->glu_prefused_f16.erase(it_h);
+                            const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+                            const int64_t n = ggml_nelements(node);
+                            if (node->data != node->src[0]->data) {
+                                to_fp32(node->src[0]->data, (float *) node->data, n, cuda_ctx->stream());
+                            } else {
+                                ggml_cuda_pool_alloc<float> wide(cuda_ctx->pool(), n);
+                                to_fp32(node->src[0]->data, wide.get(), n, cuda_ctx->stream());
+                                CUDA_CHECK(cudaMemcpyAsync(node->data, wide.get(), n*sizeof(float), cudaMemcpyDeviceToDevice,
+                                                           cuda_ctx->stream()));
+                            }
+                        } else if (node->data != node->src[0]->data) {
                             CUDA_CHECK(cudaMemcpyAsync(node->data, node->src[0]->data, ggml_nbytes(node), cudaMemcpyDeviceToDevice,
                                                        cuda_ctx->stream()));
                         }
@@ -9110,6 +9137,18 @@ static size_t ggml_backend_cuda_register_prefill_glu_pair(const ggml_tensor * ga
     return ggml_cuda_glu_pair_register(gate->data, up->data, gate->ne[1], gate->ne[0], gate->type);
 }
 
+// GB10: prefill plane copy of one weight read by the stream-k J=128 GEMM (TMAX). Returns the bytes allocated.
+static size_t ggml_backend_cuda_register_prefill_plane(const ggml_tensor * w) {
+    if (w == nullptr || w->buffer == nullptr || w->data == nullptr || w->view_src != nullptr ||
+            !ggml_backend_buffer_is_cuda(w->buffer) || w->type != GGML_TYPE_PQ2_0 || !ggml_is_contiguous(w) ||
+            w->ne[2] != 1 || w->ne[3] != 1) {
+        return 0;
+    }
+    const ggml_backend_cuda_buffer_context * c = (const ggml_backend_cuda_buffer_context *) w->buffer->context;
+    ggml_cuda_set_device(c->device);
+    return ggml_cuda_prefill_plane_register_weight(w->data, w->ne[1], w->ne[0], w->type);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_cuda_register_decode_layout") == 0) {
@@ -9120,6 +9159,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_register_prefill_glu_pair") == 0) {
         return (void *)ggml_backend_cuda_register_prefill_glu_pair;
+    }
+    if (strcmp(name, "ggml_backend_cuda_register_prefill_plane") == 0) {
+        return (void *)ggml_backend_cuda_register_prefill_plane;
     }
     if (strcmp(name, "ggml_backend_cuda_set_tensor_input_async") == 0) {
         return (void *)ggml_backend_cuda_set_tensor_input_async;

@@ -2221,6 +2221,36 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+    // The other trunk matmul weights that prefill reads through the stream-k J=128 GEMM: plane copies (the blocks
+    // verbatim, regrouped per 64 rows and K block) that it loads by TMA (ggml-cuda mmq-pq2-j128.cuh, TMAX). gate and
+    // up already have their stacked pair copy. LLAMA_PREFILL_PLANE=0 makes no copies.
+    if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA")) {
+        static const bool planes = getenv("LLAMA_PREFILL_PLANE") == nullptr || atoi(getenv("LLAMA_PREFILL_PLANE")) != 0;
+        using register_fn_t = size_t (*)(const ggml_tensor *);
+        auto * register_fn = (register_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_register_prefill_plane");
+        if (planes && register_fn != nullptr) {
+            static const char * suffixes[] = { ".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight", ".ffn_down.weight",
+                                               ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight" };
+            size_t bytes = 0;
+            int    count = 0;
+            for (const auto & [name, tensor] : tensors_by_name) {
+                bool match = false;
+                for (const char * sfx : suffixes) {
+                    const size_t n = strlen(sfx);
+                    match = match || (name.size() > n && name.compare(name.size() - n, n, sfx) == 0);
+                }
+                if (tensor == nullptr || !match) {
+                    continue;
+                }
+                const size_t b = register_fn(tensor);
+                bytes += b;
+                count += b > 0;
+            }
+            if (count > 0) {
+                LLAMA_LOG_INFO("%s: GB10 prefill plane copies of %d weight(s), %.2f MiB\n", __func__, count, bytes/1024.0/1024.0);
+            }
+        }
+    }
 
     return true;
 }

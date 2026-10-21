@@ -107,7 +107,7 @@ static __device__ __forceinline__ void ggml_cuda_prefill_plane_d1_alias_load(
 // the loop are 64 fp16 scales; one next-scale register stays live across MMA.
 // The 50176-byte footprint equals the existing stream-K kernel, with barriers
 // living in padding of the decoded X tile instead of enlarging shared memory.
-template <bool ADD,bool GLU,bool D4_ALIAS=false,bool OWNER=false,bool D1=false>
+template <bool ADD,bool GLU,bool D4_ALIAS=false,bool OWNER=false,bool D1=false,bool GLU_H=false>
 static __global__ void __launch_bounds__(256,2) mul_mat_q_pq2_plane(
         const unsigned char * codes,const uint16_t * scales,const int * y,float * dst,
         int nkb,int ncols_y,int stride_col_dst,int ntx,const float * residual) {
@@ -169,7 +169,11 @@ static __global__ void __launch_bounds__(256,2) mul_mat_q_pq2_plane(
         }
     }
     ggml_cuda_pdl_lc();
-    if constexpr (GLU) {
+    if constexpr (GLU && GLU_H) {
+        // F16 gate-operand storage with the F32 element offsets (row stride stride_col_dst halves)
+        ggml_cuda_pq2_j128_store_glu<half>(acc,reinterpret_cast<half *>(dst)+(int64_t)col0*stride_col_dst+rowtile*32,
+                                   stride_col_dst,wr*32,wc*32,ncols_y-col0-1);
+    } else if constexpr (GLU) {
         ggml_cuda_pq2_j128_store_glu(acc,dst+(int64_t)col0*stride_col_dst+rowtile*32,
                                    stride_col_dst,wr*32,wc*32,ncols_y-col0-1);
     } else if constexpr (ADD) {
@@ -184,7 +188,7 @@ static __global__ void __launch_bounds__(256,2) mul_mat_q_pq2_plane(
 // Only complete, contiguous GLU tiles are routed here. Unsupported shapes,
 // disabled mode or a missing load-time copy retain the existing J128 path.
 template <ggml_type type>
-static bool ggml_cuda_prefill_plane_glu_run(const mmq_args & args, cudaStream_t stream) {
+static bool ggml_cuda_prefill_plane_glu_run(const mmq_args & args, cudaStream_t stream, bool * stored_f16) {
     static_assert(type == GGML_TYPE_PQ2_0, "PQ2_0 only");
     if (!ggml_cuda_prefill_plane_enabled() || !ggml_cuda_mmq_pq2_j128_supported(args) ||
             args.ncols_max < 128 || args.ncols_max%128 != 0 || args.ncols_y != args.ncols_max ||
@@ -200,14 +204,16 @@ static bool ggml_cuda_prefill_plane_glu_run(const mmq_args & args, cudaStream_t 
     const bool alias=ggml_cuda_prefill_plane_d4_alias_enabled();
     const bool owner=alias && ggml_cuda_prefill_plane_owner_enabled();
     const bool d1=args.d1_y && owner; // other explicit plane modes retain the compatible original consumer
-    const auto kernel=d1 ? mul_mat_q_pq2_plane<false,true,true,true,true> :
+    const bool glu_h=d1 && args.glu_f16; // F16 SwiGLU storage only on the D1 production consumer
+    const auto kernel=glu_h ? mul_mat_q_pq2_plane<false,true,true,true,true,true> :
+                      d1 ? mul_mat_q_pq2_plane<false,true,true,true,true> :
                       (owner?mul_mat_q_pq2_plane<false,true,true,true>:
                       alias?mul_mat_q_pq2_plane<false,true,true,false>:mul_mat_q_pq2_plane<false,true,false,false>);
-    static bool attr[2][2][2][GGML_CUDA_MAX_DEVICES]={};
-    if (!attr[d1][alias][owner][device]) {
+    static bool attr[2][2][2][2][GGML_CUDA_MAX_DEVICES]={};
+    if (!attr[glu_h][d1][alias][owner][device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,SHARED));
         CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributePreferredSharedMemoryCarveout,(int)cudaSharedmemCarveoutMaxShared));
-        attr[d1][alias][owner][device]=true;
+        attr[glu_h][d1][alias][owner][device]=true;
     }
     static bool logged=false;
     if(d1 && !logged){GGML_LOG_INFO("PREFILL_D1_CONSUMER planeGU rows=%lld\n",(long long)args.ncols_y);logged=true;}
@@ -216,5 +222,6 @@ static bool ggml_cuda_prefill_plane_glu_run(const mmq_args & args, cudaStream_t 
     ggml_cuda_kernel_launch(kernel,
         ggml_cuda_kernel_launch_params(dim3((args.nrows_x/64)*ntx),dim3(32,8),SHARED,stream),
         e->data,scales,args.y,args.dst,nkb,(int)args.ncols_y,(int)args.nrows_dst,ntx,(const float *)nullptr);
+    if (stored_f16) *stored_f16=glu_h;
     return true;
 }
