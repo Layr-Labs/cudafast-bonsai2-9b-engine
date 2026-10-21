@@ -114,7 +114,7 @@ void ggml_cuda_mul_mat_q(
         ggml_tensor * dst, const ggml_tensor * gate,
         const ggml_tensor * norm_weight, const ggml_tensor * norm_scale,
         void * external_q8, bool quantize_external, const float * external_norm_scale,
-        const float * add_res, float * add_dst) {
+        const float * add_res, float * add_dst, float * deferred_q8_fixup) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -246,6 +246,7 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ne1, add_res, add_dst};
+        args.deferred_q8_fixup = deferred_q8_fixup;
         args.d1_y=ggml_cuda_mmq_d1_input(ctx,src1,external_q8,quantize_external);
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
@@ -844,6 +845,36 @@ size_t ggml_cuda_dl_register(const void * src, const int64_t nrows, const int64_
                       (long long) nrows, (long long) ncols, bytes/1024.0/1024.0);
     }
     return bytes + (dl_tm64 != nullptr ? bytes : 0);
+}
+
+bool ggml_cuda_q8_fixup_norm_supported(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * weight, const ggml_tensor * input, const ggml_tensor * dst) {
+#if defined(GGML_USE_HOPPER_Q1)
+    return false;
+#endif
+    static const bool ring = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING", 1) != 0;
+    static const int ring_min = ggml_cuda_dl_env_int("GGML_CUDA_DL_RING_MIN_ROWS", 4096);
+    const auto & dev = ggml_cuda_info().devices[ctx.device];
+    if (!ring || ring_min > 4096 || dev.cc != GGML_CUDA_CC_DGX_SPARK || dev.nsm != 48 ||
+            !weight || !input || !dst || weight->type != GGML_TYPE_Q8_0 ||
+            input->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            (weight->ne[0] != 12288 && weight->ne[0] != 32768) || weight->ne[1] != 4096 ||
+            weight->ne[2] != 1 || weight->ne[3] != 1 || input->ne[0] != weight->ne[0] ||
+            input->ne[1] != 16 || input->ne[2] != 1 || input->ne[3] != 1 ||
+            dst->ne[0] != 4096 || dst->ne[1] != 16 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            !ggml_is_contiguous(weight) || !ggml_is_contiguous(input) || !ggml_is_contiguous(dst) ||
+            !weight->buffer || ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        return false;
+    }
+    const auto * e = ggml_cuda_dl_find(weight->data);
+    if (!e || !e->dl || !e->dl_tm64 || e->type != GGML_TYPE_Q8_0 || e->dl_type != GGML_TYPE_Q8_0 ||
+            e->nrows != 4096 || e->ncols != weight->ne[0]) return false;
+    mmq_args args = {};
+    args.type_x = GGML_TYPE_Q8_0; args.ncols_x = weight->ne[0]; args.nrows_x = 4096;
+    args.ncols_y = args.ncols_dst = args.ncols_max = 16; args.nrows_dst = 4096;
+    const int nkb = int(weight->ne[0]/QK8_0);
+    const int bpi = ggml_cuda_mmq_get_K_vram(GGML_TYPE_Q8_0,16,false,dev.cc)/QK8_0;
+    return nkb >= 16*bpi && nkb%bpi == 0 && ggml_cuda_mmq_pq2_j16_grid(args,48) == 48;
 }
 
 bool ggml_cuda_mul_mat_q_fixup_producer(ggml_backend_cuda_context & ctx,

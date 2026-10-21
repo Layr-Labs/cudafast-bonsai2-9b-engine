@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "q8-fixup-norm.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -845,4 +846,14 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_q8_fixup_norm(ggml_backend_cuda_context & ctx, ggml_tensor * mm,
+        ggml_tensor * rms, ggml_tensor * mul, const float * partials) {
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(eps));
+    ggml_cuda_kernel_launch(q8_fixup_rms_norm_f32,
+        ggml_cuda_kernel_launch_params(dim3(16),dim3(1024),32*sizeof(float),ctx.stream()),
+        (float *) mm->data, partials, (const float *) w->data, (float *) mul->data, eps);
 }

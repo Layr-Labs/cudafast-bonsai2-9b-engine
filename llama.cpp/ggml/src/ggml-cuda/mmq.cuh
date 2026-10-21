@@ -1624,6 +1624,8 @@ struct mmq_args {
     bool          d1_y = false;
     // Prefill GLU only: store the fused SwiGLU as F16 when the D1 plane consumer runs (GGML_CUDA_PREFILL_GLU_F16).
     bool          glu_f16 = false;
+    // Caller-owned split-K partials; consumed by the fused Q8 fixup/RMS kernel.
+    float * deferred_q8_fixup = nullptr;
 };
 
 // GB10 prefill: the row-interleaved copy of a layer's ffn_gate/ffn_up PQ2_0 weights (made at model load): in every
@@ -1757,10 +1759,11 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                     }
                 }
                 ggml_cuda_pool_alloc<float> tmp_fixup(ctx.pool(id));
-                if (ggml_cuda_mmq_pq2_j16_needs_fixup(args, grid)) {
+                if (!args.deferred_q8_fixup && ggml_cuda_mmq_pq2_j16_needs_fixup(args, grid)) {
                     tmp_fixup.alloc((size_t) grid*16*128);
                 }
-                ggml_cuda_mmq_dl_run<type>(args, *e, grid, nsm, tmp_fixup.ptr, stream);
+                ggml_cuda_mmq_dl_run<type>(args, *e, grid, nsm,
+                    args.deferred_q8_fixup ? args.deferred_q8_fixup : tmp_fixup.ptr, stream);
                 return;
             }
         }
@@ -2002,7 +2005,10 @@ void ggml_cuda_mul_mat_q(
         const ggml_tensor * norm_weight = nullptr, const ggml_tensor * norm_scale = nullptr,
         void * external_q8 = nullptr, bool quantize_external = true,
         const float * external_norm_scale = nullptr,
-        const float * add_res = nullptr, float * add_dst = nullptr);
+        const float * add_res = nullptr, float * add_dst = nullptr, float * deferred_q8_fixup = nullptr);
+
+bool ggml_cuda_q8_fixup_norm_supported(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * weight, const ggml_tensor * input, const ggml_tensor * dst);
 
 bool ggml_cuda_mmq_d1_input(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
                             const void * external_q8, bool requantize);

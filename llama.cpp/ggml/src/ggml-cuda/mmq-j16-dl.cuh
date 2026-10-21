@@ -1114,6 +1114,10 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
             ggml_cuda_mmq_dl_launch(mul_mat_q_q8_0_j16_dl<TM, GGML_CUDA_DL_H_SECTOR, 2, 1>, attr, args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
         }
     }
+    if (args.deferred_q8_fixup) {
+        GGML_ASSERT(type == GGML_TYPE_Q8_0 && !tiling && grid == 48 && args.nrows_x == 4096);
+        return;
+    }
     if (!tiling) {
         if constexpr (type == GGML_TYPE_Q8_0) {
             const int BPI=ggml_cuda_mmq_get_K_vram(type,16,false,GGML_CUDA_CC_DGX_SPARK)/QK8_0;

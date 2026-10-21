@@ -5865,6 +5865,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    if (node->op == GGML_OP_MUL_MAT && i + 2 < cgraph->n_nodes &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i+2 }) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, std::array<int,1>{i+2}.data(), 1) &&
+            ggml_cuda_q8_fixup_norm_supported(*cuda_ctx, node->src[0], node->src[1], node)) {
+        ggml_tensor * rms = cgraph->nodes[i+1];
+        ggml_tensor * mul = cgraph->nodes[i+2];
+        const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+        if (rms->src[0] == node && rms->type == GGML_TYPE_F32 &&
+                (mul->src[0] == rms || mul->src[1] == rms) &&
+                w && w->type == GGML_TYPE_F32 && w->ne[0] == 4096 && ggml_nelements(w) == 4096 &&
+                mul->type == GGML_TYPE_F32 && ggml_are_same_shape(node,rms) && ggml_are_same_shape(node,mul) &&
+                ggml_is_contiguous(w) && ggml_is_contiguous(rms) && ggml_is_contiguous(mul)) {
+            ggml_cuda_pool_alloc<float> partials(cuda_ctx->pool(),48*16*128);
+            ggml_cuda_mul_mat_q(*cuda_ctx,node->src[0],node->src[1],nullptr,node,
+                nullptr,nullptr,nullptr,nullptr,true,nullptr,nullptr,nullptr,partials.get());
+            ggml_cuda_op_q8_fixup_norm(*cuda_ctx,node,rms,mul,partials.get());
+            return 2;
+        }
+    }
+
     // GB10 prefill: apply SWIGLU while quantizing the activation consumed by the
     // following low-bit down projection. This avoids materializing and rereading
     // the GLU output and removes one launch per transformer block.
