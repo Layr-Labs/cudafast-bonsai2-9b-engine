@@ -1,0 +1,13 @@
+prefill-plane-owner-plan 1 0.375728
+gdn-quotient-plan 1 0.287133
+prefill-plane-d4-alias-plan 1 0.311336
+gdn-dedup-plan 1 0.26758
+prefill-gates-early-cpu 1 0.329923
+prefill-last-attn-rows-cpu 1 0.448638
+decode-gates-side-cpu 1 0.377091
+dflash-concat-q8-plan 1 0.297133
+decode-fixup-add-rms-match 1 0.368643
+llama-resident-tests 0 0
+engine-boot-tests 1 0.368577
+---
+llama-resident-tests

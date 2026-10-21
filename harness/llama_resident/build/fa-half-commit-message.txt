@@ -1,0 +1,20 @@
+ggml-cuda: pack guarded FA stream-K partials as half
+
+Transport the target verify attention's nonterminal stream-K payload as the
+existing half2 bits instead of widened F32 values. Keep both softmax metadata
+planes in F32 and reconstruct the original 0 + widen(half)*1 expression in
+the uniform fixup reader, preserving its signed-zero and NaN behavior.
+
+Enable only on GB10 with the Ampere MMA configuration, D256, GQA4 (16 query
+heads and 4 KV heads), 16 query rows, batch 1, f16 KV at 512/768/1024, a shared
+mask, no bias/softcap, and uniform split tiles. Assert np == 1 and half2 VKQ
+accumulators. Query occupancy using the original F32 producer before choosing
+the packed specialization, preserving partition boundaries and merge order.
+GGML_CUDA_FATTN_HALF_PARTIALS=0 restores the F32 scratch path; default is on.
+
+Size scratch for the selected layout and add a retained CUDA equivalence
+test for all half bit patterns, random and exceptional FA inputs, strided Q,
+query-tail fallback, unchanged grids, and changed-input graph replays.
+CUDA compilation and native execution require the orchestrator's GB10.
+
+Co-Authored-By: GPT 6.1 Sol (Codex) <noreply@openai.com>

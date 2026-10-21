@@ -1,0 +1,1157 @@
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineSystem.cmake:233 (message)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      The system is: Darwin - 25.6.0 - arm64
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCXXCompiler.cmake:126 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      Compiling the CXX compiler identification source file "CMakeCXXCompilerId.cpp" failed.
+      Compiler: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ 
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      1
+      ld: library 'c++' not found
+      c++: error: linker command failed with exit code 1 (use -v to see invocation)
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCXXCompiler.cmake:126 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      Compiling the CXX compiler identification source file "CMakeCXXCompilerId.cpp" succeeded.
+      Compiler: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ 
+      Build flags: 
+      Id flags: -c 
+      
+      The output was:
+      0
+      
+      
+      Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "CMakeCXXCompilerId.o"
+      
+      The CXX compiler identification is AppleClang, found in:
+        /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/3.28.1/CompilerIdCXX/CMakeCXXCompilerId.o
+      
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerABI.cmake:57 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:2 (project)"
+    checks:
+      - "Detecting CXX compiler ABI info"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-wcaDEw"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-wcaDEw"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "CMAKE_CXX_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-wcaDEw'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_5daa2/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_5daa2.dir/build.make CMakeFiles/cmTC_5daa2.dir/build
+        Building CXX object CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++   -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6   -v -Wl,-v -MD -MT CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -MF CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o.d -o CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -c /opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeCXXCompilerABI.cpp
+        Apple clang version 21.0.0 (clang-2100.3.34.2)
+        Target: arm64-apple-darwin25.6.0
+        Thread model: posix
+        InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+        c++: warning: -Wl,-v: 'linker' input unused [-Wunused-command-line-argument]
+        ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/../include/c++/v1"
+         "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang" -cc1 -triple arm64-apple-macosx26.6.0 -Wundef-prefix=TARGET_OS_ -Wdeprecated-objc-isa-usage -Werror=deprecated-objc-isa-usage -Werror=implicit-function-declaration -emit-obj -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCXXCompilerABI.cpp -mrelocation-model pic -pic-level 2 -mframe-pointer=non-leaf -fno-strict-return -ffp-contract=on -fno-rounding-math -funwind-tables=1 -fobjc-msgsend-selector-stubs -fno-sized-deallocation -target-sdk-version=27.0 -fdepfile-entry=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/SDKSettings.json -fvisibility-inlines-hidden-static-local-var -fno-modulemap-allow-subdirectory-search -fdefine-target-os-macros -fno-assume-unique-vtables -fno-modulemap-allow-subdirectory-search -enable-tlsdesc -target-cpu apple-m1 -target-feature +v8.5a -target-feature +aes -target-feature +altnzcv -target-feature +ccdp -target-feature +ccpp -target-feature +complxnum -target-feature +crc -target-feature +dotprod -target-feature +flagm -target-feature +fp-armv8 -target-feature +fp16fml -target-feature +fptoint -target-feature +fullfp16 -target-feature +jsconv -target-feature +lse -target-feature +neon -target-feature +pauth -target-feature +perfmon -target-feature +predres -target-feature +ras -target-feature +rcpc -target-feature +rdm -target-feature +sb -target-feature +sha2 -target-feature +sha3 -target-feature +specrestrict -target-feature +ssbs -target-abi darwinpcs -debugger-tuning=lldb -fdebug-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-wcaDEw -target-linker-version 1166.2 -v -fcoverage-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-wcaDEw -resource-dir /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21 -dependency-file CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o.d -skip-unused-modulemap-deps -MT CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -sys-header-deps -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -internal-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include/c++/v1 -internal-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include -internal-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks -Wno-elaborated-enum-base -fdeprecated-macro -ferror-limit 19 -stack-protector 1 -fstack-check -mdarwin-stkchk-strong-link -fblocks -fencode-extended-block-signature -fregister-global-dtors-with-atexit -fgnuc-version=4.2.1 -fskip-odr-check-in-gmf -fcxx-exceptions -fexceptions -fmax-type-align=16 -fcommon -clang-vendor-feature=+disableNonDependentMemberExprInCurrentInstantiation -fno-odr-hash-protocols -clang-vendor-feature=+enableAggressiveVLAFolding -clang-vendor-feature=+revert09abecef7bbf -clang-vendor-feature=+thisNoAlignAttr -clang-vendor-feature=+thisNoNullAttr -clang-vendor-feature=+disableAtImportPrivateFrameworkInImplementationError -Wno-error=allocator-wrappers -fdwarf2-cfi-asm -o CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -x c++ /opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeCXXCompilerABI.cpp
+        clang -cc1 version 21.0.0 (clang-2100.3.34.2) default target arm64-apple-darwin25.6.0
+        ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include"
+        ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks"
+        #include "..." search starts here:
+        #include <...> search starts here:
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include/c++/v1
+         /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include
+         /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks (framework directory)
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks (framework directory)
+        End of search list.
+        Linking CXX executable cmTC_5daa2
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_5daa2.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names  -v -Wl,-v CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -o cmTC_5daa2 
+        Apple clang version 21.0.0 (clang-2100.3.34.2)
+        Target: arm64-apple-darwin25.6.0
+        Thread model: posix
+        InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+         "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld" -demangle -lto_library /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/libLTO.dylib -dynamic -arch arm64 -platform_version macos 26.6.0 27.0 -syslibroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mllvm -enable-linkonceodr-outlining -o cmTC_5daa2 -search_paths_first -headerpad_max_install_names -v CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -lc++ -lSystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a
+        @(#)PROGRAM:ld PROJECT:ld-27037.1
+        BUILD 12:05:32 Aug 17 2026
+        configured to support archs: armv6 armv7 armv7s arm64 arm64e arm64_32 i386 x86_64 x86_64h armv6m armv7k armv7m armv7em armv8m.main armv8.1m.main
+        LTO support using: LLVM version 21.0.0 (static support for 30, runtime is 30)
+        TAPI support using: Apple TAPI version 21.0.0 (tapi-2100.3.8.1)
+        Library search paths:
+        	/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib
+        	/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib/swift
+        Framework search paths:
+        	/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks
+        
+      exitCode: 0
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerABI.cmake:127 (message)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      Parsed CXX implicit include dir info: rv=done
+        found start of include info
+        found start of implicit include info
+          add: [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include/c++/v1]
+          add: [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include]
+          add: [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include]
+          add: [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include]
+        end of search list found
+        collapse include dir [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include/c++/v1] ==> [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include/c++/v1]
+        collapse include dir [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include] ==> [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include]
+        collapse include dir [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include] ==> [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include]
+        collapse include dir [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include] ==> [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include]
+        implicit include dirs: [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include/c++/v1;/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include;/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include;/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include]
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerABI.cmake:159 (message)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:2 (project)"
+    message: |
+      Parsed CXX implicit link information:
+        link line regex: [^( *|.*[/\\])(ld|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
+        ignore line: [Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-wcaDEw']
+        ignore line: []
+        ignore line: [Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_5daa2/fast]
+        ignore line: [/Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_5daa2.dir/build.make CMakeFiles/cmTC_5daa2.dir/build]
+        ignore line: [Building CXX object CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o]
+        ignore line: [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++   -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6   -v -Wl -v -MD -MT CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -MF CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o.d -o CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -c /opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeCXXCompilerABI.cpp]
+        ignore line: [Apple clang version 21.0.0 (clang-2100.3.34.2)]
+        ignore line: [Target: arm64-apple-darwin25.6.0]
+        ignore line: [Thread model: posix]
+        ignore line: [InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin]
+        ignore line: [c++: warning: -Wl -v: 'linker' input unused [-Wunused-command-line-argument]]
+        ignore line: [ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/../include/c++/v1"]
+        ignore line: [ "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang" -cc1 -triple arm64-apple-macosx26.6.0 -Wundef-prefix=TARGET_OS_ -Wdeprecated-objc-isa-usage -Werror=deprecated-objc-isa-usage -Werror=implicit-function-declaration -emit-obj -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCXXCompilerABI.cpp -mrelocation-model pic -pic-level 2 -mframe-pointer=non-leaf -fno-strict-return -ffp-contract=on -fno-rounding-math -funwind-tables=1 -fobjc-msgsend-selector-stubs -fno-sized-deallocation -target-sdk-version=27.0 -fdepfile-entry=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/SDKSettings.json -fvisibility-inlines-hidden-static-local-var -fno-modulemap-allow-subdirectory-search -fdefine-target-os-macros -fno-assume-unique-vtables -fno-modulemap-allow-subdirectory-search -enable-tlsdesc -target-cpu apple-m1 -target-feature +v8.5a -target-feature +aes -target-feature +altnzcv -target-feature +ccdp -target-feature +ccpp -target-feature +complxnum -target-feature +crc -target-feature +dotprod -target-feature +flagm -target-feature +fp-armv8 -target-feature +fp16fml -target-feature +fptoint -target-feature +fullfp16 -target-feature +jsconv -target-feature +lse -target-feature +neon -target-feature +pauth -target-feature +perfmon -target-feature +predres -target-feature +ras -target-feature +rcpc -target-feature +rdm -target-feature +sb -target-feature +sha2 -target-feature +sha3 -target-feature +specrestrict -target-feature +ssbs -target-abi darwinpcs -debugger-tuning=lldb -fdebug-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-wcaDEw -target-linker-version 1166.2 -v -fcoverage-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-wcaDEw -resource-dir /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21 -dependency-file CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o.d -skip-unused-modulemap-deps -MT CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -sys-header-deps -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -internal-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include/c++/v1 -internal-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include -internal-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks -Wno-elaborated-enum-base -fdeprecated-macro -ferror-limit 19 -stack-protector 1 -fstack-check -mdarwin-stkchk-strong-link -fblocks -fencode-extended-block-signature -fregister-global-dtors-with-atexit -fgnuc-version=4.2.1 -fskip-odr-check-in-gmf -fcxx-exceptions -fexceptions -fmax-type-align=16 -fcommon -clang-vendor-feature=+disableNonDependentMemberExprInCurrentInstantiation -fno-odr-hash-protocols -clang-vendor-feature=+enableAggressiveVLAFolding -clang-vendor-feature=+revert09abecef7bbf -clang-vendor-feature=+thisNoAlignAttr -clang-vendor-feature=+thisNoNullAttr -clang-vendor-feature=+disableAtImportPrivateFrameworkInImplementationError -Wno-error=allocator-wrappers -fdwarf2-cfi-asm -o CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -x c++ /opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeCXXCompilerABI.cpp]
+        ignore line: [clang -cc1 version 21.0.0 (clang-2100.3.34.2) default target arm64-apple-darwin25.6.0]
+        ignore line: [ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include"]
+        ignore line: [ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks"]
+        ignore line: [#include "..." search starts here:]
+        ignore line: [#include <...> search starts here:]
+        ignore line: [ /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include/c++/v1]
+        ignore line: [ /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include]
+        ignore line: [ /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include]
+        ignore line: [ /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include]
+        ignore line: [ /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks (framework directory)]
+        ignore line: [ /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks (framework directory)]
+        ignore line: [End of search list.]
+        ignore line: [Linking CXX executable cmTC_5daa2]
+        ignore line: [/opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_5daa2.dir/link.txt --verbose=1]
+        ignore line: [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl -search_paths_first -Wl -headerpad_max_install_names  -v -Wl -v CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -o cmTC_5daa2 ]
+        ignore line: [Apple clang version 21.0.0 (clang-2100.3.34.2)]
+        ignore line: [Target: arm64-apple-darwin25.6.0]
+        ignore line: [Thread model: posix]
+        ignore line: [InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin]
+        link line: [ "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld" -demangle -lto_library /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/libLTO.dylib -dynamic -arch arm64 -platform_version macos 26.6.0 27.0 -syslibroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mllvm -enable-linkonceodr-outlining -o cmTC_5daa2 -search_paths_first -headerpad_max_install_names -v CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o -lc++ -lSystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a]
+          arg [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld] ==> ignore
+          arg [-demangle] ==> ignore
+          arg [-lto_library] ==> ignore, skip following value
+          arg [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/libLTO.dylib] ==> skip value of -lto_library
+          arg [-dynamic] ==> ignore
+          arg [-arch] ==> ignore
+          arg [arm64] ==> ignore
+          arg [-platform_version] ==> ignore
+          arg [macos] ==> ignore
+          arg [26.6.0] ==> ignore
+          arg [27.0] ==> ignore
+          arg [-syslibroot] ==> ignore
+          arg [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk] ==> ignore
+          arg [-mllvm] ==> ignore
+          arg [-enable-linkonceodr-outlining] ==> ignore
+          arg [-o] ==> ignore
+          arg [cmTC_5daa2] ==> ignore
+          arg [-search_paths_first] ==> ignore
+          arg [-headerpad_max_install_names] ==> ignore
+          arg [-v] ==> ignore
+          arg [CMakeFiles/cmTC_5daa2.dir/CMakeCXXCompilerABI.cpp.o] ==> ignore
+          arg [-lc++] ==> lib [c++]
+          arg [-lSystem] ==> lib [System]
+          arg [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a] ==> lib [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a]
+        Library search paths: [;/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib;/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib/swift]
+        Framework search paths: [;/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks]
+        remove lib [System]
+        remove lib [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a]
+        collapse library dir [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib] ==> [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib]
+        collapse library dir [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib/swift] ==> [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib/swift]
+        collapse framework dir [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks] ==> [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks]
+        implicit libs: [c++]
+        implicit objs: []
+        implicit dirs: [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib;/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib/swift]
+        implicit fwks: [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks]
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCCompiler.cmake:123 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/CMakeLists.txt:2 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" failed.
+      Compiler: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc 
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      1
+      ld: library 'System' not found
+      cc: error: linker command failed with exit code 1 (use -v to see invocation)
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCCompiler.cmake:123 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/CMakeLists.txt:2 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" succeeded.
+      Compiler: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc 
+      Build flags: 
+      Id flags: -c 
+      
+      The output was:
+      0
+      
+      
+      Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "CMakeCCompilerId.o"
+      
+      The C compiler identification is AppleClang, found in:
+        /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/3.28.1/CompilerIdC/CMakeCCompilerId.o
+      
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerABI.cmake:57 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/CMakeLists.txt:2 (project)"
+    checks:
+      - "Detecting C compiler ABI info"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-64JcKV"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-64JcKV"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "CMAKE_C_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-64JcKV'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_5e52e/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_5e52e.dir/build.make CMakeFiles/cmTC_5e52e.dir/build
+        Building C object CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc   -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6   -v -Wl,-v -MD -MT CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -MF CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o.d -o CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -c /opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeCCompilerABI.c
+        Apple clang version 21.0.0 (clang-2100.3.34.2)
+        Target: arm64-apple-darwin25.6.0
+        Thread model: posix
+        InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+        cc: warning: -Wl,-v: 'linker' input unused [-Wunused-command-line-argument]
+         "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang" -cc1 -triple arm64-apple-macosx26.6.0 -Wundef-prefix=TARGET_OS_ -Wdeprecated-objc-isa-usage -Werror=deprecated-objc-isa-usage -Werror=implicit-function-declaration -emit-obj -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCCompilerABI.c -mrelocation-model pic -pic-level 2 -mframe-pointer=non-leaf -fno-strict-return -ffp-contract=on -fno-rounding-math -funwind-tables=1 -fobjc-msgsend-selector-stubs -fno-sized-deallocation -target-sdk-version=27.0 -fdepfile-entry=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/SDKSettings.json -fvisibility-inlines-hidden-static-local-var -fno-modulemap-allow-subdirectory-search -fdefine-target-os-macros -fno-assume-unique-vtables -fno-modulemap-allow-subdirectory-search -enable-tlsdesc -target-cpu apple-m1 -target-feature +v8.5a -target-feature +aes -target-feature +altnzcv -target-feature +ccdp -target-feature +ccpp -target-feature +complxnum -target-feature +crc -target-feature +dotprod -target-feature +flagm -target-feature +fp-armv8 -target-feature +fp16fml -target-feature +fptoint -target-feature +fullfp16 -target-feature +jsconv -target-feature +lse -target-feature +neon -target-feature +pauth -target-feature +perfmon -target-feature +predres -target-feature +ras -target-feature +rcpc -target-feature +rdm -target-feature +sb -target-feature +sha2 -target-feature +sha3 -target-feature +specrestrict -target-feature +ssbs -target-abi darwinpcs -debugger-tuning=lldb -fdebug-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-64JcKV -target-linker-version 1166.2 -v -fcoverage-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-64JcKV -resource-dir /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21 -dependency-file CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o.d -skip-unused-modulemap-deps -MT CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -sys-header-deps -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -internal-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include -internal-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks -Wno-elaborated-enum-base -ferror-limit 19 -stack-protector 1 -fstack-check -mdarwin-stkchk-strong-link -fblocks -fencode-extended-block-signature -fregister-global-dtors-with-atexit -fgnuc-version=4.2.1 -fskip-odr-check-in-gmf -fmax-type-align=16 -fcommon -clang-vendor-feature=+disableNonDependentMemberExprInCurrentInstantiation -fno-odr-hash-protocols -clang-vendor-feature=+enableAggressiveVLAFolding -clang-vendor-feature=+revert09abecef7bbf -clang-vendor-feature=+thisNoAlignAttr -clang-vendor-feature=+thisNoNullAttr -clang-vendor-feature=+disableAtImportPrivateFrameworkInImplementationError -Wno-error=allocator-wrappers -fdwarf2-cfi-asm -o CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -x c /opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeCCompilerABI.c
+        clang -cc1 version 21.0.0 (clang-2100.3.34.2) default target arm64-apple-darwin25.6.0
+        ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include"
+        ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks"
+        #include "..." search starts here:
+        #include <...> search starts here:
+         /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include
+         /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks (framework directory)
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks (framework directory)
+        End of search list.
+        Linking C executable cmTC_5e52e
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_5e52e.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc  -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names  -v -Wl,-v CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -o cmTC_5e52e 
+        Apple clang version 21.0.0 (clang-2100.3.34.2)
+        Target: arm64-apple-darwin25.6.0
+        Thread model: posix
+        InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+         "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld" -demangle -lto_library /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/libLTO.dylib -dynamic -arch arm64 -platform_version macos 26.6.0 27.0 -syslibroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mllvm -enable-linkonceodr-outlining -o cmTC_5e52e -search_paths_first -headerpad_max_install_names -v CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -lSystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a
+        @(#)PROGRAM:ld PROJECT:ld-27037.1
+        BUILD 12:05:32 Aug 17 2026
+        configured to support archs: armv6 armv7 armv7s arm64 arm64e arm64_32 i386 x86_64 x86_64h armv6m armv7k armv7m armv7em armv8m.main armv8.1m.main
+        LTO support using: LLVM version 21.0.0 (static support for 30, runtime is 30)
+        TAPI support using: Apple TAPI version 21.0.0 (tapi-2100.3.8.1)
+        Library search paths:
+        	/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib
+        	/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib/swift
+        Framework search paths:
+        	/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks
+        
+      exitCode: 0
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerABI.cmake:127 (message)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/CMakeLists.txt:2 (project)"
+    message: |
+      Parsed C implicit include dir info: rv=done
+        found start of include info
+        found start of implicit include info
+          add: [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include]
+          add: [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include]
+          add: [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include]
+        end of search list found
+        collapse include dir [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include] ==> [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include]
+        collapse include dir [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include] ==> [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include]
+        collapse include dir [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include] ==> [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include]
+        implicit include dirs: [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include;/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include;/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include]
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerABI.cmake:159 (message)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/CMakeLists.txt:2 (project)"
+    message: |
+      Parsed C implicit link information:
+        link line regex: [^( *|.*[/\\])(ld|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
+        ignore line: [Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-64JcKV']
+        ignore line: []
+        ignore line: [Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_5e52e/fast]
+        ignore line: [/Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_5e52e.dir/build.make CMakeFiles/cmTC_5e52e.dir/build]
+        ignore line: [Building C object CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o]
+        ignore line: [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc   -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6   -v -Wl -v -MD -MT CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -MF CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o.d -o CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -c /opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeCCompilerABI.c]
+        ignore line: [Apple clang version 21.0.0 (clang-2100.3.34.2)]
+        ignore line: [Target: arm64-apple-darwin25.6.0]
+        ignore line: [Thread model: posix]
+        ignore line: [InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin]
+        ignore line: [cc: warning: -Wl -v: 'linker' input unused [-Wunused-command-line-argument]]
+        ignore line: [ "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang" -cc1 -triple arm64-apple-macosx26.6.0 -Wundef-prefix=TARGET_OS_ -Wdeprecated-objc-isa-usage -Werror=deprecated-objc-isa-usage -Werror=implicit-function-declaration -emit-obj -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCCompilerABI.c -mrelocation-model pic -pic-level 2 -mframe-pointer=non-leaf -fno-strict-return -ffp-contract=on -fno-rounding-math -funwind-tables=1 -fobjc-msgsend-selector-stubs -fno-sized-deallocation -target-sdk-version=27.0 -fdepfile-entry=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/SDKSettings.json -fvisibility-inlines-hidden-static-local-var -fno-modulemap-allow-subdirectory-search -fdefine-target-os-macros -fno-assume-unique-vtables -fno-modulemap-allow-subdirectory-search -enable-tlsdesc -target-cpu apple-m1 -target-feature +v8.5a -target-feature +aes -target-feature +altnzcv -target-feature +ccdp -target-feature +ccpp -target-feature +complxnum -target-feature +crc -target-feature +dotprod -target-feature +flagm -target-feature +fp-armv8 -target-feature +fp16fml -target-feature +fptoint -target-feature +fullfp16 -target-feature +jsconv -target-feature +lse -target-feature +neon -target-feature +pauth -target-feature +perfmon -target-feature +predres -target-feature +ras -target-feature +rcpc -target-feature +rdm -target-feature +sb -target-feature +sha2 -target-feature +sha3 -target-feature +specrestrict -target-feature +ssbs -target-abi darwinpcs -debugger-tuning=lldb -fdebug-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-64JcKV -target-linker-version 1166.2 -v -fcoverage-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-64JcKV -resource-dir /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21 -dependency-file CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o.d -skip-unused-modulemap-deps -MT CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -sys-header-deps -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -internal-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include -internal-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks -Wno-elaborated-enum-base -ferror-limit 19 -stack-protector 1 -fstack-check -mdarwin-stkchk-strong-link -fblocks -fencode-extended-block-signature -fregister-global-dtors-with-atexit -fgnuc-version=4.2.1 -fskip-odr-check-in-gmf -fmax-type-align=16 -fcommon -clang-vendor-feature=+disableNonDependentMemberExprInCurrentInstantiation -fno-odr-hash-protocols -clang-vendor-feature=+enableAggressiveVLAFolding -clang-vendor-feature=+revert09abecef7bbf -clang-vendor-feature=+thisNoAlignAttr -clang-vendor-feature=+thisNoNullAttr -clang-vendor-feature=+disableAtImportPrivateFrameworkInImplementationError -Wno-error=allocator-wrappers -fdwarf2-cfi-asm -o CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -x c /opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeCCompilerABI.c]
+        ignore line: [clang -cc1 version 21.0.0 (clang-2100.3.34.2) default target arm64-apple-darwin25.6.0]
+        ignore line: [ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include"]
+        ignore line: [ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks"]
+        ignore line: [#include "..." search starts here:]
+        ignore line: [#include <...> search starts here:]
+        ignore line: [ /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include]
+        ignore line: [ /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include]
+        ignore line: [ /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include]
+        ignore line: [ /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks (framework directory)]
+        ignore line: [ /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks (framework directory)]
+        ignore line: [End of search list.]
+        ignore line: [Linking C executable cmTC_5e52e]
+        ignore line: [/opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_5e52e.dir/link.txt --verbose=1]
+        ignore line: [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc  -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl -search_paths_first -Wl -headerpad_max_install_names  -v -Wl -v CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -o cmTC_5e52e ]
+        ignore line: [Apple clang version 21.0.0 (clang-2100.3.34.2)]
+        ignore line: [Target: arm64-apple-darwin25.6.0]
+        ignore line: [Thread model: posix]
+        ignore line: [InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin]
+        link line: [ "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld" -demangle -lto_library /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/libLTO.dylib -dynamic -arch arm64 -platform_version macos 26.6.0 27.0 -syslibroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mllvm -enable-linkonceodr-outlining -o cmTC_5e52e -search_paths_first -headerpad_max_install_names -v CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o -lSystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a]
+          arg [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld] ==> ignore
+          arg [-demangle] ==> ignore
+          arg [-lto_library] ==> ignore, skip following value
+          arg [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/libLTO.dylib] ==> skip value of -lto_library
+          arg [-dynamic] ==> ignore
+          arg [-arch] ==> ignore
+          arg [arm64] ==> ignore
+          arg [-platform_version] ==> ignore
+          arg [macos] ==> ignore
+          arg [26.6.0] ==> ignore
+          arg [27.0] ==> ignore
+          arg [-syslibroot] ==> ignore
+          arg [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk] ==> ignore
+          arg [-mllvm] ==> ignore
+          arg [-enable-linkonceodr-outlining] ==> ignore
+          arg [-o] ==> ignore
+          arg [cmTC_5e52e] ==> ignore
+          arg [-search_paths_first] ==> ignore
+          arg [-headerpad_max_install_names] ==> ignore
+          arg [-v] ==> ignore
+          arg [CMakeFiles/cmTC_5e52e.dir/CMakeCCompilerABI.c.o] ==> ignore
+          arg [-lSystem] ==> lib [System]
+          arg [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a] ==> lib [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a]
+        Library search paths: [;/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib;/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib/swift]
+        Framework search paths: [;/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks]
+        remove lib [System]
+        remove lib [/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/lib/darwin/libclang_rt.osx.a]
+        collapse library dir [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib] ==> [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib]
+        collapse library dir [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib/swift] ==> [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib/swift]
+        collapse framework dir [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks] ==> [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks]
+        implicit libs: []
+        implicit objs: []
+        implicit dirs: [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib;/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/lib/swift]
+        implicit fwks: [/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks]
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerId.cmake:1144 (message)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineASMCompiler.cmake:131 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/CMakeLists.txt:3 (project)"
+    message: |
+      Checking whether the ASM compiler is GNU using "--version" did not match "(GNU assembler)|(GCC)|(Free Software Foundation)":
+      Apple clang version 21.0.0 (clang-2100.3.34.2)
+      Target: arm64-apple-darwin25.6.0
+      Thread model: posix
+      InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineCompilerId.cmake:1131 (message)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CMakeDetermineASMCompiler.cmake:131 (CMAKE_DETERMINE_COMPILER_ID_VENDOR)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/CMakeLists.txt:3 (project)"
+    message: |
+      Checking whether the ASM compiler is AppleClang using "--version" matched "(Apple (clang|LLVM) version)":
+      Apple clang version 21.0.0 (clang-2100.3.34.2)
+      Target: arm64-apple-darwin25.6.0
+      Thread model: posix
+      InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/FindThreads.cmake:97 (CHECK_C_SOURCE_COMPILES)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/FindThreads.cmake:163 (_threads_check_libc)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/CMakeLists.txt:297 (find_package)"
+    checks:
+      - "Performing Test CMAKE_HAVE_LIBC_PTHREAD"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-cRRgki"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-cRRgki"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "CMAKE_HAVE_LIBC_PTHREAD"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-cRRgki'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_3ef07/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_3ef07.dir/build.make CMakeFiles/cmTC_3ef07.dir/build
+        Building C object CMakeFiles/cmTC_3ef07.dir/src.c.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc -DCMAKE_HAVE_LIBC_PTHREAD  -std=gnu11 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_3ef07.dir/src.c.o -MF CMakeFiles/cmTC_3ef07.dir/src.c.o.d -o CMakeFiles/cmTC_3ef07.dir/src.c.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-cRRgki/src.c
+        Linking C executable cmTC_3ef07
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_3ef07.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc  -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_3ef07.dir/src.c.o -o cmTC_3ef07 
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/FindOpenMP.cmake:219 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/FindOpenMP.cmake:486 (_OPENMP_GET_FLAGS)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:338 (find_package)"
+    description: "Detecting C OpenMP compiler info"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-AaZnJK"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-AaZnJK"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "OpenMP_COMPILE_RESULT_C_Xclang fopenmp"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-AaZnJK'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_679c8/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_679c8.dir/build.make CMakeFiles/cmTC_679c8.dir/build
+        Building C object CMakeFiles/cmTC_679c8.dir/OpenMPTryFlag.c.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc   -Xclang -fopenmp -v -std=gnu11 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_679c8.dir/OpenMPTryFlag.c.o -MF CMakeFiles/cmTC_679c8.dir/OpenMPTryFlag.c.o.d -o CMakeFiles/cmTC_679c8.dir/OpenMPTryFlag.c.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-AaZnJK/OpenMPTryFlag.c
+        Apple clang version 21.0.0 (clang-2100.3.34.2)
+        Target: arm64-apple-darwin25.6.0
+        Thread model: posix
+        InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+         "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang" -cc1 -triple arm64-apple-macosx26.6.0 -Wundef-prefix=TARGET_OS_ -Wdeprecated-objc-isa-usage -Werror=deprecated-objc-isa-usage -Werror=implicit-function-declaration -emit-obj -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name OpenMPTryFlag.c -mrelocation-model pic -pic-level 2 -mframe-pointer=non-leaf -fno-strict-return -ffp-contract=on -fno-rounding-math -funwind-tables=1 -fobjc-msgsend-selector-stubs -fno-sized-deallocation -target-sdk-version=27.0 -fdepfile-entry=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/SDKSettings.json -fvisibility-inlines-hidden-static-local-var -fno-modulemap-allow-subdirectory-search -fdefine-target-os-macros -fno-assume-unique-vtables -fno-modulemap-allow-subdirectory-search -enable-tlsdesc -target-cpu apple-m1 -target-feature +v8.5a -target-feature +aes -target-feature +altnzcv -target-feature +ccdp -target-feature +ccpp -target-feature +complxnum -target-feature +crc -target-feature +dotprod -target-feature +flagm -target-feature +fp-armv8 -target-feature +fp16fml -target-feature +fptoint -target-feature +fullfp16 -target-feature +jsconv -target-feature +lse -target-feature +neon -target-feature +pauth -target-feature +perfmon -target-feature +predres -target-feature +ras -target-feature +rcpc -target-feature +rdm -target-feature +sb -target-feature +sha2 -target-feature +sha3 -target-feature +specrestrict -target-feature +ssbs -target-abi darwinpcs -debugger-tuning=lldb -fdebug-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-AaZnJK -target-linker-version 1166.2 -v -fcoverage-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-AaZnJK -resource-dir /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21 -dependency-file CMakeFiles/cmTC_679c8.dir/OpenMPTryFlag.c.o.d -skip-unused-modulemap-deps -MT CMakeFiles/cmTC_679c8.dir/OpenMPTryFlag.c.o -sys-header-deps -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -internal-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include -internal-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks -Wno-elaborated-enum-base -std=gnu11 -ferror-limit 19 -stack-protector 1 -fstack-check -mdarwin-stkchk-strong-link -fblocks -fencode-extended-block-signature -fregister-global-dtors-with-atexit -fgnuc-version=4.2.1 -fskip-odr-check-in-gmf -fmax-type-align=16 -fcommon -fopenmp -clang-vendor-feature=+disableNonDependentMemberExprInCurrentInstantiation -fno-odr-hash-protocols -clang-vendor-feature=+enableAggressiveVLAFolding -clang-vendor-feature=+revert09abecef7bbf -clang-vendor-feature=+thisNoAlignAttr -clang-vendor-feature=+thisNoNullAttr -clang-vendor-feature=+disableAtImportPrivateFrameworkInImplementationError -Wno-error=allocator-wrappers -fdwarf2-cfi-asm -o CMakeFiles/cmTC_679c8.dir/OpenMPTryFlag.c.o -x c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-AaZnJK/OpenMPTryFlag.c
+        clang -cc1 version 21.0.0 (clang-2100.3.34.2) default target arm64-apple-darwin25.6.0
+        ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include"
+        ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks"
+        #include "..." search starts here:
+        #include <...> search starts here:
+         /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include
+         /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks (framework directory)
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks (framework directory)
+        End of search list.
+        /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-AaZnJK/OpenMPTryFlag.c:2:10: fatal error: 'omp.h' file not found
+            2 | #include <omp.h>
+              |          ^~~~~~~
+        1 error generated.
+        make[1]: *** [CMakeFiles/cmTC_679c8.dir/OpenMPTryFlag.c.o] Error 1
+        make: *** [cmTC_679c8/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/FindOpenMP.cmake:219 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/FindOpenMP.cmake:486 (_OPENMP_GET_FLAGS)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:338 (find_package)"
+    description: "Detecting CXX OpenMP compiler info"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-2qTENT"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-2qTENT"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "OpenMP_COMPILE_RESULT_CXX_Xclang fopenmp"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-2qTENT'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_ec134/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_ec134.dir/build.make CMakeFiles/cmTC_ec134.dir/build
+        Building CXX object CMakeFiles/cmTC_ec134.dir/OpenMPTryFlag.cpp.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++   -Xclang -fopenmp -v -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_ec134.dir/OpenMPTryFlag.cpp.o -MF CMakeFiles/cmTC_ec134.dir/OpenMPTryFlag.cpp.o.d -o CMakeFiles/cmTC_ec134.dir/OpenMPTryFlag.cpp.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-2qTENT/OpenMPTryFlag.cpp
+        Apple clang version 21.0.0 (clang-2100.3.34.2)
+        Target: arm64-apple-darwin25.6.0
+        Thread model: posix
+        InstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin
+        ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/../include/c++/v1"
+         "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang" -cc1 -triple arm64-apple-macosx26.6.0 -Wundef-prefix=TARGET_OS_ -Wdeprecated-objc-isa-usage -Werror=deprecated-objc-isa-usage -Werror=implicit-function-declaration -emit-obj -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name OpenMPTryFlag.cpp -mrelocation-model pic -pic-level 2 -mframe-pointer=non-leaf -fno-strict-return -ffp-contract=on -fno-rounding-math -funwind-tables=1 -fobjc-msgsend-selector-stubs -fno-sized-deallocation -target-sdk-version=27.0 -fdepfile-entry=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/SDKSettings.json -fvisibility-inlines-hidden-static-local-var -fno-modulemap-allow-subdirectory-search -fdefine-target-os-macros -fno-assume-unique-vtables -fno-modulemap-allow-subdirectory-search -enable-tlsdesc -target-cpu apple-m1 -target-feature +v8.5a -target-feature +aes -target-feature +altnzcv -target-feature +ccdp -target-feature +ccpp -target-feature +complxnum -target-feature +crc -target-feature +dotprod -target-feature +flagm -target-feature +fp-armv8 -target-feature +fp16fml -target-feature +fptoint -target-feature +fullfp16 -target-feature +jsconv -target-feature +lse -target-feature +neon -target-feature +pauth -target-feature +perfmon -target-feature +predres -target-feature +ras -target-feature +rcpc -target-feature +rdm -target-feature +sb -target-feature +sha2 -target-feature +sha3 -target-feature +specrestrict -target-feature +ssbs -target-abi darwinpcs -debugger-tuning=lldb -fdebug-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-2qTENT -target-linker-version 1166.2 -v -fcoverage-compilation-dir=/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-2qTENT -resource-dir /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21 -dependency-file CMakeFiles/cmTC_ec134.dir/OpenMPTryFlag.cpp.o.d -skip-unused-modulemap-deps -MT CMakeFiles/cmTC_ec134.dir/OpenMPTryFlag.cpp.o -sys-header-deps -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -internal-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include/c++/v1 -internal-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include -internal-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include -internal-externc-isystem /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks -internal-iframework /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks -Wno-elaborated-enum-base -std=gnu++17 -fdeprecated-macro -ferror-limit 19 -stack-protector 1 -fstack-check -mdarwin-stkchk-strong-link -fblocks -fencode-extended-block-signature -fregister-global-dtors-with-atexit -fgnuc-version=4.2.1 -fskip-odr-check-in-gmf -fcxx-exceptions -fexceptions -fmax-type-align=16 -fcommon -fopenmp -clang-vendor-feature=+disableNonDependentMemberExprInCurrentInstantiation -fno-odr-hash-protocols -clang-vendor-feature=+enableAggressiveVLAFolding -clang-vendor-feature=+revert09abecef7bbf -clang-vendor-feature=+thisNoAlignAttr -clang-vendor-feature=+thisNoNullAttr -clang-vendor-feature=+disableAtImportPrivateFrameworkInImplementationError -Wno-error=allocator-wrappers -fdwarf2-cfi-asm -o CMakeFiles/cmTC_ec134.dir/OpenMPTryFlag.cpp.o -x c++ /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-2qTENT/OpenMPTryFlag.cpp
+        clang -cc1 version 21.0.0 (clang-2100.3.34.2) default target arm64-apple-darwin25.6.0
+        ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/local/include"
+        ignoring nonexistent directory "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/Library/Frameworks"
+        #include "..." search starts here:
+        #include <...> search starts here:
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include/c++/v1
+         /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/clang/21/include
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/usr/include
+         /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/Frameworks (framework directory)
+         /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk/System/Library/SubFrameworks (framework directory)
+        End of search list.
+        /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-2qTENT/OpenMPTryFlag.cpp:2:10: fatal error: 'omp.h' file not found
+            2 | #include <omp.h>
+              |          ^~~~~~~
+        1 error generated.
+        make[1]: *** [CMakeFiles/cmTC_ec134.dir/OpenMPTryFlag.cpp.o] Error 1
+        make: *** [cmTC_ec134/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckCompilerFlag.cmake:18 (cmake_check_source_compiles)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXCompilerFlag.cmake:34 (cmake_check_compiler_flag)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:108 (check_cxx_compiler_flag)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test GGML_COMPILER_SUPPORTS_FP16_FORMAT_I3E"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-m0kvm2"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-m0kvm2"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "GGML_COMPILER_SUPPORTS_FP16_FORMAT_I3E"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-m0kvm2'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_be16d/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_be16d.dir/build.make CMakeFiles/cmTC_be16d.dir/build
+        Building CXX object CMakeFiles/cmTC_be16d.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DGGML_COMPILER_SUPPORTS_FP16_FORMAT_I3E  -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6   -mfp16-format=ieee -MD -MT CMakeFiles/cmTC_be16d.dir/src.cxx.o -MF CMakeFiles/cmTC_be16d.dir/src.cxx.o.d -o CMakeFiles/cmTC_be16d.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-m0kvm2/src.cxx
+        c++: error: unknown argument: '-mfp16-format=ieee'
+        make[1]: *** [CMakeFiles/cmTC_be16d.dir/src.cxx.o] Error 1
+        make: *** [cmTC_be16d/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_run-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceRuns.cmake:93 (try_run)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceRuns.cmake:52 (cmake_check_source_runs)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:148 (check_cxx_source_runs)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:162 (check_arm_feature)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test GGML_MACHINE_SUPPORTS_dotprod"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-Ebv8bo"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-Ebv8bo"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "GGML_MACHINE_SUPPORTS_dotprod_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-Ebv8bo'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_c7e3a/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_c7e3a.dir/build.make CMakeFiles/cmTC_c7e3a.dir/build
+        Building CXX object CMakeFiles/cmTC_c7e3a.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DGGML_MACHINE_SUPPORTS_dotprod  -mcpu=native+dotprod -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_c7e3a.dir/src.cxx.o -MF CMakeFiles/cmTC_c7e3a.dir/src.cxx.o.d -o CMakeFiles/cmTC_c7e3a.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-Ebv8bo/src.cxx
+        Linking CXX executable cmTC_c7e3a
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_c7e3a.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -mcpu=native+dotprod -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_c7e3a.dir/src.cxx.o -o cmTC_c7e3a 
+        
+      exitCode: 0
+    runResult:
+      variable: "GGML_MACHINE_SUPPORTS_dotprod_EXITCODE"
+      cached: true
+      stdout: |
+      stderr: |
+      exitCode: 0
+  -
+    kind: "try_run-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceRuns.cmake:93 (try_run)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceRuns.cmake:52 (cmake_check_source_runs)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:148 (check_cxx_source_runs)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:163 (check_arm_feature)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test GGML_MACHINE_SUPPORTS_i8mm"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-z1J7zp"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-z1J7zp"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "GGML_MACHINE_SUPPORTS_i8mm_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-z1J7zp'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_f3182/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_f3182.dir/build.make CMakeFiles/cmTC_f3182.dir/build
+        Building CXX object CMakeFiles/cmTC_f3182.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DGGML_MACHINE_SUPPORTS_i8mm  -mcpu=native+i8mm -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_f3182.dir/src.cxx.o -MF CMakeFiles/cmTC_f3182.dir/src.cxx.o.d -o CMakeFiles/cmTC_f3182.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-z1J7zp/src.cxx
+        Linking CXX executable cmTC_f3182
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_f3182.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -mcpu=native+i8mm -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_f3182.dir/src.cxx.o -o cmTC_f3182 
+        
+      exitCode: 0
+    runResult:
+      variable: "GGML_MACHINE_SUPPORTS_i8mm_EXITCODE"
+      cached: true
+      stdout: |
+      stderr: |
+        Illegal instruction
+      exitCode: "FAILED_TO_RUN"
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:153 (check_cxx_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:163 (check_arm_feature)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test GGML_MACHINE_SUPPORTS_noi8mm"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-jnm4nN"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-jnm4nN"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "GGML_MACHINE_SUPPORTS_noi8mm"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-jnm4nN'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_38b78/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_38b78.dir/build.make CMakeFiles/cmTC_38b78.dir/build
+        Building CXX object CMakeFiles/cmTC_38b78.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DGGML_MACHINE_SUPPORTS_noi8mm  -mcpu=native+noi8mm -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_38b78.dir/src.cxx.o -MF CMakeFiles/cmTC_38b78.dir/src.cxx.o.d -o CMakeFiles/cmTC_38b78.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-jnm4nN/src.cxx
+        Linking CXX executable cmTC_38b78
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_38b78.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -mcpu=native+noi8mm -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_38b78.dir/src.cxx.o -o cmTC_38b78 
+        
+      exitCode: 0
+  -
+    kind: "try_run-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceRuns.cmake:93 (try_run)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceRuns.cmake:52 (cmake_check_source_runs)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:148 (check_cxx_source_runs)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:164 (check_arm_feature)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test GGML_MACHINE_SUPPORTS_sve"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-KExlGA"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-KExlGA"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "GGML_MACHINE_SUPPORTS_sve_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-KExlGA'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_d58eb/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_d58eb.dir/build.make CMakeFiles/cmTC_d58eb.dir/build
+        Building CXX object CMakeFiles/cmTC_d58eb.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DGGML_MACHINE_SUPPORTS_sve  -mcpu=native+sve -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_d58eb.dir/src.cxx.o -MF CMakeFiles/cmTC_d58eb.dir/src.cxx.o.d -o CMakeFiles/cmTC_d58eb.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-KExlGA/src.cxx
+        Linking CXX executable cmTC_d58eb
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_d58eb.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -mcpu=native+sve -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_d58eb.dir/src.cxx.o -o cmTC_d58eb 
+        
+      exitCode: 0
+    runResult:
+      variable: "GGML_MACHINE_SUPPORTS_sve_EXITCODE"
+      cached: true
+      stdout: |
+      stderr: |
+        Illegal instruction
+      exitCode: "FAILED_TO_RUN"
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:153 (check_cxx_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:164 (check_arm_feature)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test GGML_MACHINE_SUPPORTS_nosve"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-apD11Q"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-apD11Q"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "GGML_MACHINE_SUPPORTS_nosve"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-apD11Q'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_6eff3/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_6eff3.dir/build.make CMakeFiles/cmTC_6eff3.dir/build
+        Building CXX object CMakeFiles/cmTC_6eff3.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DGGML_MACHINE_SUPPORTS_nosve  -mcpu=native+nosve -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_6eff3.dir/src.cxx.o -MF CMakeFiles/cmTC_6eff3.dir/src.cxx.o.d -o CMakeFiles/cmTC_6eff3.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-apD11Q/src.cxx
+        Linking CXX executable cmTC_6eff3
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_6eff3.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -mcpu=native+nosve -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_6eff3.dir/src.cxx.o -o cmTC_6eff3 
+        
+      exitCode: 0
+  -
+    kind: "try_run-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceRuns.cmake:93 (try_run)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceRuns.cmake:52 (cmake_check_source_runs)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:148 (check_cxx_source_runs)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:165 (check_arm_feature)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test GGML_MACHINE_SUPPORTS_sme"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-XZI3DD"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-XZI3DD"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "GGML_MACHINE_SUPPORTS_sme_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-XZI3DD'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_07f3c/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_07f3c.dir/build.make CMakeFiles/cmTC_07f3c.dir/build
+        Building CXX object CMakeFiles/cmTC_07f3c.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DGGML_MACHINE_SUPPORTS_sme  -mcpu=native+sme -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_07f3c.dir/src.cxx.o -MF CMakeFiles/cmTC_07f3c.dir/src.cxx.o.d -o CMakeFiles/cmTC_07f3c.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-XZI3DD/src.cxx
+        Linking CXX executable cmTC_07f3c
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_07f3c.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -mcpu=native+sme -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_07f3c.dir/src.cxx.o -o cmTC_07f3c 
+        
+      exitCode: 0
+    runResult:
+      variable: "GGML_MACHINE_SUPPORTS_sme_EXITCODE"
+      cached: true
+      stdout: |
+      stderr: |
+        Illegal instruction
+      exitCode: "FAILED_TO_RUN"
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:153 (check_cxx_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:165 (check_arm_feature)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test GGML_MACHINE_SUPPORTS_nosme"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-HPsJat"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-HPsJat"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "GGML_MACHINE_SUPPORTS_nosme"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-HPsJat'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_f5dfb/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_f5dfb.dir/build.make CMakeFiles/cmTC_f5dfb.dir/build
+        Building CXX object CMakeFiles/cmTC_f5dfb.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DGGML_MACHINE_SUPPORTS_nosme  -mcpu=native+nosme -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_f5dfb.dir/src.cxx.o -MF CMakeFiles/cmTC_f5dfb.dir/src.cxx.o.d -o CMakeFiles/cmTC_f5dfb.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-HPsJat/src.cxx
+        Linking CXX executable cmTC_f5dfb
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_f5dfb.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -mcpu=native+nosme -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_f5dfb.dir/src.cxx.o -o cmTC_f5dfb 
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:228 (check_cxx_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test HAVE_DOTPROD"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-4i0hRc"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-4i0hRc"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "HAVE_DOTPROD"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-4i0hRc'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_ada89/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_ada89.dir/build.make CMakeFiles/cmTC_ada89.dir/build
+        Building CXX object CMakeFiles/cmTC_ada89.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DHAVE_DOTPROD  -U__ARM_FEATURE_MATMUL_INT8 -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+noi8mm+nosve+nosme -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_ada89.dir/src.cxx.o -MF CMakeFiles/cmTC_ada89.dir/src.cxx.o.d -o CMakeFiles/cmTC_ada89.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-4i0hRc/src.cxx
+        Linking CXX executable cmTC_ada89
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_ada89.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -U__ARM_FEATURE_MATMUL_INT8 -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+noi8mm+nosve+nosme -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_ada89.dir/src.cxx.o -o cmTC_ada89 
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:228 (check_cxx_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test HAVE_SVE"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-OAXCUQ"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-OAXCUQ"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "HAVE_SVE"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-OAXCUQ'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_69cb6/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_69cb6.dir/build.make CMakeFiles/cmTC_69cb6.dir/build
+        Building CXX object CMakeFiles/cmTC_69cb6.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DHAVE_SVE  -U__ARM_FEATURE_MATMUL_INT8 -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+noi8mm+nosve+nosme -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_69cb6.dir/src.cxx.o -MF CMakeFiles/cmTC_69cb6.dir/src.cxx.o.d -o CMakeFiles/cmTC_69cb6.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-OAXCUQ/src.cxx
+        /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-OAXCUQ/src.cxx:3:24: error: "Feature SVE is not defined"
+            3 |                     #  error "Feature SVE is not defined"
+              |                        ^
+        1 error generated.
+        make[1]: *** [CMakeFiles/cmTC_69cb6.dir/src.cxx.o] Error 1
+        make: *** [cmTC_69cb6/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:228 (check_cxx_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test HAVE_MATMUL_INT8"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-p2njmG"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-p2njmG"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "HAVE_MATMUL_INT8"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-p2njmG'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_8cd10/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_8cd10.dir/build.make CMakeFiles/cmTC_8cd10.dir/build
+        Building CXX object CMakeFiles/cmTC_8cd10.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DHAVE_MATMUL_INT8  -U__ARM_FEATURE_MATMUL_INT8 -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+noi8mm+nosve+nosme -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_8cd10.dir/src.cxx.o -MF CMakeFiles/cmTC_8cd10.dir/src.cxx.o.d -o CMakeFiles/cmTC_8cd10.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-p2njmG/src.cxx
+        /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-p2njmG/src.cxx:3:24: error: "Feature MATMUL_INT8 is not defined"
+            3 |                     #  error "Feature MATMUL_INT8 is not defined"
+              |                        ^
+        1 error generated.
+        make[1]: *** [CMakeFiles/cmTC_8cd10.dir/src.cxx.o] Error 1
+        make: *** [cmTC_8cd10/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:228 (check_cxx_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test HAVE_FMA"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-YvVveZ"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-YvVveZ"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "HAVE_FMA"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-YvVveZ'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_7ffc4/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_7ffc4.dir/build.make CMakeFiles/cmTC_7ffc4.dir/build
+        Building CXX object CMakeFiles/cmTC_7ffc4.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DHAVE_FMA  -U__ARM_FEATURE_MATMUL_INT8 -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+noi8mm+nosve+nosme -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_7ffc4.dir/src.cxx.o -MF CMakeFiles/cmTC_7ffc4.dir/src.cxx.o.d -o CMakeFiles/cmTC_7ffc4.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-YvVveZ/src.cxx
+        Linking CXX executable cmTC_7ffc4
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_7ffc4.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -U__ARM_FEATURE_MATMUL_INT8 -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+noi8mm+nosve+nosme -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_7ffc4.dir/src.cxx.o -o cmTC_7ffc4 
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:228 (check_cxx_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test HAVE_FP16_VECTOR_ARITHMETIC"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-0KAIJk"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-0KAIJk"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "HAVE_FP16_VECTOR_ARITHMETIC"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-0KAIJk'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_ac1b1/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_ac1b1.dir/build.make CMakeFiles/cmTC_ac1b1.dir/build
+        Building CXX object CMakeFiles/cmTC_ac1b1.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DHAVE_FP16_VECTOR_ARITHMETIC  -U__ARM_FEATURE_MATMUL_INT8 -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+noi8mm+nosve+nosme -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_ac1b1.dir/src.cxx.o -MF CMakeFiles/cmTC_ac1b1.dir/src.cxx.o.d -o CMakeFiles/cmTC_ac1b1.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-0KAIJk/src.cxx
+        Linking CXX executable cmTC_ac1b1
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_ac1b1.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++  -U__ARM_FEATURE_MATMUL_INT8 -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+noi8mm+nosve+nosme -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_ac1b1.dir/src.cxx.o -o cmTC_ac1b1 
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCXXSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/ggml-cpu/CMakeLists.txt:228 (check_cxx_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/src/CMakeLists.txt:585 (ggml_add_cpu_backend_variant_impl)"
+    checks:
+      - "Performing Test HAVE_SME"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-6X9c1g"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-6X9c1g"
+    cmakeVariables:
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/;/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/ggml/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+    buildResult:
+      variable: "HAVE_SME"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-6X9c1g'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_d51a0/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_d51a0.dir/build.make CMakeFiles/cmTC_d51a0.dir/build
+        Building CXX object CMakeFiles/cmTC_d51a0.dir/src.cxx.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/c++ -DHAVE_SME  -U__ARM_FEATURE_MATMUL_INT8 -U__ARM_FEATURE_SVE -U__ARM_FEATURE_SME -mcpu=native+dotprod+noi8mm+nosve+nosme -std=gnu++17 -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -MD -MT CMakeFiles/cmTC_d51a0.dir/src.cxx.o -MF CMakeFiles/cmTC_d51a0.dir/src.cxx.o.d -o CMakeFiles/cmTC_d51a0.dir/src.cxx.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-6X9c1g/src.cxx
+        /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-6X9c1g/src.cxx:3:24: error: "Feature SME is not defined"
+            3 |                     #  error "Feature SME is not defined"
+              |                        ^
+        1 error generated.
+        make[1]: *** [CMakeFiles/cmTC_d51a0.dir/src.cxx.o] Error 1
+        make: *** [cmTC_d51a0/fast] Error 2
+        
+      exitCode: 2
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/Internal/CheckSourceCompiles.cmake:101 (try_compile)"
+      - "/opt/homebrew/Cellar/cmake/3.28.1/share/cmake/Modules/CheckCSourceCompiles.cmake:52 (cmake_check_source_compiles)"
+      - "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/vendor/cpp-httplib/CMakeLists.txt:134 (check_c_source_compiles)"
+    checks:
+      - "Performing Test OPENSSL_VERSION_SUPPORTED"
+    directories:
+      source: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-KWkoGZ"
+      binary: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-KWkoGZ"
+    cmakeVariables:
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+      CMAKE_MODULE_PATH: "/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/llama.cpp/cmake/"
+      CMAKE_OSX_ARCHITECTURES: ""
+      CMAKE_OSX_DEPLOYMENT_TARGET: "26.6"
+      CMAKE_OSX_SYSROOT: "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk"
+      CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+    buildResult:
+      variable: "OPENSSL_VERSION_SUPPORTED"
+      cached: true
+      stdout: |
+        Change Dir: '/Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-KWkoGZ'
+        
+        Run Build Command(s): /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E env VERBOSE=1 /usr/bin/make -f Makefile cmTC_31cd0/fast
+        /Applications/Xcode.app/Contents/Developer/usr/bin/make  -f CMakeFiles/cmTC_31cd0.dir/build.make CMakeFiles/cmTC_31cd0.dir/build
+        Building C object CMakeFiles/cmTC_31cd0.dir/src.c.o
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc -DOPENSSL_VERSION_SUPPORTED -I/opt/homebrew/Cellar/openssl@3/3.6.1/include -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -fPIE -MD -MT CMakeFiles/cmTC_31cd0.dir/src.c.o -MF CMakeFiles/cmTC_31cd0.dir/src.c.o.d -o CMakeFiles/cmTC_31cd0.dir/src.c.o -c /Users/dmitryzvada/Projects/RnPLab/2026/cfw-fa-half/harness/llama_resident/build/fa-half-cpu/CMakeFiles/CMakeScratch/TryCompile-KWkoGZ/src.c
+        Linking C executable cmTC_31cd0
+        /opt/homebrew/Cellar/cmake/3.28.1/bin/cmake -E cmake_link_script CMakeFiles/cmTC_31cd0.dir/link.txt --verbose=1
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/cc  -isysroot /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX27.0.sdk -mmacosx-version-min=26.6 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/cmTC_31cd0.dir/src.c.o -o cmTC_31cd0 
+        
+      exitCode: 0
+...
