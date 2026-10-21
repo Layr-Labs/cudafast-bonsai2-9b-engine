@@ -1269,6 +1269,7 @@ static __global__ void fwht_quantize_mmq_d4_gnorm(const float * x, const float *
     const int64_t row=blockIdx.y;
     float v[NE];
     int64_t head[NE];
+    float gate[NE];
     ggml_cuda_pdl_lc();
     ggml_cuda_pdl_sync();
 #pragma unroll
@@ -1276,6 +1277,7 @@ static __global__ void fwht_quantize_mmq_d4_gnorm(const float * x, const float *
         const uint2 a21=fast_div_modulo((uint32_t)(i*(NT/HD)+tid/HD), ne1);
         head[i]=row*g3+(int64_t)a21.y*g1+(int64_t)a21.x*g2;
         v[i]=x[head[i]*HD+a0];
+        if constexpr (!D1) gate[i]=ggml_cuda_op_silu_single(z[head[i]*z_stride+a0]);
     }
 #pragma unroll
     for(int i=0;i<NE;++i) {
@@ -1293,7 +1295,7 @@ static __global__ void fwht_quantize_mmq_d4_gnorm(const float * x, const float *
         const float mean=tmp/ncols;
         const float scale=rsqrtf(mean+eps);
         const float xn=scale*v[i]*w[a0];
-        const float g=ggml_cuda_op_silu_single(z[head[i]*z_stride+a0])*xn;
+        const float g=(D1 ? ggml_cuda_op_silu_single(z[head[i]*z_stride+a0]) : gate[i])*xn;
         v[i]=g*(1.0f/64.0f);
         if constexpr(SIGNED) v[i]*=signs[i*NT+tid];
     }
