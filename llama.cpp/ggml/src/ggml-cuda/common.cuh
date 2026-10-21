@@ -1731,6 +1731,8 @@ struct ggml_backend_cuda_context {
     // SWIGLU nodes whose value the prefill gate/up GEMM already wrote into its gate operand (ggml_cuda_try_prefill_glu);
     // the node is then not computed: its FWHT quantizer reads the gate operand, or it is a copy of it.
     std::vector<const ggml_tensor *> glu_prefused;
+    // the subset of glu_prefused whose SwiGLU sits in the gate operand as F16 (GGML_CUDA_PREFILL_GLU_F16)
+    std::vector<const ggml_tensor *> glu_prefused_f16;
     // Retained until the next graph evaluation/capture. Values describe producer-selected physical layouts only.
     std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, int>> gdn_prefill_qk_layout;
 
