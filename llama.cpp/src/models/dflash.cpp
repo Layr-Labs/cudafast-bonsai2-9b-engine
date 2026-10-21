@@ -181,7 +181,7 @@ static int64_t dflash2_head_rows(const llama_model & model, int64_t n_vocab) {
         const char * desc = d.dev ? ggml_backend_dev_description(d.dev) : nullptr;
         gb10 = gb10 || (desc && strstr(desc, "GB10") != nullptr);
     }
-    if (!gb10) {
+    if (!gb10 && getenv("LLAMA_DFLASH_HEAD_ROWS") == nullptr) {
         return 0;
     }
 
@@ -855,7 +855,8 @@ static ggml_tensor * build_dflash2_conv(
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
 static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
-        int64_t n_tokens_override = 0, int64_t n_blocks_override = 0) {
+        int64_t n_tokens_override = 0, int64_t n_blocks_override = 0,
+        ggml_tensor * cand_pre = nullptr, ggml_tensor * unary_pre = nullptr) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -876,10 +877,14 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
 
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
-    ggml_tensor * unary       = ggml_reshape_2d(ctx0,
-            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
+    // the head screen (cand_pre/unary_pre) supplies the candidates and their logits directly
+    ggml_tensor * candidates = cand_pre;
+    ggml_tensor * unary      = unary_pre;
+    if (candidates == nullptr || unary == nullptr) {
+        candidates = ggml_top_k(ctx0, res->t_logits, top_k);
+        ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+        unary = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
+    }
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
 
     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
@@ -1325,6 +1330,23 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // batch that asks for logits (e.g. the init warm-up) gets the full head
     const int64_t head_rows = model.dflash_selector_hidden && !model.d2t && loras->empty() && n_outputs == 0
         ? model.dflash_head_rows : 0;
+
+    // Head screen (llama_model::output_screen): score the leading rows on the leading blocks of the
+    // rotated input only, keep the best LLAMA_DFLASH_SCREEN_K (default 32) rows of every chunk of 8192, and
+    // rescore that shortlist on the full row (ggml_dflash_rescore). The selector then takes its top_k
+    // from the shortlist. Drafts only: the target verifies every proposal with its own full head.
+    const llama_model * head_owner = model.output ? &model
+        : (cparams.ctx_other ? llama_get_model(cparams.ctx_other) : nullptr);
+    ggml_tensor * screen = head_owner ? head_owner->output_screen : nullptr;
+    const int64_t screen_chunk = 8192;
+    const int64_t screen_k     = getenv("LLAMA_DFLASH_SCREEN_K") ? atoll(getenv("LLAMA_DFLASH_SCREEN_K")) : 32;
+    const bool use_screen = screen != nullptr && head_rows > 0 && head_rows % screen_chunk == 0 &&
+        screen->ne[1] >= head_rows && output_s == nullptr && model.dspark_markov_w1 == nullptr &&
+        model.dfly_hc_down == nullptr && hparams.f_logit_scale == 0.0f && hparams.f_final_logit_softcapping <= 0.0f &&
+        screen_k >= 1 && screen_k <= 32 && hparams.dflash_selector_top_k <= screen_k*(head_rows/screen_chunk) &&
+        !(getenv("LLAMA_DFLASH_HEAD_SCREEN") && atoi(getenv("LLAMA_DFLASH_HEAD_SCREEN")) == 0);
+    ggml_tensor * screen_cand  = nullptr;
+    ggml_tensor * screen_unary = nullptr;
     if (head_rows > 0 && head_rows < output->ne[1] && output->ne[1] == (int64_t) model.vocab.n_tokens()) {
         // build_lora_mm with the leading head_rows rows of the head: the activation gets the
         // transform of the full tensor, then multiplies a view of its first rows in place, so
@@ -1355,9 +1377,31 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             }
         }
         ggml_tensor * head = ggml_view_2d(ctx0, output, output->ne[0], head_rows, output->nb[1], 0);
-        cur = ggml_mul_mat(ctx0, head, cur_mm);
-        if (output_s) {
-            cur = ggml_mul(ctx0, cur, output_s);
+        if (use_screen && cur_mm->ne[0] == output->ne[0] && ggml_nrows(cur_mm) == cur_mm->ne[1]) {
+            const int64_t n        = cur_mm->ne[1];
+            const int64_t n_chunks = head_rows / screen_chunk;
+            const int64_t S        = screen_k * n_chunks;
+            const int64_t top_k    = hparams.dflash_selector_top_k;
+
+            ggml_tensor * x       = ggml_cont(ctx0, ggml_view_2d(ctx0, cur_mm, screen->ne[0], n, cur_mm->nb[1], 0));
+            ggml_tensor * partial = ggml_mul_mat(ctx0,
+                    ggml_view_2d(ctx0, screen, screen->ne[0], head_rows, screen->nb[1], 0), x);
+            ggml_tensor * ids     = ggml_top_k(ctx0, ggml_reshape_2d(ctx0, partial, screen_chunk, n_chunks*n), (int) screen_k);
+            ggml_tensor * resc    = ggml_dflash_rescore(ctx0, head, cur_mm, ids, (int) screen_chunk);
+            ggml_tensor * values  = ggml_view_2d(ctx0, resc, S, n, resc->nb[1], 0);
+            ggml_tensor * row_ids = ggml_view_2d(ctx0, resc, S, n, resc->nb[1], resc->nb[2]);
+            ggml_tensor * pos     = ggml_top_k(ctx0, values, (int) top_k);
+
+            screen_unary = ggml_reshape_2d(ctx0,
+                    ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, values, 1, S, n), pos), top_k, n);
+            screen_cand  = ggml_cast(ctx0, ggml_reshape_2d(ctx0,
+                    ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, row_ids, 1, S, n), pos), top_k, n), GGML_TYPE_I32);
+            cur = values;
+        } else {
+            cur = ggml_mul_mat(ctx0, head, cur_mm);
+            if (output_s) {
+                cur = ggml_mul(ctx0, cur, output_s);
+            }
         }
     } else {
         cur = build_lora_mm(output, cur, output_s);
@@ -1410,7 +1454,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens, merged ? n_blk : 0, merged ? 1 : 0);
+        build_dflash2_selector(*this, model, inp_tokens, merged ? n_blk : 0, merged ? 1 : 0, screen_cand, screen_unary);
         if (merged) {
             // llama_context copies one nextn row per ubatch token: the context rows read as zeros, the
             // block's lattice keeps its rows at the block's batch indices

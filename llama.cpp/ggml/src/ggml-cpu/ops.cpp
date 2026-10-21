@@ -12285,6 +12285,49 @@ void ggml_compute_forward_dflash2_conv(
     }
 }
 
+// ggml_compute_forward_dflash_rescore: the reference for the CUDA rescore (ggml_dflash_rescore)
+
+void ggml_compute_forward_dflash_rescore(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * a = dst->src[0];
+    const ggml_tensor * b = dst->src[1];
+    const ggml_tensor * c = dst->src[2];
+
+    const int32_t chunk    = ggml_get_op_params_i32(dst, 0);
+    const int64_t K        = a->ne[0];
+    const int64_t R        = a->ne[1];
+    const int64_t n        = b->ne[1];
+    const int64_t kc       = c->ne[0];
+    const int64_t n_chunks = c->ne[1] / n;
+    const int64_t S        = kc * n_chunks;
+
+    ggml_to_float_t const to_float = ggml_get_type_traits(a->type)->to_float;
+    GGML_ASSERT(to_float != nullptr);
+
+    std::vector<float> row(K);
+    float * out = (float *) dst->data;
+
+    for (int64_t i = params->ith; i < S*n; i += params->nth) {
+        const int64_t r = i / S;
+        const int64_t s = i % S;
+        const int64_t q = s / kc;
+        const int32_t offset = ((const int32_t *) c->data)[(s % kc) + (q + r*n_chunks)*kc];
+        const int64_t id = q*chunk + offset;
+
+        float value = -INFINITY;
+        if (offset >= 0 && offset < chunk && id < R) {
+            to_float((const char *) a->data + id*a->nb[1], row.data(), K);
+            const float * x = (const float *) ((const char *) b->data + r*b->nb[1]);
+            float sum = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                sum += row[k]*x[k];
+            }
+            value = sum;
+        }
+        out[s + r*S]       = value;
+        out[S*n + s + r*S] = (float) (id < R ? id : 0);
+    }
+}
+
 // ggml_compute_forward_dflash_walk: the reference for the CUDA walk (common/speculative.cpp host walk)
 
 void ggml_compute_forward_dflash_walk(const ggml_compute_params * params, ggml_tensor * dst) {

@@ -1117,9 +1117,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "DFLASH_WALK",
+    "DFLASH_RESCORE",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1235,9 +1236,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "dflash_walk(x)",
+    "dflash_rescore(a,b,c)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5450,6 +5452,34 @@ struct ggml_tensor * ggml_dflash_walk(
 
     result->op     = GGML_OP_DFLASH_WALK;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_dflash_rescore
+
+struct ggml_tensor * ggml_dflash_rescore(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        int                   chunk) {
+    GGML_ASSERT(ggml_is_quantized(a->type) && a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && b->ne[0] == a->ne[0] && b->ne[2] == 1 && b->ne[3] == 1);
+    GGML_ASSERT(c->type == GGML_TYPE_I32 && ggml_is_contiguous(c) && c->ne[2] == 1 && c->ne[3] == 1);
+    GGML_ASSERT(chunk > 0 && c->ne[1] % b->ne[1] == 0);
+    const int64_t n_chunks = c->ne[1] / b->ne[1];
+    GGML_ASSERT(n_chunks * chunk <= a->ne[1] + chunk - 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c->ne[0]*n_chunks, b->ne[1], 2);
+
+    const int32_t params[] = { chunk };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DFLASH_RESCORE;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
 
     return result;
 }

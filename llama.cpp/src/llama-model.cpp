@@ -2161,6 +2161,69 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+    // DFlash2 drafter head screen (src/models/dflash.cpp): a verbatim copy of the leading
+    // LLAMA_DFLASH_SCREEN_GROUPS (default 12) blocks of every row of a PQ2_0 output head, contiguous, so a
+    // drafter can score all rows on those blocks and rescore only a shortlist on the full row. The blocks
+    // are copied byte for byte; the head itself is unchanged. GB10 by default; LLAMA_DFLASH_HEAD_SCREEN=0
+    // makes no copy, =1 makes it on any CUDA device.
+    if (output != nullptr && output->type == GGML_TYPE_PQ2_0 && output->buffer != nullptr &&
+            ggml_backend_buffer_is_host(output->buffer) == false && output->ne[2] == 1 && output->ne[3] == 1 &&
+            ggml_is_contiguous(output)) {
+        const char * env    = getenv("LLAMA_DFLASH_HEAD_SCREEN");
+        const char * genv   = getenv("LLAMA_DFLASH_SCREEN_GROUPS");
+        const int    groups = genv ? atoi(genv) : 12;
+        bool gb10 = false;
+        for (const auto & d : devices) {
+            const char * desc = d.dev ? ggml_backend_dev_description(d.dev) : nullptr;
+            gb10 = gb10 || (desc && strstr(desc, "GB10") != nullptr);
+        }
+        const bool want = env ? atoi(env) != 0 : gb10;
+        const int64_t K  = output->ne[0];
+        const int64_t R  = output->ne[1];
+        const int64_t qk = ggml_blck_size(GGML_TYPE_PQ2_0);
+        const int64_t Ks = (int64_t) groups*qk;
+        if (want && groups > 0 && Ks % 256 == 0 && Ks < K && K % qk == 0) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(output->buffer);
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx { ggml_init(params) };
+            ggml_tensor * screen = ctx ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_PQ2_0, Ks, R) : nullptr;
+            ggml_backend_buffer_ptr buffer { screen ? ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) : nullptr };
+            if (screen != nullptr && buffer) {
+                ggml_set_name(screen, "output.screen");
+                ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                const size_t  row_full = output->nb[1];
+                const size_t  row_part = screen->nb[1];
+                const int64_t step     = 8192;
+                std::vector<uint8_t> full(row_full*step);
+                std::vector<uint8_t> part(row_part*step);
+                for (int64_t r0 = 0; r0 < R; r0 += step) {
+                    const int64_t nr = std::min(step, R - r0);
+                    ggml_backend_tensor_get(output, full.data(), r0*row_full, nr*row_full);
+                    for (int64_t r = 0; r < nr; ++r) {
+                        memcpy(part.data() + r*row_part, full.data() + r*row_full, row_part);
+                    }
+                    ggml_backend_tensor_set(screen, part.data(), r0*row_part, nr*row_part);
+                }
+                size_t dl = 0;
+                if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA")) {
+                    using register_fn_t = size_t (*)(const ggml_tensor *);
+                    auto * register_fn = (register_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_register_decode_layout");
+                    dl = register_fn ? register_fn(screen) : 0;
+                }
+                output_screen = screen;
+                std::vector<ggml_backend_buffer_ptr> buffers;
+                buffers.emplace_back(std::move(buffer));
+                pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+                LLAMA_LOG_INFO("%s: DFlash2 head screen copy: %d of %lld blocks per row, %lld rows, %.2f MiB (+%.2f MiB decode layout)\n",
+                        __func__, groups, (long long) (K/qk), (long long) R, ggml_nbytes(screen)/1024.0/1024.0, dl/1024.0/1024.0);
+            }
+        }
+    }
+
     // Attention decode: replace three TM allocations with one verbatim QG|K|V
     // copy. The original GGUF tensors and all prefill paths are unchanged.
     if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA")) {
