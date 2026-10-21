@@ -381,7 +381,7 @@ void LlamaEngine::prefill_prompt(const llama_tokens &inp) {
 }
 
 Emit LlamaEngine::emit_logits(int idx) const {
-    llama_synchronize(ctx_tgt_);
+    // Both logits getters synchronize before returning their output buffers.
     if (logits_topk_) {
         const int32_t *ids = nullptr;
         const float *top = nullptr;
