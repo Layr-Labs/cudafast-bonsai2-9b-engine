@@ -343,7 +343,7 @@ static void gdn_half_prefill_launch(
         ids,row_stride,lazy,zero_row,zero_scale,zero_bias);
     const gdn_half_c16::Frame frame{q,k,v,g,beta,bias,a,prefix,PACKED,sq1,sq2,sv1,sv2};
     const ggml_cuda_kernel_launch_params prep(dim3(32,prefix/16),dim3(32,4),0,stream);
-    ggml_cuda_kernel_launch(gdn_half_prefill::prepare_packed<false>,prep,frame,coefficients.ptr,packed.ptr);
+    ggml_cuda_kernel_launch(gdn_half_prefill::prepare_packed<false,true>,prep,frame,coefficients.ptr,packed.ptr);
     const ggml_cuda_kernel_launch_params carry(dim3(32,8),dim3(32,4),0,stream);
     if(fused_initial) {
         static bool logged=false;
