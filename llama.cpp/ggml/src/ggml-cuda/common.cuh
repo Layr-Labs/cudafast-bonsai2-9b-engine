@@ -1710,6 +1710,12 @@ struct ggml_backend_cuda_context {
     ggml_cuda_gdn_gather_context gdn_gather_context;
     ggml_cuda_fwht_q8_context    fwht_q8_context;
 
+    void * head_cert_storage = nullptr; // fixed for backend lifetime; captured graphs retain its address
+    const ggml_tensor * head_cert_producer = nullptr;
+    const void * head_cert_logits = nullptr;
+    bool head_cert_emitted = false;
+
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {

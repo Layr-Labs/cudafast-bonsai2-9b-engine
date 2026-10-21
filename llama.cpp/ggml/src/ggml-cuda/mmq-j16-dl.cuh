@@ -791,13 +791,14 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
 // Same arguments as mul_mat_q_*_j16_dl (TM copy; mode 0 stream-k or mode 1 contiguous whole tiles), dynamic
 // shared memory ggml_cuda_dl_ring_smem<FMT, SPS>(S). Stage layout: weights of the SPS steps, then SPS x 16
 // activation blocks.
-template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false>
+template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false, bool CERT = false>
 __launch_bounds__(16*32, MIN_CTAS)
 static __global__ void mul_mat_q_j16_dl_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
         const int nrows_x, const int nkb, const int ncols_y, const int stride_col_dst, const int ncols_dst,
-        const int mode, float * dst_hi, const int nrows_lo) {
+        const int mode, float * dst_hi, const int nrows_lo, uint64_t * cert = nullptr) {
     static_assert(!JIT || FMT == GGML_CUDA_DL_FMT_PTQ1S, "JIT operands require signed PTQ1");
+    __shared__ uint64_t cert_red[CERT ? 16 : 1][129];
     using F = ggml_cuda_dl_fmt<FMT>;
     constexpr int GB = F::GB;
     constexpr int G  = F::G;
@@ -881,6 +882,7 @@ static __global__ void mul_mat_q_j16_dl_ring(
                         } else {
                             ggml_cuda_pq2_j16_store<1>(sum, dst_hi, row - nrows_lo, stride_col_dst, ncols_dst - 1);
                         }
+                        if constexpr (CERT) ggml_cuda_head_cert_store(sum, cert, cert_red, it, nty);
                         st = 0;
                         it += tile_inc;
                     } else {
@@ -984,10 +986,10 @@ static void ggml_cuda_mmq_dl_launch(Kernel kernel, bool * attr_set, const mmq_ar
         (int) (args.dst_hi ? args.nrows_lo : args.nrows_x));
 }
 
-template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false>
+template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false, bool CERT = false>
 static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
                                          const int nkb, float * tmp_fixup, cudaStream_t stream) {
-    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS, JIT, MIN_CTAS, PURE>;
+    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS, JIT, MIN_CTAS, PURE, CERT>;
     constexpr size_t smem = ggml_cuda_dl_ring_smem<FMT, SPS>(S);
     static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
     const int device = ggml_cuda_get_device();
@@ -999,7 +1001,7 @@ static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_
     ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, 16, 1), smem, stream),
         (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
         (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst_hi ? args.dst_hi : args.dst,
-        (int) (args.dst_hi ? args.nrows_lo : args.nrows_x));
+        (int) (args.dst_hi ? args.nrows_lo : args.nrows_x), CERT ? args.head_cert : nullptr);
 }
 
 static int ggml_cuda_dl_env_int(const char * name, const int dflt) {
@@ -1067,7 +1069,13 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
             if (ggml_cuda_dl_ptq_ffn_jit_use(args, e, grid, nsm)) {
                 ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2, true, 2, true>(args, e, grid, 1, nkb, tmp_fixup, stream);
             } else if (tiling && ntiles > 4*nsm) {
-                ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);
+                if (args.head_cert && args.nrows_x == 248320 && args.ncols_x == 4096 &&
+                    args.ncols_dst == 16 && args.ncols_y == 16 && !args.dst_hi && !args.add_res) {
+                    ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2, false, 1, false, true>(args, e, grid, 1, nkb, tmp_fixup, stream);
+                    if (args.head_cert_emitted) *args.head_cert_emitted = true;
+                } else {
+                    ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);
+                }
             } else {
                 ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
             }

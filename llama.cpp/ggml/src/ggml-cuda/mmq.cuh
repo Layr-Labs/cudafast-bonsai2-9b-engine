@@ -1624,6 +1624,8 @@ struct mmq_args {
     bool          d1_y = false;
     // Prefill GLU only: store the fused SwiGLU as F16 when the D1 plane consumer runs (GGML_CUDA_PREFILL_GLU_F16).
     bool          glu_f16 = false;
+    uint64_t * head_cert = nullptr;
+    bool * head_cert_emitted = nullptr;
 };
 
 // GB10 prefill: the row-interleaved copy of a layer's ffn_gate/ffn_up PQ2_0 weights (made at model load): in every
@@ -1690,6 +1692,7 @@ static void mmq_launch_kernel(const int cc, Kernel kernel, const dim3 & block_nu
 }
 
 #include "mmq-pq2-j16.cuh"
+#include "head-cert.cuh"
 #include "mmq-j16-dl.cuh"
 #include "mmq-j16-glu.cuh"
 #include "mmq-pq2-j128.cuh"

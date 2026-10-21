@@ -247,6 +247,11 @@ void ggml_cuda_mul_mat_q(
             ne03, ne13, s03, s13, s3,
             ne1, add_res, add_dst};
         args.d1_y=ggml_cuda_mmq_d1_input(ctx,src1,external_q8,quantize_external);
+        if (ctx.curr_stream_no == 0 && ctx.head_cert_producer == dst && ctx.head_cert_logits == dst->data &&
+            !ids && !gate && !norm_weight && !add_res && ctx.head_cert_storage) {
+            args.head_cert = (uint64_t *) ctx.head_cert_storage;
+            args.head_cert_emitted = &ctx.head_cert_emitted;
+        }
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }

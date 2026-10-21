@@ -725,6 +725,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
     // pool blocks held across a graph go back to the pool before the pools are destroyed below
     fwht_q8_context.reset();
+    if (head_cert_storage) CUDA_CHECK(cudaFree(head_cert_storage));
 
     ggml_cuda_upload_state_free(this);
 
@@ -7842,6 +7843,30 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_wait_buffer_clears(cuda_ctx->device, cuda_ctx->stream());
+
+    cuda_ctx->head_cert_producer = nullptr;
+    cuda_ctx->head_cert_logits = nullptr;
+    cuda_ctx->head_cert_emitted = false;
+    if (ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_DGX_SPARK) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * sel = cgraph->nodes[i];
+            const ggml_tensor * mm = sel->src[0];
+            if (sel->op != GGML_OP_TOP_K || sel->ne[0] != 8 || !mm || mm->op != GGML_OP_MUL_MAT ||
+                mm->type != GGML_TYPE_F32 || mm->ne[0] != 248320 || mm->ne[1] != 16 ||
+                mm->ne[2] != 1 || mm->ne[3] != 1 || !ggml_is_contiguous(mm) ||
+                mm->src[0]->type != GGML_TYPE_PQ2_0 || mm->src[0]->ne[0] != 4096 ||
+                mm->src[1]->ne[1] != 16) continue;
+            bool found = false;
+            for (int j = 0; j < i; ++j) found |= cgraph->nodes[j] == mm;
+            if (!found) continue;
+            if (!cuda_ctx->head_cert_storage) {
+                CUDA_CHECK(cudaMalloc(&cuda_ctx->head_cert_storage, size_t(16)*1940*8*sizeof(uint64_t)));
+            }
+            cuda_ctx->head_cert_producer = mm;
+            cuda_ctx->head_cert_logits = mm->data;
+            break;
+        }
+    }
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

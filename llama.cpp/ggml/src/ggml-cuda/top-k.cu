@@ -1,6 +1,7 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 #include "top-k-select.cuh"
+#include "head-cert.cuh"
 
 #include <cstdlib>
 
@@ -87,9 +88,17 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         if (cc == GGML_CUDA_CC_DGX_SPARK) {
             // topk_select_launch with programmatic stream serialization (both passes wait for their predecessor)
             const int nchunks = topk_select_nchunks(ncols);
+            if (ctx.curr_stream_no == 0 && ctx.head_cert_producer == src0 &&
+                ctx.head_cert_logits == src0->data && ctx.head_cert_emitted &&
+                ncols == 248320 && nrows == 16 && k == 8) {
+                ggml_cuda_kernel_launch(topk_tile_partial,
+                    ggml_cuda_kernel_launch_params(dim3(nchunks, nrows, 1), dim3(32), 0, stream),
+                    scratch.get(), ncols / 128, (const uint64_t *) ctx.head_cert_storage);
+            } else {
             ggml_cuda_kernel_launch(topk_select_partial,
                 ggml_cuda_kernel_launch_params(dim3(nchunks, nrows, 1), dim3(TOPK_SELECT_NT), 0, stream),
                 src0_d, scratch.get(), ncols, k);
+            }
             if (nchunks <= TOPK_SELECT_MERGE_WARP) {
                 ggml_cuda_kernel_launch(topk_select_merge_warp,
                     ggml_cuda_kernel_launch_params(dim3(nrows, 1, 1), dim3(32), 0, stream),
