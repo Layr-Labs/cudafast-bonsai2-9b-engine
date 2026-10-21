@@ -1723,7 +1723,14 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         if (cc == GGML_CUDA_CC_DGX_SPARK) {
             const ggml_cuda_dl_entry * e = ggml_cuda_dl_find(args.x);
             if (e != nullptr && ggml_cuda_mmq_dl_supported(args, *e)) {
-                const int grid = ggml_cuda_mmq_pq2_j16_grid(args, nsm);
+                int grid = ggml_cuda_mmq_pq2_j16_grid(args, nsm);
+                if constexpr (type == GGML_TYPE_Q8_0) {
+                    // Whole K per TM64 row tile: avoid partial stores and the
+                    // follow-up reduction for the two Q8 down projections.
+                    if (args.nrows_x == 4096 && ggml_cuda_dl_q8_tm64_use(args, *e)) {
+                        grid = (int) (args.nrows_x/128);
+                    }
+                }
                 // A stacked gate|up request for this weight (ggml_cuda_try_decode_gu_stack): one pure-tiling launch over
                 // the 2F-row copy, rows [F, 2F) stored to the up output. Each tile is one full-K segment of one CTA in
                 // both forms, so every value is the one the two launches store.
