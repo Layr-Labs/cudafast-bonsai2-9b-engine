@@ -1234,7 +1234,7 @@ template<int DV, int ncols> struct mma_tile_sizes {
 };
 #endif // defined(TURING_MMA_AVAILABLE)
 
-template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, ggml_type type_KV>
+template<int DKQ, int DV, int ncols1, int ncols2, int nwarps, bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, ggml_type type_KV, bool half_partials = false>
 static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float2 * const __restrict__ Q_f2,
         const half2  * const __restrict__ K_h2,
@@ -1280,6 +1280,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr int  nstages         = ggml_cuda_fattn_mma_get_nstages       (DKQ, DV, ncols1, ncols2, type_KV);
+
+#if defined(AMPERE_MMA_AVAILABLE)
+    static_assert(!half_partials || (DKQ == 256 && DV == 256 && ncols1 == 16 && ncols2 == 4 &&
+        np == 1 && is_fixup && !needs_fixup && type_KV == GGML_TYPE_F16 &&
+        std::is_same_v<decltype(T_C_VKQ::x), half2[T_C_VKQ::ne]>), "bad half partial producer");
+#endif
 
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
@@ -1750,7 +1756,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         if (np == 1 || threadIdx.y % np == 0) {
             // The first 2*2*gridDim.x*ncols floats in dstk_fixup are for storing max. values and row sums.
             // The values after that are for the partial results of the individual blocks.
-            float2 * dstk_fixup_data = dstk_fixup + gridDim.x*(2*ncols) + blockIdx.x*(ncols*(DV/2));
+            // Only the nonterminal stream-K payload changes layout; metadata stays float2.
+            using T_partial = std::conditional_t<half_partials, half2, float2>;
+            T_partial * dstk_fixup_data = ((T_partial *) (dstk_fixup + gridDim.x*(2*ncols))) + blockIdx.x*(ncols*(DV/2));
 
 #pragma unroll
             for (int stride_k : {warp_size, warp_size/2, warp_size/4, warp_size/8}) {
@@ -1800,7 +1808,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                         }
 
                         if (is_fixup) {
-                            dstk_fixup_data[jc_dst*(DV/2) + k00 + k] = dstk_val;
+                            if constexpr (half_partials) {
+                                // np == 1: the old scratch value is 0 + widen(tile_Q)*1.
+                                // Transport the source bits, and repeat that expression in the reader.
+                                dstk_fixup_data[jc_dst*(DV/2) + k00 + k] = tile_Q[jc_tile_K*tile_stride + k];
+                            } else {
+                                dstk_fixup_data[jc_dst*(DV/2) + k00 + k] = dstk_val;
+                            }
                         } else {
                             dstk[((jt*ncols1 + j_dst)*ne02 + c_dst)*(DV/2) + k00 + k] = dstk_val;
                         }
@@ -1821,7 +1835,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, ggml_type type_KV>
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, ggml_type type_KV, bool half_partials = false>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_ext_f16(
         const char * Q_ptr,
@@ -1847,6 +1861,12 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
     ggml_cuda_pdl_sync(); // TODO optimize placement
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
+#if !defined(AMPERE_MMA_AVAILABLE)
+    if constexpr (half_partials) {
+        NO_DEVICE_CODE;
+        return;
+    }
+#endif
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
     const char * GGML_CUDA_RESTRICT V        = V_ptr;
@@ -1997,7 +2017,7 @@ static __global__ void flash_attn_ext_f16(
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
-    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
+    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV, half_partials>
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else
@@ -2090,9 +2110,37 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #endif // !defined(GGML_USE_MUSA)
     }
 
+    fattn_kernel_t half_partials_kernel = nullptr;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (DKQ == 256 && DV == 256 && ncols1 == 16 && ncols2 == 4 && type_KV == GGML_TYPE_F16) {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const ggml_tensor * mask = dst->src[3];
+        const char * value = getenv("GGML_CUDA_FATTN_HALF_PARTIALS");
+        float max_bias;
+        memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+        if ((!value || strcmp(value, "0") != 0) && cc == GGML_CUDA_CC_DGX_SPARK && ampere_mma_available(cc) &&
+                nthreads == 128 && warp_size_host == 32 && cols_per_warp == 16 &&
+                Q->ne[1] == 16 && Q->ne[2] == 16 && Q->ne[3] == 1 &&
+                K->ne[1] >= 512 && K->ne[1] <= 1024 && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+                K->ne[2] == 4 && K->ne[3] == 1 && V->ne[2] == 4 && V->ne[3] == 1 &&
+                K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+                mask && mask->ne[2] == 1 && mask->ne[3] == 1 && max_bias == 0.0f && logit_softcap == 0.0f) {
+            // One extra producer specialization. The original above remains the occupancy authority.
+            half_partials_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, type_KV, true>;
+            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
+            if (!shared_memory_limit_raised[id]) {
+                CUDA_CHECK(cudaFuncSetAttribute(half_partials_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+                shared_memory_limit_raised[id] = true;
+            }
+        }
+    }
+#endif
+
     constexpr bool need_f16_KV = type_KV == GGML_TYPE_F16; // quantized variants read the cache in place
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, need_f16_KV, need_f16_KV, true, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, need_f16_KV, need_f16_KV, true, warp_size_host, half_partials_kernel);
 }
 
 

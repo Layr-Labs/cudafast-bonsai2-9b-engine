@@ -718,7 +718,17 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
-template<int D, int ncols1, int ncols2> // D == head size
+// Match the np == 1 producer epilogue after transporting its unmodified half bits.
+// Keep the multiply/add: a bare widening need not have the same signed-zero/NaN behavior.
+static __device__ __forceinline__ float fattn_half_partial_to_float(const half value) {
+    float dst_val = 0.0f;
+    const float dst_val_add = __half2float(value);
+    const float KQ_crs = 1.0f;
+    dst_val += dst_val_add*KQ_crs;
+    return dst_val;
+}
+
+template<int D, int ncols1, int ncols2, bool half_partials = false> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
         float * dst_ptr,
@@ -778,7 +788,13 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
 
     // Combine with all previous blocks in this tile.
     for (int bidx = b_last - 1; bidx >= b_first; --bidx) {
-        const float dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
+        float dst_add;
+        if constexpr (half_partials) {
+            static_assert(D == 256 && ncols1 == 16 && ncols2 == 4, "bad half partial shape");
+            dst_add = fattn_half_partial_to_float(((const half *) dst_fixup_data)[bidx*ncols*D + jc*D + tid]);
+        } else {
+            dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
+        }
 
         const float2 tmp = dst_fixup[(nblocks_stream_k + bidx)*ncols + jc];
 
@@ -972,7 +988,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const fattn_kernel_t half_partials_kernel = nullptr
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1110,6 +1127,7 @@ void launch_fattn(
 
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
+    // Always query the original F32-scratch producer. Its occupancy defines the partition list.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
@@ -1117,6 +1135,7 @@ void launch_fattn(
     const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
+    bool half_partials = false;
     if (stream_k) {
         // For short contexts it can be faster to have the SMs work on whole tiles because this lets us skip the fixup.
         const int max_blocks = max_blocks_per_sm*nsm;
@@ -1146,7 +1165,13 @@ void launch_fattn(
         }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
-            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+            // A packed producer is supplied only for the np == 1 target decode shape.
+            // The general fixup and unsplit launches must retain their original F32 layout.
+            if constexpr (DV == 256 && ncols1 == 16 && ncols2 == 4) {
+                half_partials = half_partials_kernel && blocks_num.x % ntiles_dst == 0;
+            }
+            // Two float2 metadata planes, followed by either half or float payloads.
+            dst_tmp_meta.alloc(size_t(blocks_num.x) * ncols * (2 + (half_partials ? DV/4 : DV/2)));
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
@@ -1210,6 +1235,11 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+    // Select storage only after computing the unchanged occupancy-derived launch geometry.
+    if (half_partials) {
+        fattn_kernel = half_partials_kernel;
+    }
+
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
         ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
@@ -1242,7 +1272,13 @@ void launch_fattn(
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
-            ggml_cuda_kernel_launch(flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>, launch_params,
+            auto fixup_kernel = flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>;
+            if constexpr (DV == 256 && ncols1 == 16 && ncols2 == 4) {
+                if (half_partials) {
+                    fixup_kernel = flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2, true>;
+                }
+            }
+            ggml_cuda_kernel_launch(fixup_kernel, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
                  gqa_ratio, bpt, fd0, fd1, fd2);
