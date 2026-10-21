@@ -785,9 +785,23 @@ size_t ggml_cuda_dl_register(const void * src, const int64_t nrows, const int64_
             CUDA_CHECK(cudaStreamSynchronize(stream));
             CUDA_CHECK(cudaFree(fail_d));
             if (fail == 0) {
+                char * paired = nullptr;
+                if (nrows == 248320 && ncols == 4096) {
+                    if (cudaMalloc(&paired, bytes_p) == cudaSuccess) {
+                        const int64_t words = int64_t(bytes_p/sizeof(uint32_t));
+                        ggml_cuda_dl_ptq_pair_tail_kernel<<<unsigned((words + 255)/256), 256, 0, stream>>>(
+                            (const uint32_t *) dl, (uint32_t *) paired, words);
+                        CUDA_CHECK(cudaGetLastError());
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                    } else {
+                        (void) cudaGetLastError();
+                    }
+                }
                 CUDA_CHECK(cudaStreamDestroy(stream));
-                m.emplace(src, ggml_cuda_dl_entry{ (const char *) src, dl, nrows, ncols, type, GGML_TYPE_PTQ1_0 });
-                return bytes_p;
+                ggml_cuda_dl_entry entry{ (const char *) src, dl, nrows, ncols, type, GGML_TYPE_PTQ1_0 };
+                entry.dl_ptq_pair_tail = paired;
+                m.emplace(src, std::move(entry));
+                return bytes_p + (paired != nullptr ? bytes_p : 0);
             }
             // a block with a code 3 (+2d) or one that does not round-trip: keep the PQ2_0 groups
             GGML_LOG_WARN("%s: PQ2_0 weight %p has a block PTQ1_0 cannot hold; it keeps PQ2_0 decode groups\n", __func__, src);
@@ -1107,6 +1121,9 @@ void ggml_cuda_dl_unregister_range(const void * base, const size_t size) {
         const char * p = (const char *) it->first;
         if (p >= (const char *) base && p < (const char *) base + size) {
             if (!it->second.dl_owner) { CUDA_CHECK(cudaFree(it->second.dl)); }
+            if (it->second.dl_ptq_pair_tail != nullptr) {
+                CUDA_CHECK(cudaFree(it->second.dl_ptq_pair_tail));
+            }
             if (it->second.dl_tm64 != nullptr) {
                 CUDA_CHECK(cudaFree(it->second.dl_tm64));
             }

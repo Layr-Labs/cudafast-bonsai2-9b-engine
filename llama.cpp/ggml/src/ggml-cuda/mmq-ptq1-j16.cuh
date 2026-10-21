@@ -51,8 +51,10 @@ struct ggml_cuda_ptq1_j16_stage {
     int      ya[4][2][2]; // [sub-block][column g + 8h][int c, int 4 + c]
     float4   yd[2];
     uint32_t wa, wb, w6;
+    uint32_t scale_pair; // initialized only by PAIR_TAIL ring loads
 };
 
+template <bool PAIR_TAIL = false>
 static __device__ __forceinline__ void ggml_cuda_ptq1_j16_load(
         ggml_cuda_ptq1_j16_stage & st, const char * __restrict__ xr, const char * yb, const int c) {
 #pragma unroll
@@ -71,7 +73,13 @@ static __device__ __forceinline__ void ggml_cuda_ptq1_j16_load(
     const uint32_t * xw = (const uint32_t *) xr;
     st.wa = xw[c];
     st.wb = xw[4 + (c & 1)];
-    st.w6 = xw[6];
+    if constexpr (PAIR_TAIL) {
+        const uint32_t * tile = xw - 7*(int(threadIdx.x)/4);
+        st.w6 = tile[7*((int(threadIdx.x)/4)/2) + 6] >> (16*((int(threadIdx.x)/4)&1));
+        st.scale_pair = tile[7*(4+c) + 6];
+    } else {
+        st.w6 = xw[6];
+    }
 }
 
 // B fragments (b[s][0] = logical int c, b[s][1] = logical int 4 + c of sub-block s) of weight row g, as trits.
@@ -125,12 +133,18 @@ static __device__ __forceinline__ void ggml_cuda_ptq1_j16_decode(uint32_t (&b)[4
 // SGN: the trits {0, 1, 2} become signed bytes {-1, 0, 1} (per byte (t + 0x7F) ^ 0x80, no carry since t <= 2) and
 // one s8.s8 mma accumulates sum(a*(t - 1)) onto MAGIC, the integer the base forms as MAGIC - sum(a) + sum(a*t)
 // with two mma; int32 accumulation is exact, so C and every float below are the same bits.
-template <bool SGN = false>
+template <bool SGN = false, bool PAIR_TAIL = false>
 static __device__ __forceinline__ void ggml_cuda_ptq1_j16_compute(float (&sum)[1][4], const ggml_cuda_ptq1_j16_stage & st, const int c) {
     // dA of the C rows 2c and 2c+1 of the 8-row tile: the scale of row r was loaded by lanes 4r..4r+3.
-    const int xd   = (int) (st.w6 >> 16);
-    const int d_lo = __shfl_sync(0xFFFFFFFF, xd, 8*c + 0);
-    const int d_hi = __shfl_sync(0xFFFFFFFF, xd, 8*c + 4);
+    int d_lo, d_hi;
+    if constexpr (PAIR_TAIL) {
+        d_lo = int(st.scale_pair & 0xffffu);
+        d_hi = int(st.scale_pair >> 16);
+    } else {
+        const int xd = (int) (st.w6 >> 16);
+        d_lo = __shfl_sync(0xFFFFFFFF, xd, 8*c + 0);
+        d_hi = __shfl_sync(0xFFFFFFFF, xd, 8*c + 4);
+    }
     const float dA[2] = {
         __half2float(__ushort_as_half((unsigned short) d_lo)),
         __half2float(__ushort_as_half((unsigned short) d_hi)),
