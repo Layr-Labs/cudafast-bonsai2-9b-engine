@@ -5835,6 +5835,60 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Preserve both graph outputs while gathering selected values in the merge.
+// The logits reshape may already precede TOP_K or be the next no-op node.
+static int ggml_cuda_try_topk_values(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, const int i) {
+    if (ctx.curr_stream_no != 0 || !ctx.stream_context().concurrent_events.empty() ||
+            i + 1 >= graph->n_nodes || graph->nodes[i]->op != GGML_OP_TOP_K) {
+        return 0;
+    }
+    ggml_tensor * ids = graph->nodes[i];
+    const int j = i + (graph->nodes[i + 1]->op == GGML_OP_RESHAPE ? 2 : 1);
+    if (j >= graph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * values = graph->nodes[j];
+    const ggml_tensor * src = ids->src[0];
+    const ggml_tensor * view = values->src[0];
+    if (values->op != GGML_OP_GET_ROWS || values->src[1] != ids || !src || !view ||
+            src->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || values->type != GGML_TYPE_F32 ||
+            view->type != GGML_TYPE_F32 || view->op != GGML_OP_RESHAPE || view->src[0] != src || view->data != src->data ||
+            (j == i + 2 && graph->nodes[i + 1] != view) ||
+            src->ne[2] != 1 || src->ne[3] != 1 || ids->ne[1] != src->ne[1] || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            view->ne[0] != 1 || view->ne[1] != src->ne[0] || view->ne[2] != src->ne[1] || view->ne[3] != 1 ||
+            values->ne[0] != 1 || values->ne[1] != ids->ne[0] || values->ne[2] != src->ne[1] || values->ne[3] != 1 ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(view) ||
+            !ggml_is_contiguous(ids) || !ggml_is_contiguous(values)) {
+        return 0;
+    }
+    const auto buft = ggml_backend_cuda_buffer_type(ctx.device);
+    const ggml_tensor * tensors[] = { src, view, ids, values };
+    for (const ggml_tensor * tensor : tensors) {
+        if (!tensor->data || (uintptr_t) tensor->data % sizeof(uint32_t) != 0 ||
+                !tensor->buffer || tensor->buffer->buft != buft) {
+            return 0;
+        }
+    }
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t x = (uintptr_t) a->data;
+        const uintptr_t y = (uintptr_t) b->data;
+        return x <= y ? y - x < ggml_nbytes(a) : x - y < ggml_nbytes(b);
+    };
+    if (overlaps(ids, values) || overlaps(ids, src) || overlaps(values, src)) {
+        return 0;
+    }
+    // The optional intervening reshape has no device execution or changed
+    // metadata. Keep it as an external view and validate both computed outputs.
+    const int nodes[] = { i, j };
+    const ggml_op ops[] = { GGML_OP_TOP_K, GGML_OP_GET_ROWS };
+    const int outputs[] = { i, j };
+    if (!ggml_can_fuse_subgraph_ext(graph, nodes, 2, ops, outputs, 2) ||
+            !ggml_cuda_check_fusion_memory_ranges(graph, i, j - i + 1, outputs, 2)) {
+        return 0;
+    }
+    return ggml_cuda_op_top_k_values(ctx, ids, values) ? j - i : 0;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5848,6 +5902,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }();
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_TOP_K) {
+        const int skip = ggml_cuda_try_topk_values(*cuda_ctx, cgraph, i);
+        if (skip != 0) {
+            return skip;
+        }
+    }
 
     // GB10 prefill: apply SWIGLU while quantizing the activation consumed by the
     // following low-bit down projection. This avoids materializing and rereading

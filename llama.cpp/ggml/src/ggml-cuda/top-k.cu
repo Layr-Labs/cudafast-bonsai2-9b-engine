@@ -51,6 +51,43 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
+bool ggml_cuda_op_top_k_values(ggml_backend_cuda_context & ctx, ggml_tensor * ids, ggml_tensor * values) {
+#if defined(GGML_CUDA_USE_CUB) && !defined(CUB_TOP_K_AVAILABLE)
+    const ggml_tensor * src = ids->src[0];
+    static const bool select_disabled = getenv("GGML_CUDA_TOPK_SELECT") != nullptr &&
+                                        atoi(getenv("GGML_CUDA_TOPK_SELECT")) == 0;
+    if (select_disabled || ggml_cuda_info().devices[ggml_cuda_get_device()].cc != GGML_CUDA_CC_DGX_SPARK ||
+            !topk_select_supported(src->ne[0], ggml_nrows(src), ids->ne[0]) || src->ne[0] <= 1024) {
+        return false;
+    }
+    const int ncols = (int) src->ne[0];
+    const int nrows = (int) ggml_nrows(src);
+    const int k = (int) ids->ne[0];
+    const int nchunks = topk_select_nchunks(ncols);
+    ggml_cuda_pool_alloc<uint64_t> scratch(ctx.pool(), topk_select_scratch_elems(ncols, nrows, k));
+    const float * src_d = (const float *) src->data;
+    int * ids_d = (int *) ids->data;
+    float * values_d = (float *) values->data;
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_kernel_launch(topk_select_partial,
+        ggml_cuda_kernel_launch_params(dim3(nchunks, nrows, 1), dim3(TOPK_SELECT_NT), 0, stream),
+        src_d, scratch.get(), ncols, k);
+    if (nchunks <= TOPK_SELECT_MERGE_WARP) {
+        ggml_cuda_kernel_launch(topk_select_merge_warp_values,
+            ggml_cuda_kernel_launch_params(dim3(nrows, 1, 1), dim3(32), 0, stream),
+            (const uint64_t *) scratch.get(), ids_d, nchunks, k, src_d, values_d, ncols);
+    } else {
+        ggml_cuda_kernel_launch(topk_select_merge_values,
+            ggml_cuda_kernel_launch_params(dim3(nrows, 1, 1), dim3(TOPK_SELECT_NT), 0, stream),
+            (const uint64_t *) scratch.get(), ids_d, nchunks, k, src_d, values_d, ncols);
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(ctx, ids, values);
+    return false;
+#endif
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;

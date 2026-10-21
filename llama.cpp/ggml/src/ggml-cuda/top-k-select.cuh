@@ -263,6 +263,69 @@ topk_select_merge(const uint64_t * part, int * dst, const int nchunks, const int
     }
 }
 
+// Same selection as the ID-only merges above. Read the original float's bits
+// rather than undoing its sort key, which canonicalizes signed zero.
+static __global__ void __launch_bounds__(32)
+topk_select_merge_warp_values(const uint64_t * part, int * dst, const int nchunks, const int k,
+                              const float * src, float * values, const int ncols) {
+    topk_select_grid_dependency();
+
+    const int        lane = threadIdx.x;
+    const int        row  = blockIdx.x;
+    const uint64_t * p    = part + (int64_t) row * nchunks * k;
+
+    int      pos  = 0;
+    uint64_t head = lane < nchunks ? p[lane * k] : 0;
+    int value_id = 0;
+    for (int r = 0; r < k; ++r) {
+        const uint64_t winner = topk_select_warp_max(head);
+        if (lane == r) {
+            value_id = (int) ~(uint32_t) winner;
+        }
+        if (r + 1 < k && head == winner) {
+            ++pos;
+            head = pos < k ? p[lane * k + pos] : 0;
+        }
+    }
+    // Gather all selected values together, avoiding one dependent load per rank.
+    if (lane < k) {
+        dst[(int64_t) row * k + lane] = value_id;
+        ((uint32_t *) values)[(int64_t) row * k + lane] = ((const uint32_t *) src)[(int64_t) row * ncols + value_id];
+    }
+}
+
+static __global__ void __launch_bounds__(TOPK_SELECT_NT)
+topk_select_merge_values(const uint64_t * part, int * dst, const int nchunks, const int k,
+                         const float * src, float * values, const int ncols) {
+    __shared__ uint64_t red[TOPK_SELECT_NT / 32 + 1];
+
+    topk_select_grid_dependency();
+
+    const int        row = blockIdx.x;
+    const int        n   = nchunks * k;
+    const uint64_t * p   = part + (int64_t) row * n;
+
+    uint64_t prev = 0;
+    int value_id = 0;
+    for (int r = 0; r < k; ++r) {
+        uint64_t best = 0;
+        for (int i = threadIdx.x; i < n; i += TOPK_SELECT_NT) {
+            const uint64_t c = p[i];
+            if ((r == 0 || c < prev) && c > best) {
+                best = c;
+            }
+        }
+        prev = topk_select_block_max(best, red);
+        if (threadIdx.x == r) {
+            value_id = (int) ~(uint32_t) prev;
+        }
+    }
+    if (threadIdx.x < k) {
+        dst[(int64_t) row * k + threadIdx.x] = value_id;
+        ((uint32_t *) values)[(int64_t) row * k + threadIdx.x] = ((const uint32_t *) src)[(int64_t) row * ncols + value_id];
+    }
+}
+
 static inline bool topk_select_supported(const int64_t ncols, const int64_t nrows, const int64_t k) {
     return k >= 1 && k <= TOPK_SELECT_MAX_K && ncols >= k && ncols <= INT32_MAX - TOPK_SELECT_CHUNK &&
            nrows >= 1 && nrows <= TOPK_SELECT_MAX_ROWS;
