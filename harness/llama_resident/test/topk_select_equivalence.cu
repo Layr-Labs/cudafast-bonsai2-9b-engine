@@ -185,7 +185,7 @@ int main() {
     struct Case { int ncols, nrows, k; };
     const Case cases[] = {
         { 248320, 16, 16 }, { 248320, 1, 16 }, { 248320, 15, 16 }, { 1025, 3, 16 }, { 8192, 4, 32 },
-        { 8193, 2, 32 },    { 24577, 5, 1 },   { 100003, 7, 5 },   { 49153, 2, 17 }, { 32, 3, 32 },
+        { 8192, 192, 32 }, { 8193, 2, 32 },    { 24577, 5, 1 },   { 100003, 7, 5 },   { 49153, 2, 17 }, { 32, 3, 32 },
         // verify top-8 rows, 32 / 33 / 37 chunks (warp merge limit), threshold path k edges
         { 248320, 16, 8 },  { 248320, 1, 8 },  { 248320, 4, 1 },   { 262144, 2, 16 }, { 262145, 2, 16 },
         { 300000, 3, 8 },   { 300000, 2, 32 }, { 65536, 3, 15 },   { 16384, 2, 16 },  { 16, 2, 16 },
@@ -239,8 +239,9 @@ int main() {
     }
 
     // CUDA graph capture and replay with changed inputs in the same buffers.
-    {
-        const int ncols = 248320, nrows = 16, k = 16;
+    // Keep the vocabulary path and cover the production screened-head shape.
+    for (const auto cs : { Case{248320, 16, 16}, Case{8192, 192, 32} }) {
+        const int ncols = cs.ncols, nrows = cs.nrows, k = cs.k;
         float * d_x;
         int * d_dst;
         uint64_t * d_scratch;
@@ -297,8 +298,8 @@ int main() {
         CHECK(cudaEventSynchronize(e1));
         float ms_c8 = 0.0f;
         CHECK(cudaEventElapsedTime(&ms_c8, e0, e1));
-        printf("info: 16x248320 k=16 select %.1f us/call, C8 select %.1f us/call (graph)\n",
-               1000.0f * ms_select / iters, 1000.0f * ms_c8 / iters);
+        printf("info: %dx%d k=%d select %.1f us/call, C8 select %.1f us/call (graph)\n",
+               nrows, ncols, k, 1000.0f * ms_select / iters, 1000.0f * ms_c8 / iters);
         cudaGraphExecDestroy(exec_c8);
         cudaGraphDestroy(graph_c8);
         cudaFree(d_scratch_c8);

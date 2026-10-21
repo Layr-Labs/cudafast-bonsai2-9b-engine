@@ -117,16 +117,28 @@ topk_select_partial(const float * src, uint64_t * part, const int ncols, const i
         best = v[j] > best ? v[j] : best;
     }
 
-    // Threshold path, k <= number of warps: the warps' maxima are distinct keys, so the smallest of them, T, has
-    // at least that many keys >= T and no key < T is in the top k. A zero T (a warp without real keys) keeps every
-    // real key. If at most TOPK_SELECT_COMPACT keys survive, warp 0 selects among them; otherwise the block
-    // selection below runs on the untouched registers.
-    if (k <= TOPK_SELECT_NT / 32) {
+    // Certified threshold: the smallest warp maximum has 16 keys at or above it.
+    // For k=17..32 use each warp's second distinct maximum instead, certifying 32.
+    // A warp with too few real keys contributes zero, retaining every real key.
+    // Compact only when every survivor fits; otherwise keep the exact block path.
+    if (k <= 2 * (TOPK_SELECT_NT / 32)) {
         const int lane = threadIdx.x % 32;
         const int warp = threadIdx.x / 32;
         const uint64_t wmax = topk_select_warp_max(best);
+        uint64_t threshold_key = wmax;
+        if (k > TOPK_SELECT_NT / 32) {
+            uint64_t second = best;
+            if (second == wmax) {
+                second = 0;
+#pragma unroll
+                for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
+                    second = v[j] < wmax && v[j] > second ? v[j] : second;
+                }
+            }
+            threshold_key = topk_select_warp_max(second);
+        }
         if (lane == 0) {
-            red[warp] = wmax;
+            red[warp] = threshold_key;
         }
         __syncthreads();
         if (threadIdx.x == 0) {
