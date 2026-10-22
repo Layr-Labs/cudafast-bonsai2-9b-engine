@@ -214,7 +214,10 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
 
     // All n_tokens (<= GDN_L8V_MAX_TOKENS) tokens' k rows (in the order lane n reads them: [r][n][m]), the block's
     // 16 v columns, g and beta are copied to shared memory up front (cp.async, overlapping the state load).
-    constexpr int TOK_SM = S_v + 16 + 4;
+    // Append a query row per token. It is produced once by cp.async while the
+    // state is loaded, then reused by all four V-column warps.
+    constexpr int Q_SM = S_v + 16 + 4;
+    constexpr int TOK_SM = Q_SM + S_v;
     __shared__ __align__(16) float stage[GDN_L8V_MAX_TOKENS][TOK_SM];
     {
         const int tid = threadIdx.y * 32 + lane;
@@ -234,6 +237,11 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
                 src = v_base + t * sv2 + (i - S_v);
             } else if (i < S_v + 18) {
                 src = (i == S_v + 16 ? g : beta) + gb_base + t * sb2;
+            } else if (i >= Q_SM) {
+                const int qi = i - Q_SM;
+                src = q + iq3 * sq3 + iq1 * sq1 + t * sq2 + qi;
+                const int r = qi / 32, n_ = qi % 8, m = (qi % 32) / 8;
+                dst_i = Q_SM + (r * 8 + n_) * 4 + m;
             } else {
                 continue;  // padding
             }
@@ -407,7 +415,6 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
         if (t >= n_tokens) {
             break;
         }
-        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * tok_sm = stage[t];
 
         const float beta_val = __shfl_sync(0xffffffff, beta_lane, t, 32);
@@ -420,11 +427,10 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
             kr[0*4 + r] = k4.x; kr[1*4 + r] = k4.y; kr[2*4 + r] = k4.z; kr[3*4 + r] = k4.w;
         }
 #pragma unroll
-        for (int m = 0; m < 4; ++m) {
-#pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                qr[m*4 + r] = q_t[r * 32 + n + 8 * m];
-            }
+        for (int r = 0; r < 4; ++r) {
+            const float4 q4 = *(const float4 *) &tok_sm[Q_SM + (r * 8 + n) * 4];
+            qr[0*4 + r] = q4.x; qr[1*4 + r] = q4.y;
+            qr[2*4 + r] = q4.z; qr[3*4 + r] = q4.w;
         }
         const float v_col = tok_sm[S_v + threadIdx.y * 4 + grp];
 
