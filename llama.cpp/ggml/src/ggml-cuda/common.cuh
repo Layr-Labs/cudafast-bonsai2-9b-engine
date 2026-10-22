@@ -1733,7 +1733,9 @@ struct ggml_backend_cuda_context {
     std::vector<const ggml_tensor *> glu_prefused;
     // the subset of glu_prefused whose SwiGLU sits in the gate operand as F16 (GGML_CUDA_PREFILL_GLU_F16)
     std::vector<const ggml_tensor *> glu_prefused_f16;
-    // Retained until the next graph evaluation/capture. Values describe producer-selected physical layouts only.
+    // Retained until the next graph evaluation/capture. Producer-selected physical layouts:
+    // 2 = F32 head-major permuted rows; 3 = canonical C16 half prefix + F32 token-major permuted final16.
+    // Both live in the L2 tensor's existing allocation; no cross-evaluation scratch owner is needed.
     std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, int>> gdn_prefill_qk_layout;
 
     // GB10 decode: a stacked gate|up request for the next launch_mul_mat_q of this gate weight (the up output and

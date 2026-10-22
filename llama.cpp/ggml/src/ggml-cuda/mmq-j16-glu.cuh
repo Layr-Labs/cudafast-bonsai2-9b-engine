@@ -3,7 +3,7 @@
 // gate/up rows give every lane both operands; the dot-product order is unchanged.
 #include "unary.cuh"
 
-template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false, bool ONE_TILE = false>
+template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false, bool ONE_TILE = false, bool PAIR_TAIL = true>
 __launch_bounds__(16*32, MIN_CTAS)
 static __global__ void mul_mat_q_ptq_gu_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
@@ -79,7 +79,7 @@ static __global__ void mul_mat_q_ptq_gu_ring(
                 const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
                 const char * sy = smem + s*SB + SPS*XB + j*YB + g*(int) sizeof(block_q8_1_mmq);
                 if constexpr (JIT) {
-                    ggml_cuda_ptq1_j16_jit_step(sum, sx, sy, c);
+                    ggml_cuda_ptq1_j16_jit_step<PAIR_TAIL>(sum, sx, sy, c);
                 } else {
                     ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
                 }

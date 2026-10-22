@@ -4718,6 +4718,9 @@ static bool ggml_cuda_view_channels(const ggml_tensor * v, const ggml_tensor * y
     return true;
 }
 
+static int ggml_cuda_try_gdn_cache_fusion(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy);
+
 // Only an internal L2 result with two full-head views consumed by one long l8 GDN may change layout.
 static const ggml_tensor * ggml_cuda_gdn_prefill_layout_consumer(const ggml_cgraph * cgraph, int i) {
     const ggml_tensor * l2 = cgraph->nodes[i];
@@ -5111,7 +5114,22 @@ static bool ggml_cuda_try_conv_front(ggml_backend_cuda_context & ctx, const ggml
         const ggml_tensor * gdn = mode == 2 ? ggml_cuda_gdn_prefill_layout_consumer(cgraph, l2_idx) : nullptr;
         if (gdn) {
             ext.qk_layout = mode;
-            ctx.gdn_prefill_qk_layout[gdn] = { l2, mode };
+            const char * c16 = getenv("GGML_CUDA_CONV_C16_PACK");
+            if ((!c16 || atoi(c16) != 0) && ggml_cuda_gdn_half_prefill_eligible(gdn) &&
+                    l2->ne[1] == 32 && qk_channels == 2 * 16 * 128 &&
+                    gdn->src[0]->view_offs == 0 && gdn->src[1]->view_offs == 16 * 128 * sizeof(float) &&
+                    gdn->src[1]->ne[1] == 16) {
+                // C16 requires the fused cache scatter. Prove that the same
+                // dispatcher which will consume this L2 tensor can select it;
+                // an exposed GDN, extra Q/K user or unsupported shape keeps F32.
+                for (int j = l2_idx + 1; j < cgraph->n_nodes; ++j) {
+                    if (cgraph->nodes[j] != gdn) continue;
+                    ggml_cuda_gated_delta_net_fused_cache cache;
+                    if (ggml_cuda_try_gdn_cache_fusion(cgraph, j, cache)) ext.qk_layout = 3;
+                    break;
+                }
+            }
+            ctx.gdn_prefill_qk_layout[gdn] = { l2, ext.qk_layout };
         }
     }
     ggml_cuda_ssm_conv_front(ctx, cat, ssm, silu, /*apply_silu=*/ true, snaps, ext);

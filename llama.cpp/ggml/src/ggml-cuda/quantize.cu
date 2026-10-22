@@ -1248,7 +1248,10 @@ static __global__ void fwht_quantize_mmq_d4_rms(const float * x, const int64_t s
         v[i]=xn*(1.0f/64.0f);
         if constexpr(SIGNED) v[i]*=signs[col];
     }
-    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    // Prefill D1: transpose warp ownership, keep stages32/64/128 in registers, restore it.
+    // Arithmetic stage and operand order is identical; D4 retains the old schedule.
+    if constexpr(D1) ggml_cuda_fwht_register_transpose_butterfly<N,NT>(v,shared,tid,lane);
+    else ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
     if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 // GDN output projection input, one block per 4096-wide row (token): per-head RMS_NORM(x) * w over 128-wide heads
