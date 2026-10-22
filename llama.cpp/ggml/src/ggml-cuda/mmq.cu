@@ -689,6 +689,7 @@ size_t ggml_cuda_dod_qkv_register(const void * q, const void * k, const void * v
         CUDA_CHECK(cudaFree(e.dl));
         e.dl = dl + offset;
         e.dl_owner = owner;
+        e.arrivals = nullptr; // original per-weight allocation was freed; grouped QKV keeps its old route
         offset += rows[s]*row_bytes;
     }
     return bytes; // replaces exactly this many bytes; no steady-state increase
@@ -788,7 +789,7 @@ size_t ggml_cuda_dl_register(const void * src, const int64_t nrows, const int64_
         const size_t bytes_p = (size_t) (nrows*nkb)*sizeof(block_ptq1_0);
         char * dl = nullptr;
         unsigned int * fail_d = nullptr;
-        if (cudaMalloc(&dl, bytes_p) == cudaSuccess && cudaMalloc(&fail_d, sizeof(unsigned int)) == cudaSuccess) {
+        if (cudaMalloc(&dl, bytes_p + (size_t)(nrows/128)*sizeof(unsigned)) == cudaSuccess && cudaMalloc(&fail_d, sizeof(unsigned int)) == cudaSuccess) {
             CUDA_CHECK(cudaMemsetAsync(fail_d, 0, sizeof(unsigned int), stream));
             ggml_cuda_dl_repack_ptq1((const char *) src, dl, (int) nrows, (int) nkb, GGML_CUDA_DL_TM, fail_d, stream);
             CUDA_CHECK(cudaGetLastError());
@@ -798,8 +799,12 @@ size_t ggml_cuda_dl_register(const void * src, const int64_t nrows, const int64_
             CUDA_CHECK(cudaFree(fail_d));
             if (fail == 0) {
                 CUDA_CHECK(cudaStreamDestroy(stream));
-                m.emplace(src, ggml_cuda_dl_entry{ (const char *) src, dl, nrows, ncols, type, GGML_TYPE_PTQ1_0 });
-                return bytes_p;
+                unsigned * arrivals = (unsigned *)(dl + bytes_p);
+                CUDA_CHECK(cudaMemset(arrivals, 0, (size_t)(nrows/128)*sizeof(unsigned)));
+                auto entry = ggml_cuda_dl_entry{ (const char *) src, dl, nrows, ncols, type, GGML_TYPE_PTQ1_0 };
+                entry.arrivals = arrivals;
+                m.emplace(src, std::move(entry));
+                return bytes_p + (size_t)(nrows/128)*sizeof(unsigned);
             }
             // a block with a code 3 (+2d) or one that does not round-trip: keep the PQ2_0 groups
             GGML_LOG_WARN("%s: PQ2_0 weight %p has a block PTQ1_0 cannot hold; it keeps PQ2_0 decode groups\n", __func__, src);

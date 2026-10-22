@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <cuda/atomic>
 
 // GB10 (sm_121) decode layout ("DL") of the J=16 MMQ weights, plus the streaming J=16 kernels that read it.
 //
@@ -788,15 +789,76 @@ static __device__ __forceinline__ void ggml_cuda_dl_ring_step(float (&sum)[1][4]
     }
 }
 
+// Complete each split tile in the last producer to publish. No CTA waits for another CTA.
+// The original producer stores and descending partial-add order are preserved.
+static __device__ __forceinline__ void ggml_cuda_dl_tile_complete(
+        float * dst, const float * partials, unsigned * arrivals,
+        int tile, int nty, int nkb, int stride, int cols) {
+    __shared__ int first_part, last_part, winner;
+    const int tid = threadIdx.y*32 + threadIdx.x;
+    if (tid == 0) {
+        int first = -1, last = -1, count = 0;
+        const int tb = tile*nkb, te = tb + nkb;
+        for (int b = 0; b < (int) gridDim.x; ++b) {
+            int lo = int(int64_t(b)*nty*nkb/gridDim.x);
+            int hi = int(int64_t(b+1)*nty*nkb/gridDim.x);
+            lo -= (lo % nkb) % (MMQ_ITER_K/QK_PQ2_0);
+            hi -= (hi % nkb) % (MMQ_ITER_K/QK_PQ2_0);
+            if (lo < te && hi > tb && hi > lo) {
+                if (first < 0) first = b;
+                last = b; ++count;
+            }
+        }
+        first_part = first; last_part = last;
+        winner = count > 1 ? count : 0;
+    }
+    // Publish every lane's output before the release/acquire arrival chain.
+    __threadfence();
+    __syncthreads();
+    if (tid == 0 && winner) {
+        cuda::atomic_ref<unsigned, cuda::thread_scope_device> a(arrivals[tile]);
+        winner = a.fetch_add(1, cuda::memory_order_acq_rel) == unsigned(winner-1);
+    }
+    __syncthreads();
+    if (winner) {
+        const int row = threadIdx.y*8 + 2*(threadIdx.x % 4);
+        const int col = threadIdx.x/4;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int j = col + 8*h;
+            if (j < cols) {
+                float2 sum = make_float2(0.0f, 0.0f);
+                for (int b = last_part-1; b >= first_part; --b) {
+                    int lo = int(int64_t(b)*nty*nkb/gridDim.x);
+                    int hi = int(int64_t(b+1)*nty*nkb/gridDim.x);
+                    lo -= (lo % nkb) % (MMQ_ITER_K/QK_PQ2_0);
+                    hi -= (hi % nkb) % (MMQ_ITER_K/QK_PQ2_0);
+                    if (lo == hi) continue;
+                    const float2 p = *(const float2 *)(partials + b*(16*128) + j*128 + row);
+                    sum.x = __fadd_rn(sum.x, p.x);
+                    sum.y = __fadd_rn(sum.y, p.y);
+                }
+                float2 * out = (float2 *)(dst + j*stride + tile*128 + row);
+                const float2 tail = *out;
+                *out = make_float2(__fadd_rn(tail.x, sum.x), __fadd_rn(tail.y, sum.y));
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            cuda::atomic_ref<unsigned, cuda::thread_scope_device>(arrivals[tile]).store(0, cuda::memory_order_release);
+        }
+    }
+}
+
 // Same arguments as mul_mat_q_*_j16_dl (TM copy; mode 0 stream-k or mode 1 contiguous whole tiles), dynamic
 // shared memory ggml_cuda_dl_ring_smem<FMT, SPS>(S). Stage layout: weights of the SPS steps, then SPS x 16
 // activation blocks.
-template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false>
+template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false, bool COMPLETE = false>
 __launch_bounds__(16*32, MIN_CTAS)
 static __global__ void mul_mat_q_j16_dl_ring(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
         const int nrows_x, const int nkb, const int ncols_y, const int stride_col_dst, const int ncols_dst,
-        const int mode, float * dst_hi, const int nrows_lo) {
+        const int mode, float * dst_hi, const int nrows_lo, unsigned * arrivals = nullptr) {
     static_assert(!JIT || FMT == GGML_CUDA_DL_FMT_PTQ1S, "JIT operands require signed PTQ1");
     using F = ggml_cuda_dl_fmt<FMT>;
     constexpr int GB = F::GB;
@@ -874,6 +936,7 @@ static __global__ void mul_mat_q_j16_dl_ring(
                 ++st;
                 const bool last = k*SPS + j == total - 1;
                 if (st == nst || last) { // end of a segment: the stores of the DL kernels
+                    const int completed_tile = it;
                     if (st == nst) {
                         const int row = it*I + w*8;
                         if (row < nrows_lo) {
@@ -889,6 +952,9 @@ static __global__ void mul_mat_q_j16_dl_ring(
 #pragma unroll
                     for (int l = 0; l < 4; ++l) {
                         sum[0][l] = 0.0f;
+                    }
+                    if constexpr (COMPLETE) {
+                        ggml_cuda_dl_tile_complete(dst, tmp_fixup, arrivals, completed_tile, nty, nkb, stride_col_dst, ncols_dst);
                     }
                 }
             }
@@ -936,6 +1002,7 @@ struct ggml_cuda_dl_entry {
     // DOD QKV entries keep independent lookup keys and point into one allocation.
     // Shared ownership also covers buffers being unregistered in separate calls.
     std::shared_ptr<char> dl_owner;
+    unsigned   * arrivals = nullptr; // zero-state synchronization; no cached results
 };
 
 // Only measured Q8 FFN and encoder shapes. This is independent of input data;
@@ -984,10 +1051,10 @@ static void ggml_cuda_mmq_dl_launch(Kernel kernel, bool * attr_set, const mmq_ar
         (int) (args.dst_hi ? args.nrows_lo : args.nrows_x));
 }
 
-template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false>
+template <int FMT, int S, int SPS, bool JIT = false, int MIN_CTAS = 1, bool PURE = false, bool COMPLETE = false>
 static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_dl_entry & e, const int grid, const int mode,
                                          const int nkb, float * tmp_fixup, cudaStream_t stream) {
-    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS, JIT, MIN_CTAS, PURE>;
+    const auto kernel = mul_mat_q_j16_dl_ring<FMT, S, SPS, JIT, MIN_CTAS, PURE, COMPLETE>;
     constexpr size_t smem = ggml_cuda_dl_ring_smem<FMT, SPS>(S);
     static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
     const int device = ggml_cuda_get_device();
@@ -999,7 +1066,7 @@ static void ggml_cuda_mmq_dl_launch_ring(const mmq_args & args, const ggml_cuda_
     ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(32, 16, 1), smem, stream),
         (const char *) e.dl, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
         (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst_hi ? args.dst_hi : args.dst,
-        (int) (args.dst_hi ? args.nrows_lo : args.nrows_x));
+        (int) (args.dst_hi ? args.nrows_lo : args.nrows_x), COMPLETE ? e.arrivals : nullptr);
 }
 
 static int ggml_cuda_dl_env_int(const char * name, const int dflt) {
@@ -1068,6 +1135,9 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
                 ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2, true, 2, true>(args, e, grid, 1, nkb, tmp_fixup, stream);
             } else if (tiling && ntiles > 4*nsm) {
                 ggml_cuda_mmq_dl_launch_ring<FMT, 2, 2>(args, e, grid, 1, nkb, tmp_fixup, stream);
+            } else if (!tiling && grid == 48 && e.arrivals && args.dst_hi == nullptr) {
+                ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2, false, 1, false, true>(args, e, grid, 0, nkb, tmp_fixup, stream);
+                return; // tile-completion continuation replaces the separate fixup launch
             } else {
                 ggml_cuda_mmq_dl_launch_ring<FMT, 3, 2>(args, e, grid, tiling ? 1 : 0, nkb, tmp_fixup, stream);
             }
