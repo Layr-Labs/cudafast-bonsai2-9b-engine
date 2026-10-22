@@ -159,3 +159,45 @@ inline std::vector<llama_token> common_prompt_lookup_draft(const std::vector<lla
     }
     return { prompt.begin() + chosen, prompt.begin() + chosen + n };
 }
+
+// Generic within-request repeat proposals. No target result is read here; all returned ids
+// must be target-verified. Tied longest matches with distinct continuations abstain.
+inline std::vector<llama_token> common_history_suffix_draft(const std::vector<llama_token> & history,
+                                                           llama_token anchor, int depth) {
+    // Four-token code/whitespace suffixes can recur with unrelated continuations.
+    // Require a longer within-request match before replacing the neural proposal.
+    constexpr size_t min_match = 8;
+    constexpr size_t max_match = 64;
+    if (depth <= 0 || history.size() < min_match + (size_t) depth) {
+        return {};
+    }
+    const size_t total = history.size() + 1;
+    const auto at = [&](size_t i) { return i == history.size() ? anchor : history[i]; };
+    size_t best = min_match - 1, chosen = 0;
+    bool ambiguous = false;
+    for (size_t end = min_match; end + (size_t) depth <= history.size(); ++end) {
+        if (history[end - 1] != anchor) {
+            continue;
+        }
+        size_t length = 1;
+        const size_t limit = std::min({max_match, end, total});
+        while (length < limit && history[end - length - 1] == at(total - length - 1)) {
+            ++length;
+        }
+        if (length < min_match || length < best) {
+            continue;
+        }
+        if (length > best) {
+            best = length;
+            chosen = end;
+            ambiguous = false;
+        } else if (!std::equal(history.begin() + chosen, history.begin() + chosen + depth,
+                               history.begin() + end)) {
+            ambiguous = true;
+        }
+    }
+    if (best < min_match || ambiguous) {
+        return {};
+    }
+    return {history.begin() + chosen, history.begin() + chosen + depth};
+}

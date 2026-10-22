@@ -32,7 +32,7 @@ static __host__ __device__ int64_t ggml_cuda_dl_tm64_stage_index(int virtual_ste
 }
 
 template <int FMT, int S, int SPS>
-__launch_bounds__(8*32, 2)
+__launch_bounds__(9*32, 2)
 static __global__ void mul_mat_q_q8_j16_dl_ring_tm64(
         const char * __restrict__ x, const int * y, float * dst, float * tmp_fixup,
         const int nrows_x, const int nkb, const int ncols_y, const int stride_col_dst, const int ncols_dst,
@@ -49,6 +49,7 @@ static __global__ void mul_mat_q_q8_j16_dl_ring_tm64(
     extern __shared__ __align__(128) char ggml_cuda_dl_ring_smem_buf[];
     char     * smem = ggml_cuda_dl_ring_smem_buf;
     uint64_t * full = (uint64_t *) (smem + S*SB);
+    uint64_t * empty = full + S;
 
     const int nst = nkb / G;
     const int nty = nrows_x / 128;
@@ -64,10 +65,11 @@ static __global__ void mul_mat_q_q8_j16_dl_ring_tm64(
     const int tid     = threadIdx.y*32 + threadIdx.x;
     const uint32_t yb_bytes = (uint32_t) (ncols_y*(int) sizeof(block_q8_1_mmq));
 
-    if (tid == 0) {
+    if (tid == 256) {
 #pragma unroll
         for (int k = 0; k < S; ++k) {
             ggml_cuda_dl_mbar_init(&full[k], 1);
+            ggml_cuda_dl_mbar_init(&empty[k], 8);
         }
         ggml_cuda_dl_mbar_init_fence();
     }
@@ -75,7 +77,7 @@ static __global__ void mul_mat_q_q8_j16_dl_ring_tm64(
     // Weights of the first S stages before the grid dependency wait (they do not depend on the previous kernel).
     // Weights are read once: evict-first in L2; the activations keep the default policy (every CTA reads them).
     const uint64_t wpol = ggml_cuda_dl_policy_evict_first();
-    if (tid == 0) {
+    if (tid == 256) {
         for (int k = 0; k < S && k < nstages; ++k) {
             const int n = min(SPS, total - k*SPS);
             ggml_cuda_dl_mbar_expect_tx(&full[k], (uint32_t) n*(XB + yb_bytes));
@@ -86,16 +88,30 @@ static __global__ void mul_mat_q_q8_j16_dl_ring_tm64(
     ggml_cuda_pdl_sync();
     ggml_cuda_pdl_lc();
 #endif
-    if (tid == 0) {
-        for (int k = 0; k < S && k < nstages; ++k) {
-            const int n = min(SPS, total - k*SPS);
-            for (int j = 0; j < n; ++j) {
-                const int stj = (gs0 + k*SPS + j) % nst;
-                ggml_cuda_dl_bulk_g2s(smem + k*SB + SPS*XB + j*YB, (const char *) y + (int64_t) stj*yb_bytes, yb_bytes, &full[k]);
+    // Dedicated ninth producer warp; eight consumer warps keep original rows.
+    // Empty parity releases a slot only after all consumers snapshot operands.
+    if (threadIdx.y == 8) {
+        if (threadIdx.x == 0) {
+            for (int k = 0; k < nstages; ++k) {
+                const int slot = k % S;
+                const int nn = min(SPS, total - k*SPS);
+                const int gsk = gs0 + k*SPS;
+                if (k >= S) {
+                    ggml_cuda_dl_mbar_wait(&empty[slot], ((k/S - 1) & 1));
+                    ggml_cuda_dl_mbar_expect_tx(&full[slot], (uint32_t) nn*(XB + yb_bytes));
+                    ggml_cuda_dl_bulk_g2s_hint(smem + slot*SB,
+                        x + ggml_cuda_dl_tm64_stage_index(gsk, nst, half)*XB,
+                        (uint32_t) nn*XB, &full[slot], wpol);
+                }
+                for (int j = 0; j < nn; ++j) {
+                    ggml_cuda_dl_bulk_g2s(smem + slot*SB + SPS*XB + j*YB,
+                        (const char *) y + (int64_t) ((gsk + j) % nst)*yb_bytes,
+                        yb_bytes, &full[slot]);
+                }
             }
         }
+        return;
     }
-
     const int w = threadIdx.y;
     const int g = threadIdx.x / 4;
     const int c = threadIdx.x % 4;
@@ -110,7 +126,16 @@ static __global__ void mul_mat_q_q8_j16_dl_ring_tm64(
             if (j < n) {
                 const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
                 const char * sy = smem + s*SB + SPS*XB + j*YB + g*(int) sizeof(block_q8_1_mmq);
-                ggml_cuda_dl_ring_step<FMT>(sum, sx, sy, c);
+                ggml_cuda_dl_q8_xstage xs;
+                ggml_cuda_dl_q8_ystage ys;
+                ggml_cuda_dl_q8_load_x(xs, sx, c);
+                ggml_cuda_dl_q8_load_y(ys, sy, c);
+                __syncwarp();
+                if (threadIdx.x == 0) {
+                    const uint32_t addr = ggml_cuda_dl_smem_u32(&empty[s]);
+                    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(addr) : "memory");
+                }
+                ggml_cuda_dl_q8_compute(sum[0], xs, ys, c);
                 ++st;
                 const bool last = k*SPS + j == total - 1;
                 if (st == nst || last) { // end of a segment: the stores of the DL kernels
@@ -131,21 +156,6 @@ static __global__ void mul_mat_q_q8_j16_dl_ring_tm64(
                         sum[0][l] = 0.0f;
                     }
                 }
-            }
-        }
-        // Only reused stages need all warps to finish before the next bulk copy.
-        // This condition is uniform across the CTA; no stage is read after its last use.
-        if (k + S < nstages) {
-            __syncthreads();
-        }
-        if (tid == 0 && k + S < nstages) {
-            const int kk = k + S;
-            const int nn = min(SPS, total - kk*SPS);
-            const int gsk = gs0 + kk*SPS;
-            ggml_cuda_dl_mbar_expect_tx(&full[s], (uint32_t) nn*(XB + yb_bytes));
-            ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + ggml_cuda_dl_tm64_stage_index(gsk, nst, half)*XB, (uint32_t) nn*XB, &full[s], wpol);
-            for (int j = 0; j < nn; ++j) {
-                ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB, (const char *) y + (int64_t) ((gsk + j) % nst)*yb_bytes, yb_bytes, &full[s]);
             }
         }
     }

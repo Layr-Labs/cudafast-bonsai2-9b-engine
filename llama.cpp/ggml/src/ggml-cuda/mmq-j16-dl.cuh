@@ -1026,7 +1026,7 @@ static void ggml_cuda_mmq_dl_launch_q8_tm64(const mmq_args & args, const ggml_cu
                                            const int grid, const int mode, const int nkb,
                                            float * tmp_fixup, cudaStream_t stream) {
     const auto kernel = mul_mat_q_q8_j16_dl_ring_tm64<GGML_CUDA_DL_FMT_Q8, 2, 1>;
-    constexpr size_t smem = 2*(64*4*sizeof(block_q8_0) + 16*sizeof(block_q8_1_mmq)) + 2*sizeof(uint64_t);
+    constexpr size_t smem = 2*(64*4*sizeof(block_q8_0) + 16*sizeof(block_q8_1_mmq)) + 4*sizeof(uint64_t);
     static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
     const int device = ggml_cuda_get_device();
     if (!attr[device]) {
@@ -1037,7 +1037,7 @@ static void ggml_cuda_mmq_dl_launch_q8_tm64(const mmq_args & args, const ggml_cu
     // The doubled physical grid retains the original virtual K partitions and
     // 128-row fixup allocation. Each pair writes disjoint halves of each tile.
     ggml_cuda_kernel_launch(kernel,
-        ggml_cuda_kernel_launch_params(dim3(2*grid, 1, 1), dim3(32, 8, 1), smem, stream),
+        ggml_cuda_kernel_launch_params(dim3(2*grid, 1, 1), dim3(32, 9, 1), smem, stream),
         (const char *) e.dl_tm64, args.y, args.dst, tmp_fixup, (int) args.nrows_x, nkb, (int) args.ncols_y,
         (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
 }
