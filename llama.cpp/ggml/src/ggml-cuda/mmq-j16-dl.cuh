@@ -723,19 +723,34 @@ static __host__ __device__ constexpr size_t ggml_cuda_dl_ring_smem(const int S) 
 
 // Signed PTQ1 FFN variant: keep only one sub-block of activation words and
 // scales live. The MMA operands and FP32 accumulation order are unchanged.
+template <bool PAIR_TAIL = false>
 static __device__ __forceinline__ void ggml_cuda_ptq1_j16_jit_step(
         float (&sum)[1][4], const char * sx, const char * sy, const int c) {
     ggml_cuda_ptq1_j16_stage st;
     const uint32_t * xw = (const uint32_t *) sx;
     st.wa = xw[c];
     st.wb = xw[4 + (c & 1)];
-    st.w6 = xw[6];
+    uint32_t ds = 0;
+    if constexpr (PAIR_TAIL) {
+        const int g = int(threadIdx.x)/4;
+        const uint32_t * tile = xw - 7*g;
+        st.w6 = tile[7*(g/2) + 6] >> (16*(g&1));
+        ds = tile[7*(4+c) + 6];
+    } else {
+        st.w6 = xw[6];
+    }
     // The original decoder reads only these three initialized weight words.
     uint32_t b[4][2];
     ggml_cuda_ptq1_j16_decode(b, st, c);
-    const int xd = int(st.w6 >> 16);
-    const int d_lo = __shfl_sync(0xFFFFFFFF, xd, 8*c + 0);
-    const int d_hi = __shfl_sync(0xFFFFFFFF, xd, 8*c + 4);
+    int d_lo, d_hi;
+    if constexpr (PAIR_TAIL) {
+        d_lo = int(ds & 0xffffu);
+        d_hi = int(ds >> 16);
+    } else {
+        const int xd = int(st.w6 >> 16);
+        d_lo = __shfl_sync(0xFFFFFFFF, xd, 8*c + 0);
+        d_hi = __shfl_sync(0xFFFFFFFF, xd, 8*c + 4);
+    }
     const float dA[2] = {
         __half2float(__ushort_as_half((unsigned short) d_lo)),
         __half2float(__ushort_as_half((unsigned short) d_hi)),
@@ -1178,14 +1193,17 @@ static __device__ __forceinline__ float * ggml_cuda_dod_qkv_dst(
     return a.dst_hi2;
 }
 
-template <bool GROUPED>
+template <bool GROUPED, bool RESIDENT_Q = false>
 __launch_bounds__(16*32, 1)
 static __global__ void mul_mat_q_dod_qkv_ring(ggml_cuda_dod_qkv_args a, float * tmp_fixup) {
     constexpr int GB = sizeof(block_ptq1_0), I = 128, J = 16, S = 3, SPS = 2;
     constexpr int K = 4096, nkb = K/QK_PQ2_0, XB = I*GB;
     constexpr int YB = J*int(sizeof(block_q8_1_mmq));
-    constexpr int SB = ggml_cuda_dl_ring_stage_bytes<GGML_CUDA_DL_FMT_PTQ1S, SPS>();
+    // Query activations depend only on K, not on the output tile. Keep one
+    // immutable activation plane while the independent weight stages rotate.
+    constexpr int SB = RESIDENT_Q ? SPS*XB : ggml_cuda_dl_ring_stage_bytes<GGML_CUDA_DL_FMT_PTQ1S, SPS>();
     const int problem = GROUPED ? int(blockIdx.x)/48 : 0;
+    const bool resident_q = RESIDENT_Q && GROUPED && problem == 0;
     const int b = GROUPED ? int(blockIdx.x)%48 : int(blockIdx.x);
     const int rows = GROUPED ? (problem == 0 ? 8192 : 1024) : 10240;
     const int row_base = GROUPED ? (problem == 0 ? 0 : 8192 + (problem - 1)*1024) : 0;
@@ -1199,10 +1217,11 @@ static __global__ void mul_mat_q_dod_qkv_ring(ggml_cuda_dod_qkv_args a, float * 
     const uint32_t yb_bytes = uint32_t(a.ncols*int(sizeof(block_q8_1_mmq)));
     extern __shared__ __align__(128) char ggml_cuda_dod_qkv_smem[];
     char * smem = ggml_cuda_dod_qkv_smem;
-    uint64_t * full = (uint64_t *)(smem + S*SB);
+    char * yplane = smem + S*SB;
+    uint64_t * full = (uint64_t *)(smem + S*SB + (RESIDENT_Q ? nkb*YB : 0));
     if (tid == 0) {
 #pragma unroll
-        for (int k = 0; k < S; ++k) { ggml_cuda_dl_mbar_init(&full[k], 1); }
+        for (int k = 0; k < S + int(RESIDENT_Q); ++k) { ggml_cuda_dl_mbar_init(&full[k], 1); }
         ggml_cuda_dl_mbar_init_fence();
     }
     __syncthreads();
@@ -1210,21 +1229,28 @@ static __global__ void mul_mat_q_dod_qkv_ring(ggml_cuda_dod_qkv_args a, float * 
     if (tid == 0) {
         for (int k = 0; k < S && k < nstages; ++k) {
             const int n = min(SPS, total - k*SPS);
-            ggml_cuda_dl_mbar_expect_tx(&full[k], uint32_t(n)*(XB + yb_bytes));
+            ggml_cuda_dl_mbar_expect_tx(&full[k], uint32_t(n)*(XB + (resident_q ? 0 : yb_bytes)));
             ggml_cuda_dl_bulk_g2s_hint(smem + k*SB, x + int64_t(begin + k*SPS)*XB, uint32_t(n)*XB, &full[k], wpol);
         }
     }
     ggml_cuda_pdl_sync();
     ggml_cuda_pdl_lc();
     if (tid == 0) {
-        for (int k = 0; k < S && k < nstages; ++k) {
-            const int n = min(SPS, total - k*SPS);
-            for (int j = 0; j < n; ++j) {
-                const int stj = (begin + k*SPS + j) % nkb;
-                ggml_cuda_dl_bulk_g2s(smem + k*SB + SPS*XB + j*YB, (const char *)y + int64_t(stj)*yb_bytes, yb_bytes, &full[k]);
+        if (resident_q) {
+            ggml_cuda_dl_mbar_expect_tx(&full[S], uint32_t(nkb*YB));
+            ggml_cuda_dl_bulk_g2s(yplane, y, uint32_t(nkb*YB), &full[S]);
+        } else {
+            for (int k = 0; k < S && k < nstages; ++k) {
+                const int n = min(SPS, total - k*SPS);
+                for (int j = 0; j < n; ++j) {
+                    const int stj = (begin + k*SPS + j) % nkb;
+                    char * slot = RESIDENT_Q ? yplane + (k*SPS+j)*YB : smem + k*SB + SPS*XB + j*YB;
+                    ggml_cuda_dl_bulk_g2s(slot, (const char *)y + int64_t(stj)*yb_bytes, yb_bytes, &full[k]);
+                }
             }
         }
     }
+    if (resident_q) { ggml_cuda_dl_mbar_wait(&full[S], 0); }
     const int w = threadIdx.y, g = threadIdx.x/4, c = threadIdx.x%4;
     float sum[1][4] = {{0.0f}};
 #pragma unroll 1
@@ -1235,7 +1261,8 @@ static __global__ void mul_mat_q_dod_qkv_ring(ggml_cuda_dod_qkv_args a, float * 
         for (int j = 0; j < SPS; ++j) {
             if (j < n) {
                 const char * sx = smem + s*SB + j*XB + (w*8 + g)*GB;
-                const char * sy = smem + s*SB + SPS*XB + j*YB + g*int(sizeof(block_q8_1_mmq));
+                const char * sy = (resident_q ? yplane + st*YB :
+                    (RESIDENT_Q ? yplane + (s*SPS+j)*YB : smem + s*SB + SPS*XB + j*YB)) + g*int(sizeof(block_q8_1_mmq));
                 ggml_cuda_dl_ring_step<GGML_CUDA_DL_FMT_PTQ1S>(sum, sx, sy, c);
                 ++st;
                 if (st == nkb || k*SPS + j == total - 1) {
@@ -1256,11 +1283,14 @@ static __global__ void mul_mat_q_dod_qkv_ring(ggml_cuda_dod_qkv_args a, float * 
         if (k + S < nstages) { __syncthreads(); }
         if (tid == 0 && k + S < nstages) {
             const int kk = k + S, nn = min(SPS, total - kk*SPS), gsk = begin + kk*SPS;
-            ggml_cuda_dl_mbar_expect_tx(&full[s], uint32_t(nn)*(XB + yb_bytes));
+            ggml_cuda_dl_mbar_expect_tx(&full[s], uint32_t(nn)*(XB + (resident_q ? 0 : yb_bytes)));
             ggml_cuda_dl_bulk_g2s_hint(smem + s*SB, x + int64_t(gsk)*XB, uint32_t(nn)*XB, &full[s], wpol);
-            for (int j = 0; j < nn; ++j) {
-                ggml_cuda_dl_bulk_g2s(smem + s*SB + SPS*XB + j*YB,
-                    (const char *)y + int64_t((gsk + j)%nkb)*yb_bytes, yb_bytes, &full[s]);
+            if (!resident_q) {
+                for (int j = 0; j < nn; ++j) {
+                    char * slot = RESIDENT_Q ? yplane + (s*SPS+j)*YB : smem + s*SB + SPS*XB + j*YB;
+                    ggml_cuda_dl_bulk_g2s(slot,
+                        (const char *)y + int64_t((gsk + j)%nkb)*yb_bytes, yb_bytes, &full[s]);
+                }
             }
         }
     }
@@ -1343,14 +1373,16 @@ static __global__ void mul_mat_q_dod_qkv_fixup_compact(ggml_cuda_dod_qkv_args a,
 template <bool GROUPED>
 static void ggml_cuda_dod_qkv_launch(ggml_cuda_dod_qkv_args a, float * partials, cudaStream_t stream) {
     constexpr int grid = GROUPED ? 144 : 48;
-    constexpr size_t smem = ggml_cuda_dl_ring_smem<GGML_CUDA_DL_FMT_PTQ1S, 2>(3);
-    const auto kernel = mul_mat_q_dod_qkv_ring<GROUPED>;
-    static bool attr[GGML_CUDA_MAX_DEVICES] = {false};
+    constexpr size_t plane_smem = 3*2*128*sizeof(block_ptq1_0) + 32*16*sizeof(block_q8_1_mmq) + 4*sizeof(uint64_t);
     const int device = ggml_cuda_get_device();
-    if (!attr[device]) {
+    const bool resident_q = GROUPED && a.ncols == 16 && ggml_cuda_info().devices[device].smpbo >= plane_smem;
+    const size_t smem = resident_q ? plane_smem : ggml_cuda_dl_ring_smem<GGML_CUDA_DL_FMT_PTQ1S, 2>(3);
+    const auto kernel = resident_q ? mul_mat_q_dod_qkv_ring<GROUPED,true> : mul_mat_q_dod_qkv_ring<GROUPED,false>;
+    static bool attr[GGML_CUDA_MAX_DEVICES][2] = {};
+    if (!attr[device][int(resident_q)]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)));
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, int(cudaSharedmemCarveoutMaxShared)));
-        attr[device] = true;
+        attr[device][int(resident_q)] = true;
     }
     ggml_cuda_kernel_launch(kernel, ggml_cuda_kernel_launch_params(dim3(grid), dim3(32,16), smem, stream), a, partials);
     if constexpr (GROUPED) {

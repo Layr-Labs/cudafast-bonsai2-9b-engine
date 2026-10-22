@@ -886,6 +886,13 @@ bool ggml_cuda_mul_mat_q_fixup_producer(ggml_backend_cuda_context & ctx,
     return true;
 }
 
+// GGML_CUDA_GU_PAIR_TAIL=0 keeps the original word-6 layout of the decode GU
+// pack and the shuffled scale reads (newjordan's 18f3f900 pairing is the default).
+static bool ggml_cuda_gu_pair_tail() {
+    static const bool on = ggml_cuda_dl_env_int("GGML_CUDA_GU_PAIR_TAIL", 1) != 0;
+    return on;
+}
+
 static bool ggml_cuda_decode_glu_enabled() {
     static const bool enabled = ggml_cuda_dl_env_int("GGML_CUDA_DECODE_GU_EPILOGUE", 1) != 0;
     return enabled;
@@ -912,8 +919,12 @@ static bool ggml_cuda_decode_glu_run(ggml_backend_cuda_context & ctx, const ggml
     // F=12288 and grid=2*F/128 below guarantee one whole tile per CTA.
     // GGML_CUDA_GU_ONE_TILE=0 keeps the segmented epilogue.
     static const bool one_tile = ggml_cuda_dl_env_int("GGML_CUDA_GU_ONE_TILE", 1) != 0;
-    const auto kernel = one_tile ? mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true, true>
-                                 : mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true, false>;
+    // The pack and the kernel agree on the word-6 layout through ggml_cuda_gu_pair_tail().
+    const auto kernel = ggml_cuda_gu_pair_tail()
+        ? (one_tile ? mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true, true, true>
+                    : mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true, false, true>)
+        : (one_tile ? mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true, true, false>
+                    : mul_mat_q_ptq_gu_ring<GGML_CUDA_DL_FMT_PTQ1S, 3, 2, true, 2, true, false, false>);
     static bool attr[GGML_CUDA_MAX_DEVICES] = { false };
     if (!attr[ctx.device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared)));
@@ -1013,7 +1024,7 @@ const ggml_cuda_glu_pair * ggml_cuda_glu_pair_find(const void * gate) {
 // Copy complete PTQ blocks from the two original TM128 allocations. The inverse
 // maps alternating row r to input row r/2 in gate (even) or up (odd).
 static __global__ void ggml_cuda_decode_glu_pack(const uint32_t * gate, const uint32_t * up,
-        uint32_t * dst, int rows, int steps) {
+        uint32_t * dst, int rows, int steps, bool pair_tail) {
     const size_t count = size_t(2*rows)*steps*7;
     for (size_t i = size_t(blockIdx.x)*blockDim.x + threadIdx.x; i < count; i += size_t(gridDim.x)*blockDim.x) {
         const size_t block = i/7;
@@ -1021,7 +1032,18 @@ static __global__ void ggml_cuda_decode_glu_pack(const uint32_t * gate, const ui
         const int kb = int(block/128)%steps;
         const int src_row = row/2;
         const size_t src_block = (size_t(src_row/128)*steps + kb)*128 + src_row%128;
-        dst[i] = (row&1 ? up : gate)[7*src_block + i%7];
+        if (i%7 != 6 || !pair_tail) {
+            dst[i] = (row&1 ? up : gate)[7*src_block + i%7];
+        } else {
+            // Pair the qh tails and then the fp16 scales of adjacent gate/up
+            // rows within the same eight-row block; allocation size is unchanged.
+            const int pair_row = (row/8)*4 + (row&3);
+            const size_t pair_block = (size_t(pair_row/128)*steps + kb)*128 + pair_row%128;
+            const int shift = (row&7) < 4 ? 0 : 16;
+            const uint32_t lo = gate[7*pair_block + 6] >> shift;
+            const uint32_t hi = up[7*pair_block + 6] >> shift;
+            dst[i] = (lo&0xffffu) | (hi << 16);
+        }
     }
 }
 
@@ -1072,7 +1094,7 @@ size_t ggml_cuda_glu_pair_register(const void * gate, const void * up, const int
             char * dl_glu = nullptr;
             if (cudaMalloc(&dl_glu, 2*dl_bytes) == cudaSuccess) {
                 ggml_cuda_decode_glu_pack<<<512,256>>>((const uint32_t *) ig->second.dl,
-                    (const uint32_t *) iu->second.dl, (uint32_t *) dl_glu, int(nrows), int(ncols/QK_PQ2_0));
+                    (const uint32_t *) iu->second.dl, (uint32_t *) dl_glu, int(nrows), int(ncols/QK_PQ2_0), ggml_cuda_gu_pair_tail());
                 CUDA_CHECK(cudaGetLastError());
                 CUDA_CHECK(cudaDeviceSynchronize());
                 m[gate].dl_glu = dl_glu;

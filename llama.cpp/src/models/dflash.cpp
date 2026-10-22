@@ -856,7 +856,7 @@ static ggml_tensor * build_dflash2_conv(
 // transition scores, packed into the nextn output slot for the CPU-side walk.
 static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens,
         int64_t n_tokens_override = 0, int64_t n_blocks_override = 0,
-        ggml_tensor * cand_pre = nullptr, ggml_tensor * unary_pre = nullptr) {
+        ggml_tensor * cand_pre = nullptr, ggml_tensor * unary_pre = nullptr, int64_t candidate_first_pos = 0) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
@@ -868,12 +868,15 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t rank     = hparams.dflash_selector_rank;
     const int64_t n_blocks = n_blocks_override > 0 ? n_blocks_override : (int64_t) g.ubatch.n_seqs_unq;
     GGML_ASSERT(n_blocks > 0 && n_tokens % n_blocks == 0);
-    GGML_ASSERT(res->t_logits->ne[1] == n_tokens);
+    GGML_ASSERT(candidate_first_pos == 0 || (candidate_first_pos == 1 && n_blocks == 1 && cand_pre && unary_pre));
+    GGML_ASSERT(res->t_logits->ne[1] == n_tokens - candidate_first_pos);
     if (!tokens) {
         return;
     }
 
     const int64_t tokens_per_block = n_tokens / n_blocks;
+    const int64_t candidate_rows = tokens_per_block - candidate_first_pos;
+    GGML_ASSERT(candidate_rows > 0);
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
 
@@ -889,17 +892,17 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
 
     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
     // position varies fastest, sequences are the outer dimension.
-    ggml_tensor * cand_blk  = ggml_reshape_3d(ctx0, candidates, top_k, tokens_per_block, n_blocks);
-    ggml_tensor * unary_blk = ggml_reshape_3d(ctx0, unary,      top_k, tokens_per_block, n_blocks);
+    ggml_tensor * cand_blk  = ggml_reshape_3d(ctx0, candidates, top_k, candidate_rows, n_blocks);
+    ggml_tensor * unary_blk = ggml_reshape_3d(ctx0, unary,      top_k, candidate_rows, n_blocks);
     ggml_tensor * gate_blk  = ggml_reshape_3d(ctx0, gate,       rank,  tokens_per_block, n_blocks);
 
     // a position's score reads only the candidate sets at pos-1 and pos, so a run
     // of positions has no internal dependency and scores in one batched matmul
     auto score_run = [&](int64_t beg_pos, int64_t n_pos, ggml_tensor * pred_ids) {
         ggml_tensor * cand_run  = ggml_view_3d(ctx0, cand_blk, top_k, n_pos, n_blocks, cand_blk->nb[1], cand_blk->nb[2],
-                                               beg_pos * cand_blk->nb[1]);
+                                               (beg_pos - candidate_first_pos) * cand_blk->nb[1]);
         ggml_tensor * unary_run = ggml_view_3d(ctx0, unary_blk, top_k, n_pos, n_blocks, unary_blk->nb[1],
-                                               unary_blk->nb[2], beg_pos * unary_blk->nb[1]);
+                                               unary_blk->nb[2], (beg_pos - candidate_first_pos) * unary_blk->nb[1]);
         ggml_tensor * gate_run  = ggml_view_3d(ctx0, gate_blk, rank, n_pos, n_blocks, gate_blk->nb[1], gate_blk->nb[2],
                                                beg_pos * gate_blk->nb[1]);
         // A single sequence's position slice is already contiguous. Avoid three
@@ -949,7 +952,7 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     if (block_size > 2) {
         ggml_tensor * prev_ids = ggml_reshape_1d(ctx0,
                 ggml_cont(ctx0, ggml_view_3d(ctx0, cand_blk, top_k, block_size - 2, n_blocks,
-                        cand_blk->nb[1], cand_blk->nb[2], cand_blk->nb[1])),
+                        cand_blk->nb[1], cand_blk->nb[2], (1 - candidate_first_pos) * cand_blk->nb[1])),
                 top_k * (block_size - 2) * n_blocks);
         packed = ggml_concat(ctx0, packed, score_run(2, block_size - 2, prev_ids), 1);
     }
@@ -1345,6 +1348,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         model.dfly_hc_down == nullptr && hparams.f_logit_scale == 0.0f && hparams.f_final_logit_softcapping <= 0.0f &&
         screen_k >= 1 && screen_k <= 32 && hparams.dflash_selector_top_k <= screen_k*(head_rows/screen_chunk) &&
         !(getenv("LLAMA_DFLASH_HEAD_SCREEN") && atoi(getenv("LLAMA_DFLASH_HEAD_SCREEN")) == 0);
+    int64_t candidate_first_pos = 0;
     ggml_tensor * screen_cand  = nullptr;
     ggml_tensor * screen_unary = nullptr;
     if (head_rows > 0 && head_rows < output->ne[1] && output->ne[1] == (int64_t) model.vocab.n_tokens()) {
@@ -1378,6 +1382,16 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         }
         ggml_tensor * head = ggml_view_2d(ctx0, output, output->ne[0], head_rows, output->nb[1], 0);
         if (use_screen && cur_mm->ne[0] == output->ne[0] && ggml_nrows(cur_mm) == cur_mm->ne[1]) {
+            // The selector emits a zero anchor row and uses the input anchor token
+            // as position 1's predecessor; anchor head candidates are never read.
+            // Keep full rows whenever logits can escape or the block is partial.
+            const int64_t effective_blocks = merged ? 1 : (int64_t) ubatch.n_seqs_unq;
+            if (effective_blocks == 1 && n_outputs == 0 && samplers.empty() && cparams.logits_topk == 0 &&
+                    cur_mm->ne[1] == hparams.dflash_block_size && cur_mm->ne[1] > 1) {
+                candidate_first_pos = 1;
+                cur_mm = ggml_view_2d(ctx0, cur_mm, cur_mm->ne[0], cur_mm->ne[1] - 1,
+                        cur_mm->nb[1], cur_mm->nb[1]);
+            }
             const int64_t n        = cur_mm->ne[1];
             const int64_t n_chunks = head_rows / screen_chunk;
             const int64_t S        = screen_k * n_chunks;
@@ -1454,7 +1468,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens, merged ? n_blk : 0, merged ? 1 : 0, screen_cand, screen_unary);
+        build_dflash2_selector(*this, model, inp_tokens, merged ? n_blk : 0, merged ? 1 : 0, screen_cand, screen_unary, candidate_first_pos);
         if (merged) {
             // llama_context copies one nextn row per ubatch token: the context rows read as zeros, the
             // block's lattice keeps its rows at the block's batch indices
