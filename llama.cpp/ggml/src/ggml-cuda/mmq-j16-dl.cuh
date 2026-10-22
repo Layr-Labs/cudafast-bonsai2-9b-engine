@@ -666,11 +666,16 @@ static __device__ __forceinline__ void ggml_cuda_dl_mbar_expect_tx(uint64_t * ba
 
 static __device__ __forceinline__ void ggml_cuda_dl_mbar_wait(uint64_t * bar, const uint32_t parity) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && !defined(GGML_USE_HIP)
-    uint32_t done = 0;
-    do {
-        asm volatile("{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n\tselp.u32 %0, 1, 0, p;\n\t}"
-                     : "=r"(done) : "r"(ggml_cuda_dl_smem_u32(bar)), "r"(parity) : "memory");
-    } while (!done);
+    // One acquire per warp, then distribute completion with warp convergence.
+    // Every caller uses complete warps and a CTA-uniform stage/parity.
+    if ((threadIdx.x & 31) == 0) {
+        uint32_t done = 0;
+        do {
+            asm volatile("{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n\tselp.u32 %0, 1, 0, p;\n\t}"
+                         : "=r"(done) : "r"(ggml_cuda_dl_smem_u32(bar)), "r"(parity) : "memory");
+        } while (!done);
+    }
+    __syncwarp(0xffffffff);
 #else
     GGML_UNUSED_VARS(bar, parity);
 #endif
