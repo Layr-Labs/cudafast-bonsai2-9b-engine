@@ -137,6 +137,24 @@ bool ggml_cuda_gdn_l8_layout_eligible(const ggml_tensor * dst) {
         gdn_cols_per_warp(ggml_cuda_highest_compiled_arch(dev.cc), 128, false) == 4;
 }
 
+bool ggml_cuda_gdn_half_prefill_eligible(const ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    static const bool half = !getenv("GGML_CUDA_GDN_HALF_PREFILL") || atoi(getenv("GGML_CUDA_GDN_HALF_PREFILL"));
+    const auto * q = dst->src[0];
+    const auto * v = dst->src[2];
+    const auto * g = dst->src[3];
+    const auto * b = dst->src[4];
+    return half && gdn_chunk32_enabled() && ggml_cuda_gdn_l8_layout_eligible(dst) &&
+        q->ne[1] == 16 && v->ne[1] == 32 && v->ne[3] == 1 &&
+        ggml_get_op_params_i32(dst, 0) == 16 && (v->ne[2] - 16) % 16 == 0 &&
+        ggml_is_contiguous(g) && ggml_is_contiguous(b) && ggml_nelements(g) == ggml_nelements(b) &&
+        b->nb[1] == sizeof(float) && b->nb[2] == 32 * sizeof(float);
+#else
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];
@@ -222,11 +240,18 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const int lazy = !lazy_disabled && keep_rs && !kda && cache != nullptr && s_ids != nullptr && n_seqs == 1 ? 1 : 0;
 
     bool qk_packed = false;
+    const __half * conv_packed = nullptr;
     const auto pi = ctx.gdn_prefill_qk_layout.find(dst);
     if (pi != ctx.gdn_prefill_qk_layout.end()) {
         GGML_ASSERT(ggml_cuda_gdn_l8_layout_eligible(dst));
         const auto * l2 = pi->second.first;
         qk_packed = true;
+        if (pi->second.second == 3) {
+            GGML_ASSERT(ggml_cuda_gdn_half_prefill_eligible(dst) && cache != nullptr);
+            // The F32 final16 uses the views' original token-major strides.
+            // The prefix occupies only the first half of this L2 allocation.
+            conv_packed = (const __half *) l2->data;
+        }
         if (pi->second.second == 2) {
             const int64_t qhead = ((const char *) src_q->data - (const char *) l2->data) / l2->nb[1];
             const int64_t khead = ((const char *) src_k->data - (const char *) l2->data) / l2->nb[1];
@@ -396,7 +421,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
             if (qk_packed) {
                 gdn_half_prefill_launch<false,true,true>(ctx,q_d,k_d,v_d,g_d,b_d,rb_d,ra_d,s_d,dst_d,state_d,
                     int(n_tokens),sq1,sq2,sq3,sv1,sv2,sv3,sb1,sb2,sb3,scale,state_slot_stride,
-                    s_ids,s_row_stride,lazy,zero[0],zero[0]?*zero[1]:0.0f,zero[0]?*zero[2]:0.0f,stream);
+                    s_ids,s_row_stride,lazy,zero[0],zero[0]?*zero[1]:0.0f,zero[0]?*zero[2]:0.0f,stream,conv_packed);
             } else {
                 gdn_half_prefill_launch<false,true,false>(ctx,q_d,k_d,v_d,g_d,b_d,rb_d,ra_d,s_d,dst_d,state_d,
                     int(n_tokens),sq1,sq2,sq3,sv1,sv2,sv3,sb1,sb2,sb3,scale,state_slot_stride,
@@ -404,6 +429,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
             }
             return;
         }
+        GGML_ASSERT(conv_packed == nullptr && "conv C16 prefix requires the half-prefill consumer");
         ggml_cuda_pool_alloc<gdn_chunk32> work(ctx.pool(), size_t(H)*((n_tokens-K+31)/32));
 #define GDN_CHUNK_LAUNCH(RAW_, PRE_, PACK_) \
         gdn_chunk32_launch<RAW_, PRE_, PACK_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, work.ptr, \
@@ -424,6 +450,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     }
 #endif
 
+    GGML_ASSERT(conv_packed == nullptr && "conv C16 prefix cannot use a scalar fallback");
 #define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_)                                                       \
     launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, \
         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                    \

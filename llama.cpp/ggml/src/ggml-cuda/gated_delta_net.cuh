@@ -16,3 +16,6 @@ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, g
                                               ggml_cuda_gated_delta_net_fused_cache cache);
 
 bool ggml_cuda_gdn_l8_layout_eligible(const ggml_tensor * dst);
+// The conv producer may omit its F32 prefix only when the C16 consumer is guaranteed.
+// The caller must additionally prove the fused cache scatter and canonical Q/K views.
+bool ggml_cuda_gdn_half_prefill_eligible(const ggml_tensor * dst);

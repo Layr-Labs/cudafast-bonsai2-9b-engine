@@ -485,8 +485,24 @@ static __global__ void __launch_bounds__(32 * n_seg) ssm_conv_front_f32(const fl
                 // The permutation changes addresses only. Each warp still writes the same 32 consecutive words.
                 const int col = qk_layout ? i * WARP_SIZE + (threadIdx.x % 8) * 4 + threadIdx.x / 8
                                           : i * WARP_SIZE + threadIdx.x;
-                const int64_t row = qk_layout == 2 ? ((int64_t) h * n_t + t) * head : t * c_v0 + c0;
-                qk[row + col] = scale * buf[t - tc0][i * WARP_SIZE + threadIdx.x];
+                const float value = scale * buf[t - tc0][i * WARP_SIZE + threadIdx.x];
+                if constexpr (qk_layout == 3) {
+                    // The recognizer proves 16 Q heads followed by 16 K heads,
+                    // and a multiple-of-16 prefix. Match prepare_packed's
+                    // [chunk, head, Q/K, token, natural channel] half slabs.
+                    // The scalar final16 keeps the original F32 lane permutation
+                    // at its token-major offset, beyond the entire half prefix.
+                    if (t < n_t - 16) {
+                        const int64_t off = ((t / 16) * 16 + h % 16) * (2 * 16 * head) +
+                                            (h / 16) * (16 * head) + (t % 16) * head + i * WARP_SIZE + threadIdx.x;
+                        reinterpret_cast<__half *>(qk)[off] = __float2half_rn(value);
+                    } else {
+                        qk[t * c_v0 + c0 + col] = value;
+                    }
+                } else {
+                    const int64_t row = qk_layout == 2 ? ((int64_t) h * n_t + t) * head : t * c_v0 + c0;
+                    qk[row + col] = value;
+                }
             }
         }
     }
@@ -713,6 +729,8 @@ void ggml_cuda_ssm_conv_front(ggml_backend_cuda_context & ctx, const ggml_tensor
     cudaStream_t  stream = ctx.stream();
     GGML_ASSERT(ext.qk == nullptr || (ext.qk_channels % 128 == 0 && ext.qk_channels <= C));
     GGML_ASSERT(ext.gather_ids == nullptr || !ext.copy_states);
+    GGML_ASSERT(ext.qk_layout != 3 || (apply_silu && ext.qk && ext.qk_channels == 2 * 16 * 128 &&
+                                     n_t >= 64 && (n_t - 16) % 16 == 0));
 
     // conv_states under the output: read a copy, made before any output is written
     ggml_cuda_pool_alloc<float> states_copy(ctx.pool());
@@ -787,6 +805,8 @@ void ggml_cuda_ssm_conv_front(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (n_t < 64 && apply_silu && ext.qk) {
         launch(std::true_type{}, std::integral_constant<int, 4>{}, std::integral_constant<int, 4>{},
                std::integral_constant<int, 0>{}, std::true_type{});
+    } else if (n_t >= 64 && apply_silu && ext.qk && ext.qk_layout == 3) {
+        launch(std::true_type{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 3>{}, std::false_type{});
     } else if (n_t >= 64 && apply_silu && ext.qk && ext.qk_layout == 2) {
         launch(std::true_type{}, std::integral_constant<int, 8>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 2>{}, std::false_type{});
     } else if (n_t >= 64) {
