@@ -1722,6 +1722,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<llama_pos> pend_pos; // [pend_n]
 
     // DFlash2 device walk (see the constructor) and whether the last draft's ids are on the device
+    bool history_suffix = true;
+    bool suffix_logged = false;
     bool device_walk    = false;
     bool device_pending = false;
 
@@ -1772,6 +1774,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        if (const char * env = std::getenv("LLAMA_DFLASH2_HISTORY_SUFFIX")) {
+            history_suffix = std::strcmp(env, "0") != 0;
+        }
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
         // a lookup hit skips the noise-block forward and leaves the draft context untouched, so it is
@@ -2104,6 +2109,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // record where each block starts and its size
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
+        std::vector<llama_tokens> history_proposals(n_seq);
         bool merged_now = false;
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2119,6 +2125,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     *dp.result = std::move(found);
                     LOG_DBG("DFlash prompt lookup: seq=%d tokens=%zu, neural draft skipped\n", seq_id,
                             dp.result->size());
+                    continue;
+                }
+            }
+            if (history_suffix && is_dflash2 && device_walk && dp.prompt) {
+                const int limit = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+                history_proposals[seq_id] = common_history_suffix_draft(*dp.prompt, dp.id_last, limit);
+                if (!history_proposals[seq_id].empty() && inject_merge && pend_n > 0 &&
+                    pend_seq == seq_id && dp.n_past > pend_pos[0] && dp.n_past <= pend_pos.back() + 1) {
+                    // The prior verify's encoder output is already staged. Consume it using the
+                    // existing inject-only graph, not the expensive noise/selector graph. Rejected
+                    // rows remain isolated on PAD, exactly as in merged injection.
+                    batch_inject.n_tokens = pend_n;
+                    for (int32_t i = 0; i < pend_n; ++i) {
+                        const llama_pos pos = pend_pos[i];
+                        batch_inject.pos[i] = pos;
+                        if (is_mrope) {
+                            batch_inject.pos[pend_n + i] = batch_inject.pos[2 * pend_n + i] = pos;
+                            batch_inject.pos[3 * pend_n + i] = 0;
+                        }
+                        batch_inject.n_seq_id[i] = 1;
+                        batch_inject.seq_id[i][0] = pos < dp.n_past ? seq_id : DFLASH2_PAD_SEQ;
+                        batch_inject.logits[i] = false;
+                    }
+                    if (llama_decode(ctx_dft, batch_inject) != 0) {
+                        GGML_ABORT("DFlash2 history hit: staged feature injection failed.");
+                    }
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), DFLASH2_PAD_SEQ, -1, -1);
+                    pend_n = 0;
+                    *dp.result = std::move(history_proposals[seq_id]);
+                    if (!suffix_logged) {
+                        LOG_INF("DFlash2 history hit inject-only: tokens=%zu noise_head_skipped=1 target_verified=1\n",
+                                dp.result->size());
+                        suffix_logged = true;
+                    }
                     continue;
                 }
             }
@@ -2188,6 +2228,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto & result = *dp.result;
 
             if (is_dflash2) {
+                if (device_walk && !history_proposals[seq_id].empty()) {
+                    // The neural graph still consumes the staged encoder rows, keeping draft KV
+                    // chronology and the fallback pipeline identical. Only proposal ids change.
+                    result = std::move(history_proposals[seq_id]);
+                    if (!suffix_logged) {
+                        LOG_INF("DFlash2 history suffix proposal: tokens=%zu min_match=4 target_verified=1\n",
+                                result.size());
+                        suffix_logged = true;
+                    }
+                    continue;
+                }
                 if (device_walk) {
                     // the walk ran on the device after the lattice: placeholders here, the ids stay there
                     result.assign(n_block_tokens - 1, mask_token_id >= 0 ? mask_token_id : 0);
