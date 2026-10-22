@@ -1175,7 +1175,7 @@ static __global__ void fwht_quantize_mmq_d4_glu_perm(const T * x, const T * g, c
             v[i]=float(T(ggml_cuda_op_silu_single(float(x[row*o0+src]))*float(g[row*o1+src])))*(1.0f/64.0f);
             if constexpr(SIGNED) v[i]*=signs[col];
         }
-        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+        ggml_cuda_fwht_register_transpose_butterfly<N,NT>(v,shared,tid,lane);
     } else {
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
@@ -1248,7 +1248,7 @@ static __global__ void fwht_quantize_mmq_d4_rms(const float * x, const int64_t s
         v[i]=xn*(1.0f/64.0f);
         if constexpr(SIGNED) v[i]*=signs[col];
     }
-    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    ggml_cuda_fwht_register_transpose_butterfly<N,NT>(v,shared,tid,lane);
     if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 // GDN output projection input, one block per 4096-wide row (token): per-head RMS_NORM(x) * w over 128-wide heads
@@ -1297,7 +1297,7 @@ static __global__ void fwht_quantize_mmq_d4_gnorm(const float * x, const float *
         v[i]=g*(1.0f/64.0f);
         if constexpr(SIGNED) v[i]*=signs[i*NT+tid];
     }
-    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    ggml_cuda_fwht_register_transpose_butterfly<N,NT>(v,shared,tid,lane);
     if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 void fwht_quantize_mmq_d4_gnorm_cuda(const float * x, const float * z, int64_t z_stride, const float * w, float eps,
@@ -1517,7 +1517,7 @@ static __global__ void fwht_quantize_mmq_d4_sigmoid_gate(const float * gate, con
             v[i]=float(fwht_gate_op_sigmoid(float(gate_value))*float(attn[row*at+col]))*(1.0f/64.0f);
             if constexpr(SIGNED) v[i]*=signs[col];
         }
-        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+        ggml_cuda_fwht_register_transpose_butterfly<N,NT>(v,shared,tid,lane);
     } else {
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
