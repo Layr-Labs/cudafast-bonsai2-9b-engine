@@ -1042,6 +1042,29 @@ static void ggml_cuda_mmq_dl_launch_q8_tm64(const mmq_args & args, const ggml_cu
         (int) args.nrows_dst, (int) args.ncols_dst, mode, args.dst, (int) args.nrows_x);
 }
 
+// Narrow original pair-fixup geometry only. Both original segments are
+// evaluated in order with an accumulator reset at the same aligned K cut.
+static bool ggml_cuda_dl_q8_pairsplit_use(const mmq_args & args, const ggml_cuda_dl_entry & e,
+                                         int grid, int nkb) {
+    constexpr int BPI = ggml_cuda_dl_fmt<GGML_CUDA_DL_FMT_Q8>::BPI;
+    return grid==48 && args.nrows_x==4096 && nkb>=16*BPI && nkb%BPI==0 &&
+        args.ncols_y==16 && args.ncols_dst==16 && ggml_cuda_dl_q8_tm64_use(args,e);
+}
+static void ggml_cuda_mmq_dl_launch_q8_pairsplit(const mmq_args & args, const ggml_cuda_dl_entry & e,
+                                               int nkb, cudaStream_t stream) {
+    const auto kernel = mul_mat_q_q8_j16_pairsplit_tm64<GGML_CUDA_DL_FMT_Q8,2,1>;
+    constexpr size_t smem = 2*(64*4*sizeof(block_q8_0)+16*sizeof(block_q8_1_mmq))+16;
+    static bool attr[GGML_CUDA_MAX_DEVICES]={false};
+    const int device=ggml_cuda_get_device();
+    if (!attr[device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)smem));
+        CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributePreferredSharedMemoryCarveout,(int)cudaSharedmemCarveoutMaxShared));
+        attr[device]=true;
+    }
+    ggml_cuda_kernel_launch(kernel,ggml_cuda_kernel_launch_params(dim3(64),dim3(32,8),smem,stream),
+        (const char*)e.dl_tm64,args.y,args.dst,nullptr,4096,nkb,16,(int)args.nrows_dst,16,1,args.dst,4096);
+}
+
 // grid: the mul_mat_q grid rule (ggml_cuda_mmq_pq2_j16_grid). Stream-k shapes keep that partition and the
 // unchanged mul_mat_q_stream_k_fixup; pure-tiling shapes compute every tile in one CTA (mode 1, one tile
 // per CTA). Prefetch per shape class from the microbenchmark (c44 NOTES): PQ2_0 pure tiling: CTA bulk
@@ -1055,6 +1078,12 @@ static void ggml_cuda_mmq_dl_run(const mmq_args & args, const ggml_cuda_dl_entry
     const int nkb    = (int) (args.ncols_x / ggml_cuda_type_traits<type>::qk);
     const int ntiles = (int) (args.nrows_x / 128);
     const bool tiling = grid == ntiles;
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        if (ggml_cuda_dl_q8_pairsplit_use(args,e,grid,nkb)) {
+            ggml_cuda_mmq_dl_launch_q8_pairsplit(args,e,nkb,stream);
+            return; // Final output already includes the exact original pair fixup.
+        }
+    }
     if constexpr (type == GGML_TYPE_PQ2_0) {
         const int64_t bytes = args.nrows_x*nkb*(int64_t) sizeof(block_pq2_0);
         // PTQ1_0 matrices of at least 2048 rows: bulk-copy ring of 2-step stages (c64); GGML_CUDA_DL_RING_PT=0 off.
