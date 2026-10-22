@@ -29,6 +29,40 @@
         }                                                                                     \
     } while (0)
 
+// Exercise the same programmatic-serialization launch attribute and two-pass
+// geometry used by top-k.cu on GB10, without linking the full model runtime.
+template <typename Kernel, typename... Args>
+static void launch_pdl(Kernel kernel, dim3 grid, dim3 block, cudaStream_t stream, Args... args) {
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.stream = stream;
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
+    CHECK(cudaLaunchKernelEx(&cfg, kernel, args...));
+}
+
+static void select_launch(const float * x, int * dst, uint64_t * scratch,
+                          int ncols, int nrows, int k, cudaStream_t stream, bool pdl) {
+    if (!pdl) {
+        topk_select_launch(x, dst, scratch, ncols, nrows, k, stream);
+        return;
+    }
+    const int nchunks = topk_select_nchunks(ncols);
+    launch_pdl(topk_select_partial, dim3(nchunks, nrows, 1), dim3(TOPK_SELECT_NT), stream,
+               x, scratch, ncols, k);
+    if (nchunks <= TOPK_SELECT_MERGE_WARP) {
+        launch_pdl(topk_select_merge_warp, dim3(nrows, 1, 1), dim3(32), stream,
+                   (const uint64_t *) scratch, dst, nchunks, k);
+    } else {
+        launch_pdl(topk_select_merge, dim3(nrows, 1, 1), dim3(TOPK_SELECT_NT), stream,
+                   (const uint64_t *) scratch, dst, nchunks, k);
+    }
+}
+
 static uint64_t host_pack(const float v, const int col) {
     uint32_t u;
     memcpy(&u, &v, sizeof(u));
@@ -112,7 +146,7 @@ static float bits_to_float(uint32_t u) {
     return f;
 }
 
-static constexpr int kPatterns = 16;
+static constexpr int kPatterns = 19;
 
 static std::vector<float> make_data(int pattern, int ncols, int nrows, uint32_t seed) {
     std::mt19937 rng(seed);
@@ -142,8 +176,14 @@ static std::vector<float> make_data(int pattern, int ncols, int nrows, uint32_t 
             case 9: x[i] = -(float) col; break;                                 // descending
             case 10: case 11: case 12: case 13: case 14:
                 x[i] = (float) (rng() % levels[pattern - 10]); break;
-            default:                                                            // winners in one thread's columns
+            case 15:                                                            // two warp winners can share one thread
                 x[i] = (col % TOPK_SELECT_NT == 7) ? 100.0f + normal(rng) : normal(rng); break;
+            case 16:                                                            // arbitrary float bits, both NaN signs/payloads
+                x[i] = bits_to_float(rng()); break;
+            case 17:                                                            // warp winners in different threads
+                x[i] = (col % 32 < 2) ? 100.0f + normal(rng) : normal(rng); break;
+            default:                                                            // low second maximum forces compact overflow
+                x[i] = (col % TOPK_SELECT_NT >= 480) ? -100.0f : normal(rng); break;
         }
     }
     for (int r = 0; r < nrows; ++r) {
@@ -182,6 +222,14 @@ static int compare(const char * what, const std::vector<int> & got, const std::v
 }
 
 int main() {
+    printf("CUDA runtime=%d CCCL=%d.%d CUB=%d\n", CUDART_VERSION,
+           CCCL_MAJOR_VERSION, CCCL_MINOR_VERSION, CUB_VERSION);
+    // Match the dispatch condition in top-k.cu. An image upgrade must not
+    // silently validate an optimization bypassed by the production dispatch.
+#if CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
+    fprintf(stderr, "candidate inactive: top-k.cu dispatches to CCCL DeviceTopK\n");
+    return 3;
+#endif
     struct Case { int ncols, nrows, k; };
     const Case cases[] = {
         { 248320, 16, 16 }, { 248320, 1, 16 }, { 248320, 15, 16 }, { 1025, 3, 16 }, { 8192, 4, 32 },
@@ -189,6 +237,8 @@ int main() {
         // verify top-8 rows, 32 / 33 / 37 chunks (warp merge limit), threshold path k edges
         { 248320, 16, 8 },  { 248320, 1, 8 },  { 248320, 4, 1 },   { 262144, 2, 16 }, { 262145, 2, 16 },
         { 300000, 3, 8 },   { 300000, 2, 32 }, { 65536, 3, 15 },   { 16384, 2, 16 },  { 16, 2, 16 },
+        // second-maximum threshold boundary, sparse warps, and one-column chunk tails
+        { 8192, 3, 17 },    { 8192, 3, 31 },  { 481, 2, 32 },     { 513, 2, 32 },    { 16385, 2, 32 },
     };
     int failures = 0, checks = 0;
     for (const Case & cs : cases) {
@@ -207,6 +257,16 @@ int main() {
             std::vector<int> got((size_t) cs.nrows * cs.k);
             CHECK(cudaMemcpy(got.data(), d_dst, got.size() * sizeof(int), cudaMemcpyDeviceToHost));
 
+            std::vector<int> pdl(got.size());
+            CHECK(cudaMemset(d_dst, 0xff, pdl.size() * sizeof(int)));
+            // A stale partial result must not make the PDL comparison pass,
+            // including cases with more than 32 chunks (block merge).
+            CHECK(cudaMemset(d_scratch, 0xa5,
+                             topk_select_scratch_elems(cs.ncols, cs.nrows, cs.k) * sizeof(uint64_t)));
+            select_launch(d_x, d_dst, d_scratch, cs.ncols, cs.nrows, cs.k, 0, true);
+            CHECK(cudaDeviceSynchronize());
+            CHECK(cudaMemcpy(pdl.data(), d_dst, pdl.size() * sizeof(int), cudaMemcpyDeviceToHost));
+
             std::vector<int> c8((size_t) cs.nrows * cs.k);
             {
                 uint64_t * d_scratch_c8;
@@ -222,10 +282,11 @@ int main() {
             char what[160];
             snprintf(what, sizeof(what), "ncols=%d nrows=%d k=%d pattern=%d", cs.ncols, cs.nrows, cs.k, pattern);
             int bad = 0;
+            bad |= compare("pdl-selector", pdl, got);
             bad |= compare("c8-selector", got, c8);
             bad |= compare("host", got, host_reference(x, cs.ncols, cs.nrows, cs.k));
             bad |= compare("cub-segmented-radix", got, cub_reference(d_x, cs.ncols, cs.nrows, cs.k, true));
-            checks += 3;
+            checks += 4;
             if (cs.nrows == 1) {
                 bad |= compare("cub-radix", got, cub_reference(d_x, cs.ncols, cs.nrows, cs.k, false));
                 checks += 1;
@@ -239,8 +300,9 @@ int main() {
     }
 
     // CUDA graph capture and replay with changed inputs in the same buffers.
-    {
-        const int ncols = 248320, nrows = 16, k = 16;
+    for (const bool pdl : { false, true }) {
+      for (const int k : { 16, 32 }) {
+        const int ncols = 248320, nrows = 16;
         float * d_x;
         int * d_dst;
         uint64_t * d_scratch;
@@ -252,7 +314,7 @@ int main() {
         cudaGraph_t graph;
         cudaGraphExec_t exec;
         CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
-        topk_select_launch(d_x, d_dst, d_scratch, ncols, nrows, k, stream);
+        select_launch(d_x, d_dst, d_scratch, ncols, nrows, k, stream, pdl);
         CHECK(cudaStreamEndCapture(stream, &graph));
         CHECK(cudaGraphInstantiate(&exec, graph, 0));
         for (int rep = 0; rep < 3; ++rep) {
@@ -263,7 +325,7 @@ int main() {
             std::vector<int> got((size_t) nrows * k);
             CHECK(cudaMemcpy(got.data(), d_dst, got.size() * sizeof(int), cudaMemcpyDeviceToHost));
             const int bad = compare("graph-replay", got, host_reference(x, ncols, nrows, k));
-            printf("%s graph replay %d\n", bad ? "FAIL" : "ok  ", rep);
+            printf("%s graph replay pdl=%d k=%d rep=%d\n", bad ? "FAIL" : "ok  ", pdl, k, rep);
             failures += bad;
             checks += 1;
         }
@@ -297,8 +359,8 @@ int main() {
         CHECK(cudaEventSynchronize(e1));
         float ms_c8 = 0.0f;
         CHECK(cudaEventElapsedTime(&ms_c8, e0, e1));
-        printf("info: 16x248320 k=16 select %.1f us/call, C8 select %.1f us/call (graph)\n",
-               1000.0f * ms_select / iters, 1000.0f * ms_c8 / iters);
+        printf("info: 16x248320 pdl=%d k=%d select %.1f us/call, C8 select %.1f us/call (graph)\n",
+               pdl, k, 1000.0f * ms_select / iters, 1000.0f * ms_c8 / iters);
         cudaGraphExecDestroy(exec_c8);
         cudaGraphDestroy(graph_c8);
         cudaFree(d_scratch_c8);
@@ -318,6 +380,7 @@ int main() {
         cudaFree(d_x);
         cudaFree(d_dst);
         cudaFree(d_scratch);
+      }
     }
 
     printf("%s: %d checks, %d failures\n", failures ? "FAIL" : "PASS", checks, failures);

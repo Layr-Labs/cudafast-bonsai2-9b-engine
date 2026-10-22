@@ -117,14 +117,28 @@ topk_select_partial(const float * src, uint64_t * part, const int ncols, const i
         best = v[j] > best ? v[j] : best;
     }
 
-    // Threshold path, k <= number of warps: the warps' maxima are distinct keys, so the smallest of them, T, has
-    // at least that many keys >= T and no key < T is in the top k. A zero T (a warp without real keys) keeps every
-    // real key. If at most TOPK_SELECT_COMPACT keys survive, warp 0 selects among them; otherwise the block
-    // selection below runs on the untouched registers.
-    if (k <= TOPK_SELECT_NT / 32) {
+    // Threshold path: use each warp's maximum for k <= number of warps, or its second maximum for
+    // k <= twice that number (including the head screen's k=32). If their minimum T is nonzero, each warp
+    // contributes one or two distinct real keys >= T, so no key < T is in the top k. A zero T retains every
+    // real key. Compact at most TOPK_SELECT_COMPACT survivors and select with warp 0; on overflow, the block
+    // selection below uses the untouched v/best registers.
+    if (k <= 2 * (TOPK_SELECT_NT / 32)) {
         const int lane = threadIdx.x % 32;
         const int warp = threadIdx.x / 32;
-        const uint64_t wmax = topk_select_warp_max(best);
+        uint64_t wmax = topk_select_warp_max(best);
+        if (k > TOPK_SELECT_NT / 32) {
+            uint64_t second = best;
+            // Only the thread holding the unique warp winner must scan again. Other threads' maxima
+            // already exclude that winner. Keep best intact for the overflow fallback.
+            if (second == wmax) {
+                second = 0;
+#pragma unroll
+                for (int j = 0; j < TOPK_SELECT_PER_THREAD; ++j) {
+                    second = v[j] < wmax && v[j] > second ? v[j] : second;
+                }
+            }
+            wmax = topk_select_warp_max(second);
+        }
         if (lane == 0) {
             red[warp] = wmax;
         }
