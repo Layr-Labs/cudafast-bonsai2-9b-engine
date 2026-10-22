@@ -103,7 +103,6 @@ __device__ __forceinline__ void ggml_cuda_fwht_register_transpose_butterfly(floa
     __syncthreads();
 #pragma unroll
     for (int j = 0; j < NE; ++j) reg[j] = s[j*NT + tid];
-    // Scratch is dead after this helper in its one selected caller.
 
     // stages above the block width: partner is another register of the same thread
 #pragma unroll

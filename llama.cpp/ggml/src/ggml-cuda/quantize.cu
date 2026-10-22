@@ -1175,7 +1175,7 @@ static __global__ void fwht_quantize_mmq_d4_glu_perm(const T * x, const T * g, c
             v[i]=float(T(ggml_cuda_op_silu_single(float(x[row*o0+src]))*float(g[row*o1+src])))*(1.0f/64.0f);
             if constexpr(SIGNED) v[i]*=signs[col];
         }
-        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+        ggml_cuda_fwht_register_transpose_butterfly<N,NT>(v,shared,tid,lane);
     } else {
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
@@ -1248,7 +1248,7 @@ static __global__ void fwht_quantize_mmq_d4_rms(const float * x, const int64_t s
         v[i]=xn*(1.0f/64.0f);
         if constexpr(SIGNED) v[i]*=signs[col];
     }
-    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    ggml_cuda_fwht_register_transpose_butterfly<N,NT>(v,shared,tid,lane);
     if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 // GDN output projection input, one block per 4096-wide row (token): per-head RMS_NORM(x) * w over 128-wide heads
@@ -1297,7 +1297,7 @@ static __global__ void fwht_quantize_mmq_d4_gnorm(const float * x, const float *
         v[i]=g*(1.0f/64.0f);
         if constexpr(SIGNED) v[i]*=signs[i*NT+tid];
     }
-    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    ggml_cuda_fwht_register_transpose_butterfly<N,NT>(v,shared,tid,lane);
     if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 void fwht_quantize_mmq_d4_gnorm_cuda(const float * x, const float * z, int64_t z_stride, const float * w, float eps,
@@ -1314,9 +1314,6 @@ void fwht_quantize_mmq_d4_gnorm_cuda(const float * x, const float * z, int64_t z
 
 // Verify-batch layer input: ADD -> RMS_NORM -> MUL(w) exactly as add_rms_norm_f32<1024> forms it (its thread t
 // owns columns t + 1024k, k = 0..3: __fadd_rn sum, FFMA square chain, warp sums s_sum[t/32], final warp sum,
-// rsqrtf(tmp/ncols + eps), scale*x*w), then the signed transform through ggml_cuda_fwht_block_butterfly<4096, NT>
-// (the ascending stage order and the expressions of every other instantiation) and the D4 quantization. Thread u
-// holds columns u + NT*m in v[m] and stands for add_rms_norm's threads u + NT*j, j < 1024/NT (columns with
 // m % (1024/NT) == j, in increasing m). The weights and signs are model constants, so they are loaded before the
 // wait for the producing kernel. sum receives the residual; norm, when set, the product.
 template <int NT, bool SIGNED, bool D1 = false>
@@ -1326,7 +1323,7 @@ static __global__ void fwht_quantize_mmq_d4_add_rms(const float * a, const float
     constexpr int N=4096, NE=N/NT, NR=1024, R=NR/NT;
     static_assert(NT==256 || NT==512 || NT==1024, "add_rms fold block size");
     __shared__ float s_sum[NR/WARP_SIZE];
-    __shared__ float shared[N];
+    __shared__ __align__(16) float shared[N];
     const int tid=threadIdx.x, lane=tid%WARP_SIZE, warp=tid/WARP_SIZE;
     const int64_t row=blockIdx.y;
     float v[NE], wv[NE], sv[NE];
@@ -1366,7 +1363,11 @@ static __global__ void fwht_quantize_mmq_d4_add_rms(const float * a, const float
         v[m]=xn*(1.0f/64.0f);
         if constexpr(SIGNED) v[m]*=sv[m];
     }
-    ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    if constexpr (NT == 1024 && ggml_cuda_get_physical_warp_size() == 32) {
+        ggml_cuda_fwht_warp_lane_butterfly<N,NT>(v,shared,tid,lane);
+    } else {
+        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+    }
     if constexpr(D1)fwht_quantize_mmq_d1_store<N,NT>(v,y,0,row,rows,tid,lane);else fwht_quantize_mmq_d4_store<N,NT>(v,y,0,row,rows,tid,lane);
 }
 void fwht_quantize_mmq_d4_add_rms_cuda(const float * a, const float * b, float * sum, const float * w, float eps,
@@ -1517,7 +1518,7 @@ static __global__ void fwht_quantize_mmq_d4_sigmoid_gate(const float * gate, con
             v[i]=float(fwht_gate_op_sigmoid(float(gate_value))*float(attn[row*at+col]))*(1.0f/64.0f);
             if constexpr(SIGNED) v[i]*=signs[col];
         }
-        ggml_cuda_fwht_block_butterfly<N,NT>(v,shared,tid,lane);
+        ggml_cuda_fwht_register_transpose_butterfly<N,NT>(v,shared,tid,lane);
     } else {
 #pragma unroll
         for(int i=0;i<NE;++i) v[i]=0.0f;
