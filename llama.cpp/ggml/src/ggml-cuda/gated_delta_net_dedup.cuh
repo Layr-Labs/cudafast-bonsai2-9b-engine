@@ -220,7 +220,6 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
         const int tid = threadIdx.y * 32 + lane;
         const float * k_base  = k + iq3 * sq3 + iq1 * sq1;
         const float * v_base  = v + sequence * sv3 + h_idx * sv1 + blockIdx.z * 16;
-        const int64_t gb_base = sequence * sb3 + h_idx * sb1;
         for (int e = tid; e < (int) n_tokens * TOK_SM; e += 128) {
             const int t = e / TOK_SM;
             const int i = e % TOK_SM;
@@ -232,10 +231,8 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
                 dst_i = (r * 8 + n_) * 4 + m;
             } else if (i < S_v + 16) {
                 src = v_base + t * sv2 + (i - S_v);
-            } else if (i < S_v + 18) {
-                src = (i == S_v + 16 ? g : beta) + gb_base + t * sb2;
             } else {
-                continue;  // padding
+                continue;  // gates are produced once by warp zero below; trailing padding
             }
             const unsigned int dst = (unsigned int) __cvta_generic_to_shared(&stage[t][dst_i]);
             asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(dst), "l"(src));
@@ -330,6 +327,22 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
     // the staged inputs are complete, and every warp has finished reading the previous lazy record before any
     // warp rewrites it
     asm volatile("cp.async.wait_all;");
+    // One producer per CTA owns each token's gates. The existing CTA barrier
+    // publishes activated values to the four V-column warps without a new sync.
+    if (threadIdx.y == 0 && lane < n_tokens) {
+        const int64_t gate_offset = sequence * sb3 + h_idx * sb1 + lane * sb2;
+        float beta_owned = beta[gate_offset];
+        if constexpr (RAW) {
+            beta_owned = 1.0f / (1.0f + expf(-beta_owned));
+        }
+        float g_owned = g[gate_offset];
+        if constexpr (RAW) {
+            const float x = g_owned + raw_dt_bias[h_idx];
+            g_owned = raw_a[h_idx] * ((x > 20.0f) ? x : logf(1.0f + expf(x)));
+        }
+        stage[lane][S_v + 16] = G_PRECOMPUTED ? g_owned : expf(g_owned);
+        stage[lane][S_v + 17] = beta_owned;
+    }
     const int any_eager = __syncthreads_or(!replayed);
     const int64_t input_diff = curr_state - state;
     lazy = LAZY && (!any_eager || input_diff == 0 || input_diff == state_slot_stride);
@@ -338,15 +351,7 @@ gated_delta_net_dedup_l8v_cuda(const float * q, const float * k, const float * v
     float g_lane = 0.0f, beta_lane = 0.0f;
     if (lane < n_tokens) {
         beta_lane = stage[lane][S_v + 17];
-        if constexpr (RAW) {
-            beta_lane = 1.0f / (1.0f + expf(-beta_lane));
-        }
-        float g0 = stage[lane][S_v + 16];
-        if constexpr (RAW) {
-            const float x = g0 + raw_dt_bias[h_idx];
-            g0 = raw_a[h_idx] * ((x > 20.0f) ? x : logf(1.0f + expf(x)));
-        }
-        g_lane = G_PRECOMPUTED ? g0 : expf(g0);
+        g_lane = stage[lane][S_v + 16];
     }
     const int lazy_W  = (int) (n_tokens < K ? n_tokens : K);
     uint32_t  lazy_cs = 0;
