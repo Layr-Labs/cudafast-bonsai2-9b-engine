@@ -198,6 +198,11 @@ void shape(ggml_backend_cuda_context & cuda, int kv, int rows, bool strided) {
             same_dim(graphs[0].fixup.blockDim, graphs[1].fixup.blockDim), "unchanged fixup geometry");
     require((graphs[0].producer.func != graphs[1].producer.func) == (rows == 16), "half producer selected only for guarded shape");
     require((graphs[0].fixup.func != graphs[1].fixup.func) == (rows == 16), "matching fixup reader selected");
+    const size_t blocks_per_tile = graphs[1].producer.gridDim.x / KV_HEADS;
+    const size_t planned_bytes = (2*(blocks_per_tile - 1) + 1)*sizeof(float);
+    require(graphs[0].fixup.sharedMemBytes == 0, "F32 fixup keeps its original shared-memory contract");
+    require(graphs[1].fixup.sharedMemBytes == (rows == 16 ? planned_bytes : 0),
+            "half fixup carries one block-wide scalar combine plan");
     for (int phase : {0, 1, 2, 1, 0}) {
         upload(phase); reference.reset(cuda.stream()); candidate.reset(cuda.stream());
         check(cudaStreamSynchronize(cuda.stream()));

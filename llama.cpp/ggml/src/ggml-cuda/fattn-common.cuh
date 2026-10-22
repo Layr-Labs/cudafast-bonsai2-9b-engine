@@ -778,6 +778,47 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
     ggml_cuda_pdl_sync();
     // Load the partial result that needs a fixup
     float dst_val = *dst;
+
+    if constexpr (half_partials) {
+        static_assert(D == 256 && ncols1 == 16 && ncols2 == 4, "bad half partial shape");
+        // max/rowsum and their rescaling factors are identical for all D lanes.
+        // Build that scalar recurrence once per block, then let every lane apply
+        // the same factors to its own transported half partials.  The operation
+        // order is unchanged from the per-lane path below.
+        extern __shared__ float combine_plan[];
+        const int nprevious = blocks_per_tile - 1;
+        if (tid == 0) {
+            const float2 last = dst_fixup[b_last*ncols + jc];
+            float max_val = last.x;
+            float rowsum  = last.y;
+            int plan_idx = 0;
+            for (int bidx = b_last - 1; bidx >= b_first; --bidx, ++plan_idx) {
+                const float2 tmp = dst_fixup[(nblocks_stream_k + bidx)*ncols + jc];
+                const float max_val_new = fmaxf(max_val, tmp.x);
+                const float diff_val = max_val - max_val_new;
+                const float diff_add = tmp.x   - max_val_new;
+                const float scale_val = diff_val >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_val) : 0.0f;
+                const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
+                combine_plan[2*plan_idx + 0] = scale_val;
+                combine_plan[2*plan_idx + 1] = scale_add;
+                rowsum = scale_val*rowsum + scale_add*tmp.y;
+                max_val = max_val_new;
+            }
+            combine_plan[2*nprevious] = rowsum;
+        }
+        __syncthreads();
+
+        int plan_idx = 0;
+        for (int bidx = b_last - 1; bidx >= b_first; --bidx, ++plan_idx) {
+            const float dst_add = fattn_half_partial_to_float(
+                ((const half *) dst_fixup_data)[bidx*ncols*D + jc*D + tid]);
+            dst_val = combine_plan[2*plan_idx + 0]*dst_val +
+                      combine_plan[2*plan_idx + 1]*dst_add;
+        }
+        *dst = dst_val / combine_plan[2*nprevious];
+        return;
+    }
+
     float max_val;
     float rowsum;
     {
@@ -789,12 +830,7 @@ static __global__ void flash_attn_stream_k_fixup_uniform(
     // Combine with all previous blocks in this tile.
     for (int bidx = b_last - 1; bidx >= b_first; --bidx) {
         float dst_add;
-        if constexpr (half_partials) {
-            static_assert(D == 256 && ncols1 == 16 && ncols2 == 4, "bad half partial shape");
-            dst_add = fattn_half_partial_to_float(((const half *) dst_fixup_data)[bidx*ncols*D + jc*D + tid]);
-        } else {
-            dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
-        }
+        dst_add = dst_fixup_data[bidx*ncols*D + jc*D + tid];
 
         const float2 tmp = dst_fixup[(nblocks_stream_k + bidx)*ncols + jc];
 
@@ -1271,13 +1307,16 @@ void launch_fattn(
             const dim3 block_dim_combine(DV, 1, 1);
             const dim3 blocks_num_combine = {(unsigned)ntiles_dst, ncols1, ncols2};
 
-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, 0, main_stream);
             auto fixup_kernel = flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2>;
+            size_t fixup_shared = 0;
             if constexpr (DV == 256 && ncols1 == 16 && ncols2 == 4) {
                 if (half_partials) {
                     fixup_kernel = flash_attn_stream_k_fixup_uniform<DV, ncols1, ncols2, true>;
+                    fixup_shared = size_t(2*(bpt - 1) + 1)*sizeof(float);
                 }
             }
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+                blocks_num_combine, block_dim_combine, fixup_shared, main_stream);
             ggml_cuda_kernel_launch(fixup_kernel, launch_params,
                 (float *) KQV->data, dst_tmp_meta.ptr,
                  Q->ne[1], Q->ne[2], K->ne[2], nblocks_sk,
