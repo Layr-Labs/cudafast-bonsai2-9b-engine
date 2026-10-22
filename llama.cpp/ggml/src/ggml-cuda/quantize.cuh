@@ -140,3 +140,8 @@ void fwht_quantize_mmq_d4_sigmoid_gate_cuda(const float * gate, const float * at
 void fwht_quantize_mmq_d4_fixup_add_rms_cuda(const float * a, const float * b, float * sum,
     const float * w, float eps, const float * signs, float * norm, void * y,
     const float * partials, cudaStream_t stream);
+
+// Exact deferred Z-projection fixup at the gated norm's sole read,4096x16 streamK/grid48 only.
+void fwht_quantize_mmq_d4_gnorm_zfix_cuda(const float * x, const float * z, const float * partials,
+        const float * w, float eps, int64_t ne1, int64_t g1, int64_t g2, int64_t g3,
+        const float * signs, void * y, cudaStream_t stream);

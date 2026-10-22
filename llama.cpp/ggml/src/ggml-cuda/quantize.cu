@@ -1257,11 +1257,11 @@ static __global__ void fwht_quantize_mmq_d4_rms(const float * x, const int64_t s
 // head row r*g3 + a1*g1 + a2*g2, column a0. Then the signed transform as fwht_quantize_mmq_d4. Register i of the
 // threads of half tid/128 holds one head, column tid%128 being thread tid%128 of that head's rms block: the same
 // square, xor warp reduction, four per-warp partials and final warp reduction (zeros above lane 3).
-template <bool SIGNED, bool D1 = false>
+template <bool SIGNED, bool D1 = false, bool ZFIX = false>
 __launch_bounds__(256, 1)
 static __global__ void fwht_quantize_mmq_d4_gnorm(const float * x, const float * z, const int64_t z_stride,
         const float * w, const int ncols, const float eps, const uint3 ne1, const int64_t g1, const int64_t g2,
-        const int64_t g3, const float * signs, block_q8_1_mmq * y, const int64_t rows) {
+        const int64_t g3, const float * signs, block_q8_1_mmq * y, const int64_t rows, const float * zpartials = nullptr) {
     constexpr int N=4096, NT=256, NE=N/NT, HD=128, HW=HD/WARP_SIZE;
     __shared__ float shared[N];
     __shared__ float s_sum[NE][NT/WARP_SIZE];
@@ -1293,7 +1293,16 @@ static __global__ void fwht_quantize_mmq_d4_gnorm(const float * x, const float *
         const float mean=tmp/ncols;
         const float scale=rsqrtf(mean+eps);
         const float xn=scale*v[i]*w[a0];
-        const float g=ggml_cuda_op_silu_single(z[head[i]*z_stride+a0])*xn;
+        const int64_t zi = head[i]*z_stride+a0;
+        float zv = z[zi];
+        if constexpr (ZFIX) {
+            // Exact4096x16/grid48 original descending fixup: one predecessor per tile.
+            const int tile = (zi%4096)/128;
+            const int pred = tile + tile/2;
+            const float ps = __fadd_rn(0.0f,zpartials[pred*2048+(zi/4096)*128+zi%128]);
+            zv = __fadd_rn(zv,ps);
+        }
+        const float g=ggml_cuda_op_silu_single(zv)*xn;
         v[i]=g*(1.0f/64.0f);
         if constexpr(SIGNED) v[i]*=signs[i*NT+tid];
     }
@@ -1306,10 +1315,19 @@ void fwht_quantize_mmq_d4_gnorm_cuda(const float * x, const float * z, int64_t z
     const ggml_cuda_kernel_launch_params lp(dim3(1,rows,1),dim3(256,1,1),0,stream);
     const uint3 ne1_fd=init_fastdiv_values(ne1);
     if(signs) {
-        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_gnorm<true,true>:fwht_quantize_mmq_d4_gnorm<true,false>,lp,x,z,z_stride,w,128,eps,ne1_fd,g1,g2,g3,signs,(block_q8_1_mmq*)y,rows);
+        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_gnorm<true,true>:fwht_quantize_mmq_d4_gnorm<true,false>,lp,x,z,z_stride,w,128,eps,ne1_fd,g1,g2,g3,signs,(block_q8_1_mmq*)y,rows,(const float *)nullptr);
     } else {
-        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_gnorm<false,true>:fwht_quantize_mmq_d4_gnorm<false,false>,lp,x,z,z_stride,w,128,eps,ne1_fd,g1,g2,g3,signs,(block_q8_1_mmq*)y,rows);
+        ggml_cuda_kernel_launch(use_d1?fwht_quantize_mmq_d4_gnorm<false,true>:fwht_quantize_mmq_d4_gnorm<false,false>,lp,x,z,z_stride,w,128,eps,ne1_fd,g1,g2,g3,signs,(block_q8_1_mmq*)y,rows,(const float *)nullptr);
     }
+}
+
+// Private producer-tail consumer: selected only after graph exclusivity and original producer support.
+void fwht_quantize_mmq_d4_gnorm_zfix_cuda(const float * x, const float * z, const float * partials,
+        const float * w, float eps, int64_t ne1, int64_t g1, int64_t g2, int64_t g3,
+        const float * signs, void * y, cudaStream_t stream) {
+    const ggml_cuda_kernel_launch_params lp(dim3(1,16,1),dim3(256,1,1),0,stream);
+    ggml_cuda_kernel_launch(fwht_quantize_mmq_d4_gnorm<true,false,true>,lp,x,z,int64_t(128),w,128,eps,
+        init_fastdiv_values(ne1),g1,g2,g3,signs,(block_q8_1_mmq*)y,int64_t(16),partials);
 }
 
 // Verify-batch layer input: ADD -> RMS_NORM -> MUL(w) exactly as add_rms_norm_f32<1024> forms it (its thread t

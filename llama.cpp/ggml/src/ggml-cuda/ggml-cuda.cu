@@ -3575,9 +3575,15 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 // The check walks every later node, so any other use of the output (or of a view of it) keeps the
 // plain transform, and use counts guard against consumers outside this graph. Returns the number of
 // nodes consumed (3 or 1) or 0 to fall through. GGML_CUDA_FWHT_FUSION=0 disables it.
+// Graph-local deferred projection. Buffers use the main-stream held arena; no graph Z write is exposed.
+struct ggml_cuda_gnorm_zfix {
+    const ggml_tensor * gate = nullptr;
+    const float * tail = nullptr;
+    const float * partials = nullptr;
+};
 static int ggml_cuda_try_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx,
                                   bool plan_only = false, ggml_tensor * fixup_mm = nullptr,
-                                  const void * fixup_q8 = nullptr) {
+                                  const void * fixup_q8 = nullptr, ggml_cuda_gnorm_zfix * zfix = nullptr) {
     static const bool disabled = getenv("GGML_CUDA_FWHT_MMQ_FUSION") != nullptr &&
                                  atoi(getenv("GGML_CUDA_FWHT_MMQ_FUSION")) == 0;
     if (disabled) {
@@ -3940,9 +3946,17 @@ static int ggml_cuda_try_fwht_mmq(ggml_backend_cuda_context & ctx, const ggml_cg
         float eps = 0.0f;
         memcpy(&eps, rms->op_params, sizeof(float));
         const ggml_tensor * gz = gn_glu->src[0];
+        if (zfix && zfix->gate == gn_glu) {
+            GGML_ASSERT(ncols==16 && gz->nb[1]==128*sizeof(float));
+            fwht_quantize_mmq_d4_gnorm_zfix_cuda((const float *) rms->src[0]->data,zfix->tail,zfix->partials,
+                (const float *) rms_w->data,eps,gn_perm->ne[1],gn_g[0],gn_g[1],gn_g[2],
+                (const float *) signs->data,out,ctx.stream());
+            *zfix = {};
+        } else {
         fwht_quantize_mmq_d4_gnorm_cuda((const float *) rms->src[0]->data, (const float *) gz->data,
                                         gz->nb[1] / sizeof(float), (const float *) rms_w->data, eps, gn_perm->ne[1],
                                         gn_g[0], gn_g[1], gn_g[2], (const float *) signs->data, out, ncols, ctx.stream());
+        }
     } else if (add) {
         float eps = 0.0f;
         memcpy(&eps, rms->op_params, sizeof(float));
@@ -4107,6 +4121,35 @@ static int ggml_cuda_d4_side_plan(const ggml_backend_cuda_context & ctx, const g
         }
     }
     return j;
+}
+
+// Return the one supported gnorm consumer. Never defer a projection with an exposed or additional reader.
+static int ggml_cuda_gnorm_zfix_plan(ggml_backend_cuda_context & ctx,const ggml_cgraph * cg,int mi) {
+    const ggml_tensor * mm=cg->nodes[mi];
+    if(mm->ne[0]!=4096 || mm->ne[1]!=16 || !ggml_is_contiguous(mm))return -1;
+    const auto * pre=ctx.fwht_q8().find(mm->src[1]);
+    if(!pre || !pre->mmq_d4 || !ggml_cuda_mul_mat_q_fixup_producer(ctx,mm->src[0],mm->src[1],cg->nodes[mi],pre->data,nullptr))return -1;
+    for(int ri=mi+1;ri+2<cg->n_nodes && ri<mi+512;++ri){
+        const ggml_tensor * rms=cg->nodes[ri];
+        const ggml_tensor * gate=cg->nodes[ri+2];
+        if(rms->op!=GGML_OP_RMS_NORM || rms->ne[0]!=128 || gate->op!=GGML_OP_GLU ||
+                ggml_get_glu_op(gate)!=GGML_GLU_OP_SWIGLU || !gate->src[0])continue;
+        const ggml_tensor * z=gate->src[0];
+        if(!ggml_is_contiguous(z) || z->nb[1]!=128*sizeof(float) || z->data!=mm->data ||
+                ggml_nbytes(z)!=ggml_nbytes(mm))continue;
+        const ggml_tensor * t=z;
+        bool ok=true;
+        while(t){
+            int ti=-1;for(int k=mi;k<ri+2;++k)if(cg->nodes[k]==t){ti=k;break;}
+            if(ti<0 || (t->flags&GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cg,ti)!=1){ok=false;break;}
+            if(t==mm)break;
+            if(t->op!=GGML_OP_RESHAPE && t->op!=GGML_OP_VIEW && t->op!=GGML_OP_PERMUTE && t->op!=GGML_OP_TRANSPOSE){ok=false;break;}
+            if(t->data!=mm->data || ggml_nbytes(t)!=ggml_nbytes(mm)){ok=false;break;}
+            t=t->src[0];
+        }
+        if(ok && t==mm && ggml_cuda_try_fwht_mmq(ctx,cg,ri,true))return ri;
+    }
+    return -1;
 }
 
 // GB10 decode (verify batches of at most 16 rows): the ffn_gate/ffn_up MUL_MAT pair of one D4 activation feeding a
@@ -7294,6 +7337,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             std::vector<ggml_cuda_conv_gather> conv_gathers;  // skipped conv-state GET_ROWS, by CONCAT
             ggml_tensor * pending_zero = nullptr;  // a deferred zeroing SCALE of a recurrent-cache row
             int side_node = -1;  // a D4 matmul planned on stream 1 (ggml_cuda_d4_side_plan), forked already
+            ggml_cuda_gnorm_zfix gnorm_zfix;
             const ggml_tensor * gdn_mmf_pending = nullptr;
             const auto flush_zero = [&]() {
                 if (pending_zero != nullptr) {
@@ -7476,7 +7520,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // Hadamard rotation that quantizes its own output; its PTQ1_0 mat-vecs skip quantize
                 if ((node->op == GGML_OP_MUL || node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_GLU ||
                         node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_ADD) && !is_concurrent_event_active) {
-                    const int mmq_consumed = ggml_cuda_try_fwht_mmq(*cuda_ctx, cgraph, i);
+                    const int mmq_consumed = ggml_cuda_try_fwht_mmq(*cuda_ctx, cgraph, i,false,nullptr,nullptr,&gnorm_zfix);
                     const int consumed = mmq_consumed ? mmq_consumed : ggml_cuda_try_fwht_q8(*cuda_ctx, cgraph, i);
                     if (consumed > 0) {
                         i += consumed - 1;
@@ -7587,6 +7631,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             continue;
                         }
                         if (side_node == i && ia < 0) {
+                            const int zg = !gnorm_zfix.gate && !is_concurrent_event_active && stream_ctx.concurrent_events.empty() ?
+                                ggml_cuda_gnorm_zfix_plan(*cuda_ctx,cgraph,i) : -1;
+                            if(zg>i){
+                                const auto * zp=cuda_ctx->fwht_q8().find(node->src[1]);
+                                auto tail=std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(),ggml_nbytes(node));
+                                auto parts=std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(),size_t(48*16*128*sizeof(float)));
+                                ggml_tensor zdst=*node;zdst.data=tail->get();
+                                gnorm_zfix={cgraph->nodes[zg+2],(const float *)tail->get(),(const float *)parts->get()};
+                                cuda_ctx->fwht_q8().held.push_back(std::move(tail));
+                                cuda_ctx->fwht_q8().held.push_back(std::move(parts));
+                                cudaStream_t main_stream=cuda_ctx->stream();cuda_ctx->curr_stream_no=1;
+                                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(),cuda_ctx->side_fork));
+                                GGML_ASSERT(ggml_cuda_mul_mat_q_fixup_producer(*cuda_ctx,node->src[0],node->src[1],&zdst,zp->data,
+                                    const_cast<float *>(gnorm_zfix.partials)));
+                                CUDA_CHECK(cudaEventRecord(cuda_ctx->side_join,cuda_ctx->stream()));
+                                cuda_ctx->curr_stream_no=0;CUDA_CHECK(cudaStreamWaitEvent(main_stream,cuda_ctx->side_join));
+                                static bool logged=false;if(!logged){GGML_LOG_INFO("Z_FIXUP_GNORM selected producer-only side route, no copy\n");logged=true;}
+                                side_node=-1;continue;
+                            }
                             // the planned side matmul: stream 1 after the fork, the main stream joins it here
                             cudaStream_t main_stream = cuda_ctx->stream();
                             cuda_ctx->curr_stream_no = 1;
@@ -7773,6 +7836,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
             GGML_ASSERT(gdn_mmf_pending == nullptr);
+            GGML_ASSERT(gnorm_zfix.gate == nullptr);
             flush_zero();  // a deferred SCALE no later node touched
             ggml_cuda_gdn_dedup_written_ranges(cuda_ctx->gdn_dedup_graph_writes, cuda_ctx->stream());
         }
